@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-やどかり弁当 メニュー違反チェック（Streamlit版）
+メニュー違反チェック（Streamlit版）
 Streamlit Community Cloud (share.streamlit.io) での公開を想定。
 """
 import io
@@ -133,7 +133,7 @@ st.markdown(
 _logo_svg = load_logo_svg()
 _header_html = (
     '<div class="glug-header">' + _logo_svg
-    + '<p class="glug-title">やどかり弁当 メニューチェック</p></div>'
+    + '<p class="glug-title">メニューチェック</p></div>'
     + '<p class="glug-caption">37項目のメニュー構成ルールに照らして自動チェックします。</p>'
 )
 st.markdown(
