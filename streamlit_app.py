@@ -32,7 +32,11 @@ def load_logo_svg():
     path = os.path.join(HERE, "assets", "glug_logo.svg")
     try:
         with open(path, encoding="utf-8") as f:
-            return f.read()
+            svg = f.read()
+        # Markdownパーサーが改行/空行を挟んだ生HTMLをうまく扱えず、
+        # タグがそのままテキスト表示されてしまう問題を避けるため1行に圧縮する
+        svg = re.sub(r"\s+", " ", svg).strip()
+        return svg
     except Exception:
         return ""
 
@@ -127,14 +131,13 @@ st.markdown(
 )
 
 _logo_svg = load_logo_svg()
+_header_html = (
+    '<div class="glug-header">' + _logo_svg
+    + '<p class="glug-title">やどかり弁当 メニューチェック</p></div>'
+    + '<p class="glug-caption">37項目のメニュー構成ルールに照らして自動チェックします。</p>'
+)
 st.markdown(
-    f"""
-    <div class="glug-header">
-        {_logo_svg}
-        <p class="glug-title">やどかり弁当 メニューチェック</p>
-    </div>
-    <p class="glug-caption">37項目のメニュー構成ルールに照らして自動チェックします。</p>
-    """,
+    _header_html,
     unsafe_allow_html=True,
 )
 
