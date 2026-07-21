@@ -14,7 +14,7 @@ import streamlit as st
 
 import menu_checker as mc
 
-st.set_page_config(page_title="やどかり弁当 メニューチェック", layout="wide")
+st.set_page_config(page_title="メニューチェック", layout="wide")
 
 SEVERITY_ORDER = {"高": 0, "中": 1, "低": 2}
 HERE = os.path.dirname(os.path.abspath(__file__))
