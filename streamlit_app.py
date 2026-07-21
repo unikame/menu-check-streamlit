@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-やどかり弁当 メニュー違反チェック（Streamlit版）
+メニュー違反チェック（Streamlit版）
 Streamlit Community Cloud (share.streamlit.io) での公開を想定。
 """
 import io
