@@ -14,7 +14,7 @@ import streamlit as st
 
 import menu_checker as mc
 
-st.set_page_config(page_title="やどかり弁当 メニューチェック", layout="wide")
+st.set_page_config(page_title="メニューチェック", layout="wide")
 
 SEVERITY_ORDER = {"高": 0, "中": 1, "低": 2}
 
@@ -27,7 +27,7 @@ def severity_rank(v):
     return 3
 
 
-st.title("やどかり弁当 メニュー違反チェック")
+st.title("メニュー違反チェック")
 st.caption("37項目のメニュー構成ルールに照らして自動チェックします。")
 
 with st.expander("アップロードするファイルの形式", expanded=False):
