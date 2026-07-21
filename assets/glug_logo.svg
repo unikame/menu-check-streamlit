@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 220" width="270" height="66">
+  <g>
+    <circle cx="110" cy="110" r="90" fill="#FFCC1E"/>
+    <path d="M110 110 L190 62 A90 90 0 0 1 110 200 A90 90 0 0 1 30 155 Z" fill="#111111"/>
+    <circle cx="110" cy="110" r="55" fill="#FFFFFF"/>
+    <path d="M110 110 L165 78 A55 55 0 0 1 55 110 Z" fill="#FFCC1E"/>
+  </g>
+  <text x="230" y="168" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="150" fill="#111111" letter-spacing="-2">GLUG</text>
+</svg>

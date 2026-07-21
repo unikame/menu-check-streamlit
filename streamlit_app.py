@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-メニュー違反チェック（Streamlit版）
+やどかり弁当 メニュー違反チェック（Streamlit版）
 Streamlit Community Cloud (share.streamlit.io) での公開を想定。
 """
 import io
@@ -14,9 +14,10 @@ import streamlit as st
 
 import menu_checker as mc
 
-st.set_page_config(page_title="メニューチェック", layout="wide")
+st.set_page_config(page_title="やどかり弁当 メニューチェック", layout="wide")
 
 SEVERITY_ORDER = {"高": 0, "中": 1, "低": 2}
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def severity_rank(v):
@@ -27,8 +28,115 @@ def severity_rank(v):
     return 3
 
 
-st.title("メニュー違反チェック")
-st.caption("37項目のメニュー構成ルールに照らして自動チェックします。")
+def load_logo_svg():
+    path = os.path.join(HERE, "assets", "glug_logo.svg")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+st.markdown(
+    """
+    <style>
+    #MainMenu, footer, header {visibility: hidden;}
+    html, body, [class*="css"] {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Kaku Gothic ProN",
+                     "Yu Gothic", sans-serif;
+    }
+    .stApp {
+        background-color: #f5f5f7;
+    }
+    .block-container {
+        max-width: 1080px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+    .glug-header {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 4px;
+    }
+    .glug-header svg {
+        height: 34px;
+        width: auto;
+    }
+    .glug-title {
+        font-size: 21px;
+        font-weight: 600;
+        color: #1d1d1f;
+        letter-spacing: -0.01em;
+        margin: 0;
+    }
+    .glug-caption {
+        font-size: 14px;
+        color: #6e6e73;
+        margin: 2px 0 28px 0;
+    }
+    div[data-testid="stFileUploader"] {
+        background-color: #ffffff;
+        border: 1px solid #e5e5e7;
+        border-radius: 14px;
+        padding: 18px 20px;
+    }
+    div[data-testid="stFileUploaderDropzone"] {
+        background-color: #fafafa;
+        border-radius: 10px;
+    }
+    div[data-testid="stExpander"] {
+        background-color: #ffffff;
+        border: 1px solid #e5e5e7;
+        border-radius: 14px;
+    }
+    div[data-testid="stMetric"] {
+        background-color: #ffffff;
+        border: 1px solid #e5e5e7;
+        border-radius: 12px;
+        padding: 12px 4px;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #1d1d1f;
+    }
+    .stButton > button, .stDownloadButton > button {
+        background-color: #1d1d1f;
+        color: #ffffff;
+        border: none;
+        border-radius: 980px;
+        padding: 10px 26px;
+        font-weight: 500;
+        transition: background-color 0.15s ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        background-color: #3a3a3c;
+        color: #ffffff;
+    }
+    .stButton > button:disabled {
+        background-color: #d2d2d7;
+        color: #86868b;
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #e5e5e7;
+        border-radius: 12px;
+        overflow: hidden;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+_logo_svg = load_logo_svg()
+st.markdown(
+    f"""
+    <div class="glug-header">
+        {_logo_svg}
+        <p class="glug-title">やどかり弁当 メニューチェック</p>
+    </div>
+    <p class="glug-caption">37項目のメニュー構成ルールに照らして自動チェックします。</p>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.expander("アップロードするファイルの形式", expanded=False):
     st.markdown(
