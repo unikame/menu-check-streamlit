@@ -156,7 +156,7 @@ with st.expander("アップロードするファイルの形式", expanded=False
 
 main_file = st.file_uploader("① メニューワークブック（必須・.xlsx）", type=["xlsx"])
 night_files = st.file_uploader(
-    "② 夜（夕）食材CSV（任意・複数選択可、ファイル名に月を含めてください）",
+    "② 昼・夕の食材CSV（任意・複数選択可、ファイル名に月を含めてください）",
     type=["csv"], accept_multiple_files=True,
 )
 
