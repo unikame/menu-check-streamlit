@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-メニュー違反チェック（月非依存・汎用版）
+やどかり弁当 メニュー違反チェック（月非依存・汎用版）
 
 run_check.py で7月/8月に対して個別実装していたロジックを、
 アップロードされたワークブックのシート名から月を自動検出して
@@ -21,6 +21,7 @@ run_check.py で7月/8月に対して個別実装していたロジックを、
 import os
 import re
 import sys
+import json
 import datetime
 from collections import Counter
 
@@ -69,6 +70,14 @@ FISH_FD_ONLY = ['いわしの梅煮', 'マスの塩焼き', 'サーモン塩焼�
                 'さわらの西京焼き', 'タラの香草焼き', 'あじみりん焼き', 'あじの塩焼き']
 NUTRI_BOUNDS = {'昼': {'kcal': (415, 455), 'salt_max': 3.8, 'protein_min': 12},
                 '夜': {'kcal': (245, 275), 'salt_max': 3.0, 'protein_min': 12}}
+# No.17: 1食につき赤・黄・緑を必ず使用（キーワード方式・暫定版。商材マスタの「色」列が整備され次第、
+# そちらを正とする判定に切り替える想定）
+RED_KW = ['人参', 'にんじん', '3色ピーマン', '3色パプリカ', '赤ピーマン', '赤パプリカ', 'レッドピーマン',
+          '紅芯大根', 'トマト', 'ミニトマト', '紅生姜', 'いちご']
+YELLOW_KW = ['3色ピーマン', '3色パプリカ', '黄パプリカ', '黄ピーマン', 'イエローピーマン', 'コーン', 'とうもろこし',
+             'かぼちゃ', '卵', 'たまご', '玉子', 'たくあん', 'パイナップル', 'レモン']
+GREEN_KW = ['ほうれん草', '小松菜', 'ブロッコリー', 'いんげん', 'インゲン', 'オクラ', 'きゅうり', 'キュウリ',
+            'ピーマン', '枝豆', 'さやえんどう', 'スナップ', 'アスパラ', '春菊', '水菜', 'チンゲン菜']
 
 
 def is_base_seasoning(prod):
@@ -87,12 +96,94 @@ def is_health(name):
     return any(k in str(name) for k in HEALTH_KW)
 
 
+def _to_date(v):
+    """セルの値をdatetimeに変換する。日付書式のセルはdatetime.datetimeで返るが、
+    書式が数値のままの一部ファイルではExcelのシリアル値（整数/浮動小数）で返ってくるため、
+    その場合も1899-12-30起点で変換する。"""
+    if isinstance(v, datetime.datetime):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+        try:
+            return datetime.datetime(1899, 12, 30) + datetime.timedelta(days=v)
+        except (OverflowError, ValueError):
+            return None
+    return None
+
+
 def canon_name(name):
     for group, _ in LOOKALIKE_PAIRS:
         for g in group:
             if g in name:
                 return group[0]
     return cm.norm_recipe(name)
+
+
+AI_MODEL = 'claude-haiku-4-5-20251001'
+_AI_SIM_CACHE = {}
+
+
+def get_anthropic_client():
+    """Streamlit CloudのSecrets（ANTHROPIC_API_KEY）か環境変数からAPIキーを取得してクライアントを作る。
+    キーが無い/anthropicパッケージが未インストールならNoneを返す（呼び出し側はAI判定をスキップする）。"""
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        try:
+            import streamlit as st
+            api_key = st.secrets.get('ANTHROPIC_API_KEY')
+        except Exception:
+            api_key = None
+    if not api_key:
+        return None
+    try:
+        return anthropic.Anthropic(api_key=api_key)
+    except Exception:
+        return None
+
+
+def ai_similar_candidates(client, new_name, candidate_names, model=AI_MODEL):
+    """new_name と candidate_names の中から『同じ/酷似した料理』とAIに判定させ、
+    酷似すると判定された候補名の集合を返す。API呼び出しに失敗した場合は空集合（＝AI判定なし）。
+    同じ組み合わせは再度APIを呼ばずキャッシュから返す。"""
+    candidate_names = [c for c in dict.fromkeys(candidate_names) if c and c != new_name]
+    if not candidate_names or client is None:
+        return set()
+    cache_key = (new_name, tuple(sorted(candidate_names)))
+    if cache_key in _AI_SIM_CACHE:
+        return _AI_SIM_CACHE[cache_key]
+
+    numbered = '\n'.join(f'{i + 1}. {n}' for i, n in enumerate(candidate_names))
+    prompt = (
+        'あなたは高齢者向け配食弁当のメニュー構成をチェックしている担当者です。\n'
+        '以下の「新しく使う商品名」が、「直近使用済みリスト」の中の商品と、'
+        '同じ料理・酷似した料理（主原料・調理法・味付けの系統が同じ）とみなせる場合、'
+        'その番号をすべて挙げてください。\n'
+        '例：「コク深い味噌の甘辛ハンバーグ」と「おろしハンバーグ」は、どちらも'
+        '「ハンバーグ」が主役なので酷似とみなします。「大葉おろしチキンカツ」と'
+        '「おろしチキンカツ」も、大葉の有無だけの違いなので酷似とみなします。\n'
+        '単に同じ食材カテゴリ（両方とも肉料理、等）というだけでは酷似とみなさず、'
+        '料理として同じ系統（ハンバーグ同士、コロッケ同士、唐揚げ同士 等）の場合のみ酷似と判定してください。\n\n'
+        f'新しく使う商品名: {new_name}\n\n'
+        f'直近使用済みリスト:\n{numbered}\n\n'
+        '酷似すると判定した番号のみをJSON配列で出力してください（例: [1, 3]）。'
+        '酷似するものが無ければ [] と出力してください。JSON以外は一切出力しないでください。'
+    )
+    try:
+        resp = client.messages.create(
+            model=model, max_tokens=200,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        text = resp.content[0].text.strip()
+        m = re.search(r'\[.*?\]', text, re.S)
+        idxs = json.loads(m.group(0)) if m else []
+        result = {candidate_names[i - 1] for i in idxs if isinstance(i, int) and 1 <= i <= len(candidate_names)}
+    except Exception:
+        result = set()
+    _AI_SIM_CACHE[cache_key] = result
+    return result
 
 
 class MenuData:
@@ -106,6 +197,7 @@ class MenuData:
         self.rows = []                   # [(date, weekday_jp, slot, pos, name), ...] 全月分
         self.warnings = []               # 注記（画面に表示する）
         self.date_range = None
+        self.ai_client = None            # Anthropic clientが設定されていればAI酷似判定を使う（No.1）
 
 
 def _find_month_sheets(sheet_names, suffix_regex):
@@ -135,8 +227,9 @@ def _detect_lunchdinner_layout(ws, date_col=2, label_col=1, sample_rows=30):
         if label is None:
             continue
         d = ws.cell(row=r, column=date_col).value
-        if isinstance(d, datetime.datetime):
-            cur_date = d
+        dd = _to_date(d)
+        if dd is not None:
+            cur_date = dd
         if cur_date is None:
             continue
         vals_3_8 = [ws.cell(row=r, column=c).value for c in range(3, 9)]
@@ -164,8 +257,9 @@ def _parse_lunch_dinner_sheet(ws, date_col=2, label_col=1):
         if label is None:
             continue
         d = ws.cell(row=r, column=date_col).value
-        if isinstance(d, datetime.datetime):
-            cur_date = d
+        dd = _to_date(d)
+        if dd is not None:
+            cur_date = dd
         if cur_date is None:
             continue
         slot = '夜' if '夜' in str(label) else ('昼' if '昼' in str(label) else str(label))
@@ -344,46 +438,82 @@ def _max_gap_check(data, match_fn, max_gap, rule_no, rule_name, severity='中'):
 # ---------------- 各ルールの判定関数（run_check.py の最終版ロジックを月非依存化） ----------------
 
 def check_rule1(data, positions=('メイン', 'サブ')):
-    """No.1: メイン/サブ商材（酷似品含む）を1週間以上空けて使用（昼のみ判定：従来通り昼メニューのメイン/サブを対象）"""
+    """No.1: メイン/サブ商材（酷似品含む）を1週間以上空けて使用（昼夜とも対象）。
+    まず商品名の完全一致（正規化後）で判定し、ANTHROPIC_API_KEYが設定されていれば、
+    さらにAIによる『料理として酷似しているか』の判定も行い、完全一致では拾えない
+    酷似ケース（例：おろしハンバーグ / コク深い味噌の甘辛ハンバーグ）も検出する。"""
     if not data.rows:
         return pd.DataFrame()
-    by_date = {}
-    for (d, wd, slot, pos, name) in data.rows:
-        if slot == '昼' and pos in positions:
-            by_date.setdefault(d, {})[pos] = name
-    days_sorted = sorted(by_date.items())
-    last_seen = {}
+
+    entries = sorted(
+        [(d, slot, pos, name) for (d, wd, slot, pos, name) in data.rows if pos in positions],
+        key=lambda x: x[0],
+    )
+    if not entries:
+        return pd.DataFrame()
+
     viol = []
-    for d, posmap in days_sorted:
-        for p, name in posmap.items():
-            key = canon_name(name)
-            if not key:
+    flagged = set()  # (date, slot, pos) の集合。exact matchで既に検出済みならAI判定は重複させない
+
+    # --- 1) 完全一致（正規化後）判定 ---
+    last_seen = {}
+    for d, slot, p, name in entries:
+        key = canon_name(name)
+        if not key:
+            continue
+        if key in last_seen:
+            prev_date, prev_slot, prev_p, prev_name = last_seen[key]
+            gap = (d - prev_date).days
+            if 0 < gap <= 7:
+                viol.append({
+                    '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 1,
+                    'ルール': 'メイン/サブ商材（酷似品含む）を1週間空けず再使用',
+                    '該当箇所': f'{slot}{p}:{name[:20]}（前回 {prev_date.strftime("%-m/%-d")} {prev_slot}{prev_p}:{prev_name[:16]}）',
+                    '理由': f'{gap}日しか空いていない（要8日以上・完全一致）',
+                    '修正提案': '該当日か次回使用日をずらす', '重要度': '高',
+                })
+                flagged.add((d, slot, p))
+        last_seen[key] = (d, slot, p, name)
+
+    # --- 2) AIによる酷似判定（完全一致以外・直近7日以内の候補と比較） ---
+    client = data.ai_client
+    if client is not None:
+        for i, (d, slot, p, name) in enumerate(entries):
+            if (d, slot, p) in flagged:
                 continue
-            if key in last_seen:
-                prev_date, prev_p, prev_name = last_seen[key]
-                gap = (d - prev_date).days
-                if 0 < gap <= 7:
-                    viol.append({
-                        '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 1,
-                        'ルール': 'メイン/サブ商材（酷似品含む）を1週間空けず再使用',
-                        '該当箇所': f'{p}:{name[:20]}（前回 {prev_date.strftime("%-m/%-d")} {prev_p}:{prev_name[:16]}）',
-                        '理由': f'{gap}日しか空いていない（要8日以上）',
-                        '修正提案': '該当日か次回使用日をずらす', '重要度': '高',
-                    })
-            last_seen[key] = (d, p, name)
+            window_start = d - datetime.timedelta(days=7)
+            candidates = [nm for (d2, s2, p2, nm) in entries if window_start <= d2 < d]
+            similar = ai_similar_candidates(client, name, candidates)
+            if not similar:
+                continue
+            # 直近の該当候補（複数該当する場合は最も新しいもの）を前回使用として採用
+            prev_hits = [(d2, s2, p2, nm) for (d2, s2, p2, nm) in entries
+                         if window_start <= d2 < d and nm in similar]
+            if not prev_hits:
+                continue
+            prev_date, prev_slot, prev_p, prev_name = max(prev_hits, key=lambda x: x[0])
+            gap = (d - prev_date).days
+            viol.append({
+                '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 1,
+                'ルール': 'メイン/サブ商材（酷似品含む）を1週間空けず再使用',
+                '該当箇所': f'{slot}{p}:{name[:20]}（前回 {prev_date.strftime("%-m/%-d")} {prev_slot}{prev_p}:{prev_name[:16]}）',
+                '理由': f'{gap}日しか空いていない（要8日以上・AI判定で酷似）',
+                '修正提案': '該当日か次回使用日をずらす', '重要度': '高',
+            })
+            flagged.add((d, slot, p))
     return pd.DataFrame(viol)
 
 
 def check_rule3_5(data):
-    """No.3(挽肉重複) / No.5(鶏豚牛重複、No.34のハンバーグ例外込み)（昼のみ判定）"""
+    """No.3(挽肉重複) / No.5(鶏豚牛重複、No.34のハンバーグ例外込み)（昼夜それぞれの食事単位で判定）"""
     if not data.rows:
         return pd.DataFrame(), pd.DataFrame()
-    by_date = {}
+    by_ds = {}
     for (d, wd, slot, pos, name) in data.rows:
-        if slot == '昼' and pos in ('メイン', 'サブ'):
-            by_date.setdefault(d, {})[pos] = name
+        if pos in ('メイン', 'サブ'):
+            by_ds.setdefault((d, slot), {})[pos] = name
     v3, v5 = [], []
-    for d, posmap in sorted(by_date.items()):
+    for (d, slot), posmap in sorted(by_ds.items()):
         nm_m, nm_s = posmap.get('メイン', ''), posmap.get('サブ', '')
         if not nm_m or not nm_s:
             continue
@@ -398,14 +528,14 @@ def check_rule3_5(data):
             v3.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 3,
                 'ルール': '挽肉商材がメイン・サブメインで同日重複',
-                '該当箇所': f'メイン:{nm_m[:16]} / サブ:{nm_s[:16]}', '理由': f'両方「{gm}」',
+                '該当箇所': f'[{slot}] メイン:{nm_m[:16]} / サブ:{nm_s[:16]}', '理由': f'両方「{gm}」',
                 '修正提案': 'メインかサブの系統を変える', '重要度': '高',
             })
         if gm in ('鶏肉系', '豚肉系', '牛肉系'):
             v5.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 5,
                 'ルール': '鶏豚牛が同日でメイン・サブメインに重複（枠をずらす）',
-                '該当箇所': f'メイン:{nm_m[:16]} / サブ:{nm_s[:16]}', '理由': f'両方「{gm}」',
+                '該当箇所': f'[{slot}] メイン:{nm_m[:16]} / サブ:{nm_s[:16]}', '理由': f'両方「{gm}」',
                 '修正提案': 'メインかサブの系統を変える', '重要度': '高',
             })
     return pd.DataFrame(v3), pd.DataFrame(v5)
@@ -519,37 +649,61 @@ def check_rule12(data):
 
 
 def check_rule14(data):
-    """No.14: 75歳以上向け栄養素基準（月平均・75歳基準）"""
+    """No.14: 75歳以上向け栄養素基準（月平均・75歳基準、昼夜それぞれの基準値で判定）"""
     viol = []
-    for month, shoku in data.shoku.items():
-        if not all(c in shoku.columns for c in ['カロリー', 'たんぱく質', '食塩相当量']):
-            continue
-        sub = shoku[shoku['isDX']]
-        daily = sub.groupby('md')[['カロリー', 'たんぱく質', '食塩相当量']].sum().reset_index()
-        if not len(daily):
-            continue
-        bounds = NUTRI_BOUNDS['昼']
-        avg = daily[['カロリー', 'たんぱく質', '食塩相当量']].mean()
-        label = f'{month}月'
-        if avg['カロリー'] < bounds['kcal'][0] or avg['カロリー'] > bounds['kcal'][1]:
-            pos = '下限未達' if avg['カロリー'] < bounds['kcal'][0] else '上限超過'
-            viol.append({'日付': label, '曜日': '昼', 'No': 14, 'ルール': f'エネルギー月平均が{pos}',
-                         '該当箇所': f'{label}昼・月平均', '理由': f'{avg["カロリー"]:.0f}kcal（基準{bounds["kcal"][0]}-{bounds["kcal"][1]}kcal）',
-                         '修正提案': '全体のメニュー量・構成を見直す', '重要度': '高'})
-        if avg['食塩相当量'] > bounds['salt_max']:
-            viol.append({'日付': label, '曜日': '昼', 'No': 14, 'ルール': '食塩相当量の月平均が上限超過',
-                         '該当箇所': f'{label}昼・月平均', '理由': f'{avg["食塩相当量"]:.2f}g（上限{bounds["salt_max"]}g）',
-                         '修正提案': '調味料量を見直す', '重要度': '中'})
-        if avg['たんぱく質'] < bounds['protein_min']:
-            viol.append({'日付': label, '曜日': '昼', 'No': 14, 'ルール': 'たんぱく質の月平均が下限未達',
-                         '該当箇所': f'{label}昼・月平均', '理由': f'{avg["たんぱく質"]:.1f}g（下限{bounds["protein_min"]}g）',
-                         '修正提案': 'たんぱく質を含む食材を増やす', '重要度': '中'})
+    for slot_label, shoku_dict in [('昼', data.shoku), ('夜', data.shoku_night)]:
+        for month, shoku in shoku_dict.items():
+            if not all(c in shoku.columns for c in ['カロリー', 'たんぱく質', '食塩相当量']):
+                continue
+            sub = shoku[shoku['isDX']]
+            daily = sub.groupby('md')[['カロリー', 'たんぱく質', '食塩相当量']].sum().reset_index()
+            if not len(daily):
+                continue
+            bounds = NUTRI_BOUNDS[slot_label]
+            avg = daily[['カロリー', 'たんぱく質', '食塩相当量']].mean()
+            label = f'{month}月'
+            if avg['カロリー'] < bounds['kcal'][0] or avg['カロリー'] > bounds['kcal'][1]:
+                pos = '下限未達' if avg['カロリー'] < bounds['kcal'][0] else '上限超過'
+                viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': f'エネルギー月平均が{pos}',
+                             '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["カロリー"]:.0f}kcal（基準{bounds["kcal"][0]}-{bounds["kcal"][1]}kcal）',
+                             '修正提案': '全体のメニュー量・構成を見直す', '重要度': '高'})
+            if avg['食塩相当量'] > bounds['salt_max']:
+                viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': '食塩相当量の月平均が上限超過',
+                             '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["食塩相当量"]:.2f}g（上限{bounds["salt_max"]}g）',
+                             '修正提案': '調味料量を見直す', '重要度': '中'})
+            if avg['たんぱく質'] < bounds['protein_min']:
+                viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': 'たんぱく質の月平均が下限未達',
+                             '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["たんぱく質"]:.1f}g（下限{bounds["protein_min"]}g）',
+                             '修正提案': 'たんぱく質を含む食材を増やす', '重要度': '中'})
     return pd.DataFrame(viol)
 
 
 def check_rule15(data):
     """No.15: 週に1回、健康食材を使用する"""
     return _max_gap_check(data, is_health, 7, 15, '健康食材の使用間隔が週1回を下回る')
+
+
+def check_rule17(data):
+    """No.17: 1食につき赤・黄・緑の食材を必ず使用する（キーワード方式の暫定判定）"""
+    dr = data.date_range
+    viol = []
+    for d in dr:
+        prods = dishes_products(data, d)
+        allnames = [p for lst in prods.values() for p in lst]
+        if not allnames:
+            continue
+        has_red = any(any(k in p for k in RED_KW) for p in allnames)
+        has_yellow = any(any(k in p for k in YELLOW_KW) for p in allnames)
+        has_green = any(any(k in p for k in GREEN_KW) for p in allnames)
+        missing = [c for c, ok in [('赤', has_red), ('黄', has_yellow), ('緑', has_green)] if not ok]
+        if missing:
+            viol.append({
+                '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 17,
+                'ルール': '1食につき赤・黄・緑の食材を必ず使用', '該当箇所': '当日メニュー全体',
+                '理由': f'{"".join(missing)}系の食材が0件（キーワード方式のため未登録食材は検出漏れの可能性あり）',
+                '修正提案': f'{"".join(missing)}系の食材を1品追加', '重要度': '中',
+            })
+    return pd.DataFrame(viol)
 
 
 def check_rule21(data):
@@ -818,6 +972,7 @@ ALL_RULES = [
     ('No.12 揚げ物3品まで', check_rule12),
     ('No.14 栄養素基準（月平均）', check_rule14),
     ('No.15 健康食材 週1回以上', check_rule15),
+    ('No.17 1食で赤・黄・緑を使用', check_rule17),
     ('No.21 禁止食材・調味料', check_rule21),
     ('No.22 魚メニュー3日に1回', check_rule22),
     ('No.23 食べにくさチェックリスト', check_rule23),
@@ -832,8 +987,9 @@ ALL_RULES = [
 ]
 
 
-def run_all_checks(xlsx_path, night_csv_paths=None):
+def run_all_checks(xlsx_path, night_csv_paths=None, ai_client=None):
     data = load_workbook_data(xlsx_path, night_csv_paths)
+    data.ai_client = ai_client
     frames = []
     for label, fn in ALL_RULES:
         try:

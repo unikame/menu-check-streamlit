@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-メニュー違反チェック（Streamlit版）
+やどかり弁当 メニュー違反チェック（Streamlit版）
 Streamlit Community Cloud (share.streamlit.io) での公開を想定。
 """
 import io
@@ -14,7 +14,7 @@ import streamlit as st
 
 import menu_checker as mc
 
-st.set_page_config(page_title="メニューチェック", layout="wide")
+st.set_page_config(page_title="やどかり弁当 メニューチェック", layout="wide")
 
 SEVERITY_ORDER = {"高": 0, "中": 1, "低": 2}
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -133,7 +133,7 @@ st.markdown(
 _logo_svg = load_logo_svg()
 _header_html = (
     '<div class="glug-header">' + _logo_svg
-    + '<p class="glug-title">メニューチェック</p></div>'
+    + '<p class="glug-title">やどかり弁当 メニューチェック</p></div>'
     + '<p class="glug-caption">37項目のメニュー構成ルールに照らして自動チェックします。</p>'
 )
 st.markdown(
@@ -156,9 +156,24 @@ with st.expander("アップロードするファイルの形式", expanded=False
 
 main_file = st.file_uploader("① メニューワークブック（必須・.xlsx）", type=["xlsx"])
 night_files = st.file_uploader(
-    "② 昼・夕の食材CSV（任意・複数選択可、ファイル名に月を含めてください）",
+    "② 夜（夕）食材CSV（任意・複数選択可、ファイル名に月を含めてください）",
     type=["csv"], accept_multiple_files=True,
 )
+
+_ai_client = mc.get_anthropic_client()
+if _ai_client is not None:
+    use_ai = st.checkbox(
+        "No.1（メイン/サブ商材の酷似判定）にAIを使う（Claude Haiku）",
+        value=True,
+        help="商品名が完全一致しなくても、料理として酷似している場合（例：おろしハンバーグ／"
+             "コク深い味噌の甘辛ハンバーグ）をAIが判定します。件数が多いと数十秒〜数分かかることがあります。",
+    )
+else:
+    use_ai = False
+    st.caption(
+        "※ No.1のAI酷似判定は、Streamlit CloudのSecretsに ANTHROPIC_API_KEY が設定されると使えるようになります"
+        "（未設定の間は、商品名の完全一致のみで判定します）。"
+    )
 
 run = st.button("チェックを実行", type="primary", disabled=(main_file is None))
 
@@ -181,8 +196,12 @@ if run and main_file is not None:
             night_csv_paths[month] = p
 
         try:
-            with st.spinner("チェック中..."):
-                combined, summary = mc.run_all_checks(main_path, night_csv_paths)
+            spinner_msg = "チェック中...（AI酷似判定を含むため数分かかる場合があります）" if (use_ai and _ai_client) else "チェック中..."
+            with st.spinner(spinner_msg):
+                combined, summary = mc.run_all_checks(
+                    main_path, night_csv_paths,
+                    ai_client=(_ai_client if use_ai else None),
+                )
         except Exception as e:
             st.error(f"チェック中にエラーが発生しました: {e}")
             st.exception(e)
