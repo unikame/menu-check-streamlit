@@ -1219,45 +1219,78 @@ def check_rule4_36(data):
     return pd.DataFrame(viol)
 
 
+# No.8で「調味料の中身」として見る食材ワード。
+# 調味料.csv の商品名に含まれる“素材名”のうち、同じ食材が生食材としても使われうるものだけを挙げる。
+# 塩・こしょう・砂糖・醤油・酢・油のような、ほぼ全料理に入る基礎調味料の要素は
+# 検出してもきりが無いため入れない（ユーザー確認済み）。
+# 玉ねぎ(オニオン)・にんにく等の基礎野菜は、塩こしょうと同じくほぼ全料理で使われ
+# 検出してもきりが無いため入れない（ユーザー確認済み。BASE_VEG_KWと同じ考え方）。
+SEASONING_FOOD_KW = [
+    '生姜', 'しょうが', 'ごま', '胡麻', '梅', '柚子', 'ゆず', '青じそ', '大葉', '昆布',
+    'かつお', 'トマト', 'バジル', 'アンチョビ', '豆乳', 'ピーナッツ', '大根おろし',
+    'レモン', 'マスタード', 'チーズ', 'バター', 'わさび', 'ゆかり', 'しそ',
+]
+
+
 def check_rule8(data):
-    """No.8: 1食のうち食材と調味料での食材被りはNG。
-    調味料の判定は、キーワードではなく調味料.csv（実際の調味料マスタ、商品ID）で行う
-    （ユーザー指定）。マスタに載っていない汎用調味料表記が漏れる可能性はあるが、
-    「塩こしょう」等の誤除外/除外漏れが起きにくく実データに忠実。基礎野菜(is_base_veg)は
-    従来通りキーワードで除外する。"""
+    """No.8: 1食のうち『食材と調味料での食材被り』はNG。
+    例：生姜おろし（食材）と やどかり国産生姜焼きのタレ（調味料）を同じ食事内で使う。
+    調味料かどうかは調味料.csv（商品ID）で判定し、その商品名に含まれる素材名
+    （SEASONING_FOOD_KW）が、同じ食事の“調味料でない食材”にも含まれていればNGとする。
+    塩・こしょう・醤油・砂糖などの基礎調味料要素は、ほぼ全料理で使われ検出してもきりが無いため
+    SEASONING_FOOD_KWに含めない（ユーザー確認済み）。
+    昼/夜は別々の「1食」として判定する。"""
+    if not data.day_csv or not data.seasoning_ids:
+        return pd.DataFrame()
     dr = data.date_range
     viol = []
     for d in dr:
-        month = d.month
-        for meal, shoku in [('昼', data.shoku.get(month)), ('夜', data.shoku_night.get(month))]:
-            if shoku is None:
+        for slot in ('昼', '夜'):
+            df = data.day_csv.get((d.month, slot))
+            if df is None:
                 continue
-            md = (d.month, d.day)
-            sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
-            prod_recipes = {}
-            for _, r in sub.iterrows():
-                prod = str(r['商品名'])
-                qty = r.get('食材数量')
-                pid = pd.to_numeric(r.get('商品ID'), errors='coerce')
-                is_seasoning = (not pd.isna(pid)) and (int(pid) in data.seasoning_ids)
-                if pd.isna(qty) or qty == 0 or cm.is_noise(prod) or is_seasoning or is_base_veg(prod):
+            sub = df[(df['md'] == (d.month, d.day)) &
+                     (~df['レシピ名'].astype(str).str.contains('備品', na=False))]
+            if not len(sub):
+                continue
+            ids = pd.to_numeric(sub['商品ID'], errors='coerce')
+            seasonings = sub[ids.isin(data.seasoning_ids)].drop_duplicates('商品ID')
+            foods = sub[~ids.isin(data.seasoning_ids)]
+            seen = set()
+            for _, sr in seasonings.iterrows():
+                sname = str(sr['商品名'])
+                sname_n = _nfkc(sname)
+                if cm.is_noise(sname):
                     continue
-                recipe = cm.norm_recipe(r['レシピ名'])
-                if not recipe or '備品' in recipe:
-                    continue
-                prod_recipes.setdefault(prod, set()).add(recipe)
-            for prod, recipes in prod_recipes.items():
-                if len(recipes) >= 2:
-                    group = cm.group_from_name(prod)
-                    cand = _pick_least_recent(_group_products_map(data).get(group, []),
-                                               _usage_history(data), d, exclude={prod})
-                    suggestion = f'一方を同系統（{group}）の「{cand[:22]}」に変更' if cand else 'いずれかを別食材/調味料に'
+                for kw in SEASONING_FOOD_KW:
+                    if kw not in sname_n:
+                        continue
+                    hit = foods[foods['商品名'].astype(str).apply(lambda x: kw in _nfkc(x))]
+                    # 同一レシピ内での被り（例：豚肉生姜焼きに生姜おろし＋生姜焼きのタレ）は
+                    # 料理として自然なため対象外。別レシピ間の被りのみをNGとする（ユーザー確認済み）。
+                    hit = hit[hit['レシピ名'].astype(str) != str(sr['レシピ名'])]
+                    if not len(hit):
+                        continue
+                    fname = str(hit['商品名'].iloc[0])
+                    key = (slot, kw)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    frecipe = str(hit['レシピ名'].iloc[0])
+                    srecipe = str(sr['レシピ名'])
+                    cand = _pick_least_recent(
+                        [n for n in data.seasoning_names.values() if kw not in _nfkc(n)],
+                        _usage_history(data), d, exclude={sname})
+                    suggestion = f'調味料を「{cand[:22]}」等、{kw}を含まないものに変更' if cand \
+                        else f'調味料か食材のどちらかを{kw}以外に変更'
                     viol.append({
-                        '日付': d.strftime('%-m/%-d'), '曜日': meal, 'No': 8,
-                        'ルール': '1食内で食材/調味料が複数レシピに重複使用',
-                        '該当箇所': f'[{meal}] {prod[:26]} → ' + ' / '.join(list(recipes)[:4]),
-                        '理由': f'{len(recipes)}レシピで使用', '修正提案': suggestion, '重要度': '低',
+                        '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 8,
+                        'ルール': '1食内で食材と調味料の中身が被っている',
+                        '該当箇所': f'[{slot}] {kw}：{fname[:20]}（{frecipe[:14]}） × {sname[:22]}（{srecipe[:14]}）',
+                        '理由': f'食材と調味料の両方に「{kw}」が含まれる',
+                        '修正提案': suggestion, '重要度': '低',
                     })
+                    break
     return pd.DataFrame(viol)
 
 
