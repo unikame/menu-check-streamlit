@@ -142,6 +142,14 @@ VEG_TIERS = [
 # チェックでは実質常に満たされるため対象外とし、1.5日以上の間隔が必要な階層のみ判定する。
 # 各要素: (match_type('id'/'name'), key(商品ID or レシピ名に含むキーワード), 名寄せ用キーワード,
 #          基本必要日数, メニュー名に記載がある場合の必要日数, 昼夜連続(半日)は例外的にOKか, 表示名)
+# 同シートの「昼･夜、夜･昼使用可能」「連続OK（半日空いていればOK）」階層の商品ID。
+# 間隔制約がほぼ無いため、No.30違反時の『代わりに使える野菜』候補として使う。
+VEG_FLEXIBLE_IDS = [
+    3001891, 3002435, 3001871, 3002300, 3002403, 3001844, 3002158,     # 昼夜/夜昼 使用可能
+    3001945, 3001944, 3002217, 3000080, 3000914, 3000001, 3002357,     # 連続OK（半日）
+    3002248, 3003055, 3002192, 3003057, 3001890, 3000024, 3003009, 3001403,
+]
+
 VEG_TIER_MASTER = [
     # 半日階層だが、ほうれん草のみ1.5日に格上げ（シートD11注記）
     ('id', 3002349, 'ほうれん草', 1.5, 3, False, '自然解凍 ほうれん草IQF 500g'),
@@ -360,6 +368,7 @@ class MenuData:
         self.seasoning_names = {}        # 調味料.csv由来の 商品ID -> 商品名。No.19の代替案提案用
         self.ng_product_ids = set()      # 食材データ.xlsx「禁止食材・調味料該当」由来の商品ID集合。No.21専用
         self.ng_product_names = {}       # 同シート由来の 商品ID -> 商品名
+        self.recipe_nutrition = None     # 食材データ.xlsx由来のレシピ別栄養価。No.14の代替メニュー提案用
         self._usage_hist = None          # 商品名(NFKC) -> 使用日リスト（キャッシュ、代替案提案用）
 
 
@@ -550,6 +559,36 @@ def load_ng_product_ids(shoku_data_path, sheet='禁止食材・調味料該当')
     return set(ids), name_map
 
 
+def load_recipe_nutrition(shoku_data_path):
+    """食材データ.xlsx の「レシピID/名称/カロリー/たんぱく質/食塩相当量」列を持つ全シート
+    （調理法（当日揚げ）／調理法（前日揚げ）／マッシュ該当 等）を統合し、
+    レシピ単位の栄養価一覧DataFrameを返す。No.14の具体的な代替メニュー提案に使う。"""
+    wb = openpyxl.load_workbook(shoku_data_path, data_only=True)
+    frames = []
+    for s in wb.sheetnames:
+        ws = wb[s]
+        rows = list(ws.iter_rows(min_row=3, values_only=True))
+        if not rows or not rows[0]:
+            continue
+        cols = [str(c) if c is not None else '' for c in rows[0]]
+        if 'レシピID' not in cols or 'カロリー' not in cols:
+            continue
+        df = pd.DataFrame(rows[1:], columns=cols)
+        keep = [c for c in ['レシピID', '名称', 'カロリー', 'たんぱく質', '食塩相当量'] if c in df.columns]
+        df = df[keep].dropna(subset=['レシピID', '名称'])
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=['レシピID', '名称', 'カロリー', 'たんぱく質', '食塩相当量'])
+    out = pd.concat(frames, ignore_index=True).drop_duplicates(subset='レシピID')
+    for c in ['カロリー', 'たんぱく質', '食塩相当量']:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors='coerce')
+        else:
+            out[c] = pd.NA
+    out['名称'] = out['名称'].astype(str).apply(_nfkc)
+    return out
+
+
 def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                         seasoning_csv_path=None, fried_master_path=None):
     """xlsx_path: メインのメニューワークブック。
@@ -583,6 +622,10 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
             data.ng_product_ids, data.ng_product_names = load_ng_product_ids(fried_master_path)
         except Exception as e:
             data.warnings.append(f'食材データ.xlsx（禁止食材・調味料該当）の読み込みに失敗しました（{e}）')
+        try:
+            data.recipe_nutrition = load_recipe_nutrition(fried_master_path)
+        except Exception as e:
+            data.warnings.append(f'食材データ.xlsx（レシピ別栄養価）の読み込みに失敗しました（{e}）')
     for key, path in day_csv_paths.items():
         try:
             df = pd.read_csv(path)
@@ -876,6 +919,67 @@ def _nonfried_dish_names(data):
                 fried_names.add(str(recipe))
     data._nonfried_names = all_names - fried_names
     return data._nonfried_names
+
+
+def _nutrition_candidates(data, column, ascending=False, top=3):
+    """レシピ別栄養価マスタ(recipe_nutrition)から、指定栄養素の多い順（または少ない順）に
+    レシピ名を返す。No.14の「具体的にどのメニューを足す/差し替えるか」の提案に使う。"""
+    df = data.recipe_nutrition
+    if df is None or not len(df) or column not in df.columns:
+        return []
+    sub = df.dropna(subset=[column]).sort_values(column, ascending=ascending)
+    names = []
+    for nm in sub['名称'].astype(str):
+        nm = nm.strip()
+        if nm and nm not in names:
+            names.append(nm)
+        if len(names) >= top:
+            break
+    return names
+
+
+def _next_weekday(d, max_ahead=7):
+    """dの翌日以降で最初の平日（月〜金）を返す。見つからなければNone。
+    No.27/28の『いつの平日枠に振り替えるか』の具体案に使う。"""
+    d0 = pd.Timestamp(d)
+    for i in range(1, max_ahead + 1):
+        nd = d0 + pd.Timedelta(days=i)
+        if nd.weekday() < 5:
+            return nd
+    return None
+
+
+def _flexible_veg_names(data):
+    """VEG_FLEXIBLE_IDS（間隔制約がほぼ無い野菜）の実データ上の商品名一覧（キャッシュ有）。
+    No.30違反時の『代わりに使える野菜』提案に使う。"""
+    if getattr(data, '_flex_veg', None) is not None:
+        return data._flex_veg
+    names = set()
+    ids = set(VEG_FLEXIBLE_IDS)
+    for df in data.day_csv.values():
+        hit = df[pd.to_numeric(df['商品ID'], errors='coerce').isin(ids)]
+        names |= set(hit['商品名'].astype(str))
+    data._flex_veg = sorted(n for n in names if '終売' not in n)
+    return data._flex_veg
+
+
+def _ng_replacement(data, prod_name, date):
+    """No.21用：禁止商品の具体的な代替案を返す。
+    調味料マスタに載っている商品なら別の調味料を、そうでなければ同じ主原料グループの
+    別商材を、いずれも『その時点で直近使われていないもの』から選ぶ。"""
+    hist = _usage_history(data)
+    if data.seasoning_names:
+        # 禁止商品が調味料（味付けの素/タレ類）なら、別の調味料を提案する
+        if any(k in _nfkc(prod_name) for k in ['素', 'タレ', 'たれ', 'ジャン', 'ソース', 'ドレッシング']):
+            cand = _pick_least_recent(list(data.seasoning_names.values()), hist, date,
+                                       exclude={prod_name})
+            if cand:
+                return f'「{cand[:24]}」等、別の調味料に差し替え'
+    group = cm.group_from_name(prod_name)
+    cand = _pick_least_recent(_group_products_map(data).get(group, []), hist, date, exclude={prod_name})
+    if cand:
+        return f'同系統（{group}）の「{cand[:24]}」に差し替え'
+    return '代替食材/調味料に変更'
 
 
 def _filtered_dish_hist(data, match_fn):
@@ -1423,22 +1527,33 @@ def check_rule14(data):
     viol = []
     slot_label = '昼'
     bounds = NUTRI_BOUNDS[slot_label]
+    # 具体的な代替メニュー候補（食材データ.xlsxのレシピ別栄養価から高カロリー/高たんぱく/低塩を抽出）
+    hi_kcal = _nutrition_candidates(data, 'カロリー', ascending=False)
+    lo_kcal = _nutrition_candidates(data, 'カロリー', ascending=True)
+    hi_prot = _nutrition_candidates(data, 'たんぱく質', ascending=False)
+    lo_salt = _nutrition_candidates(data, '食塩相当量', ascending=True)
+
+    def _sug(names, verb):
+        return f'{verb}（候補: {" / ".join(n[:16] for n in names)}）' if names else verb
     for month, df in data.nutrition_daily.items():
         avg = df[['kcal', 'protein', 'salt']].mean()
         label = f'{month}月'
         if avg['kcal'] < bounds['kcal'][0] or avg['kcal'] > bounds['kcal'][1]:
-            pos = '下限未達' if avg['kcal'] < bounds['kcal'][0] else '上限超過'
+            low = avg['kcal'] < bounds['kcal'][0]
+            pos = '下限未達' if low else '上限超過'
+            sug = _sug(hi_kcal, '高カロリーのメニューに差し替え/追加') if low \
+                else _sug(lo_kcal, '低カロリーのメニューに差し替え')
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': f'エネルギー月平均が{pos}',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["kcal"]:.0f}kcal（基準{bounds["kcal"][0]}-{bounds["kcal"][1]}kcal）',
-                         '修正提案': '全体のメニュー量・構成を見直す', '重要度': '高'})
+                         '修正提案': sug, '重要度': '高'})
         if avg['salt'] > bounds['salt_max']:
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': '食塩相当量の月平均が上限超過',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["salt"]:.2f}g（上限{bounds["salt_max"]}g）',
-                         '修正提案': '調味料量を見直す', '重要度': '中'})
+                         '修正提案': _sug(lo_salt, '低塩分のメニューに差し替え'), '重要度': '中'})
         if avg['protein'] < bounds['protein_min']:
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': 'たんぱく質の月平均が下限未達',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["protein"]:.1f}g（下限{bounds["protein_min"]}g）',
-                         '修正提案': 'たんぱく質を含む食材を増やす', '重要度': '中'})
+                         '修正提案': _sug(hi_prot, '高たんぱくのメニューに差し替え/追加'), '重要度': '中'})
     for month, shoku in data.nutrition_shoku.items():
         if month in data.nutrition_daily:
             continue  # 栄養価シートが優先。使用食材シートは無い月のみのフォールバック
@@ -1451,18 +1566,21 @@ def check_rule14(data):
         avg = daily[['カロリー', 'たんぱく質', '食塩相当量']].mean()
         label = f'{month}月'
         if avg['カロリー'] < bounds['kcal'][0] or avg['カロリー'] > bounds['kcal'][1]:
-            pos = '下限未達' if avg['カロリー'] < bounds['kcal'][0] else '上限超過'
+            low = avg['カロリー'] < bounds['kcal'][0]
+            pos = '下限未達' if low else '上限超過'
+            sug = _sug(hi_kcal, '高カロリーのメニューに差し替え/追加') if low \
+                else _sug(lo_kcal, '低カロリーのメニューに差し替え')
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': f'エネルギー月平均が{pos}',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["カロリー"]:.0f}kcal（基準{bounds["kcal"][0]}-{bounds["kcal"][1]}kcal）',
-                         '修正提案': '全体のメニュー量・構成を見直す', '重要度': '高'})
+                         '修正提案': sug, '重要度': '高'})
         if avg['食塩相当量'] > bounds['salt_max']:
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': '食塩相当量の月平均が上限超過',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["食塩相当量"]:.2f}g（上限{bounds["salt_max"]}g）',
-                         '修正提案': '調味料量を見直す', '重要度': '中'})
+                         '修正提案': _sug(lo_salt, '低塩分のメニューに差し替え'), '重要度': '中'})
         if avg['たんぱく質'] < bounds['protein_min']:
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': 'たんぱく質の月平均が下限未達',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["たんぱく質"]:.1f}g（下限{bounds["protein_min"]}g）',
-                         '修正提案': 'たんぱく質を含む食材を増やす', '重要度': '中'})
+                         '修正提案': _sug(hi_prot, '高たんぱくのメニューに差し替え/追加'), '重要度': '中'})
     return pd.DataFrame(viol)
 
 
@@ -1572,24 +1690,32 @@ def check_rule18(data, min_weight_g=212):
                 continue
             total = 0.0
             unknown = []
+            weights = []
             for recipe, grp in sub_day.groupby('レシピ名', sort=False):
                 w = _recipe_weight_g(grp)
                 if w is None:
                     unknown.append(str(recipe))
                     continue
                 total += w
+                weights.append((w, str(recipe)))
             if unknown:
                 # 重量不明レシピがあれば合計は過小評価の可能性が高いため、参考情報として理由に残す
                 unknown_note = f'（重量不明レシピ{len(unknown)}件を除く: ' + '/'.join(u[:10] for u in unknown[:3]) + '）'
             else:
                 unknown_note = ''
             if total < min_weight_g:
+                short = min_weight_g - total
+                if weights:
+                    w_min, r_min = min(weights)
+                    sug = f'最も軽い「{r_min[:18]}」（約{w_min:.0f}g）を中心に、計{short:.0f}g分を増量'
+                else:
+                    sug = f'副菜等で計{short:.0f}g分を増量'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 18,
                     'ルール': '1食の重量が下限（M=212g）未達',
                     '該当箇所': f'[{slot}] 合計約{total:.0f}g',
                     '理由': f'下限{min_weight_g}gに対し約{total:.0f}g{unknown_note}（容器・カップ重量は含まず）',
-                    '修正提案': '副菜等の量を増やす', '重要度': '中',
+                    '修正提案': sug, '重要度': '中',
                 })
     return pd.DataFrame(viol)
 
@@ -1690,7 +1816,9 @@ def check_rule21(data):
                         '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 21,
                         'ルール': '禁止食材・調味料の使用（禁止食材マスタ照合）',
                         '該当箇所': f'[{slot}] {str(recipe)[:22]} → {"/".join(prods)[:30]}',
-                        '理由': '「禁止食材・調味料該当」シート登録商品を使用', '修正提案': '代替食材/調味料に変更', '重要度': '高',
+                        '理由': '「禁止食材・調味料該当」シート登録商品を使用',
+                        '修正提案': _ng_replacement(data, prods[0], d) if prods else '代替食材/調味料に変更',
+                        '重要度': '高',
                     })
         return pd.DataFrame(viol)
     # フォールバック：禁止食材マスタが無い場合は従来のキーワード判定
@@ -1747,11 +1875,16 @@ def check_rule23(data):
                     if key in seen:
                         continue
                     seen.add(key)
+                    safe_hist = _filtered_dish_hist(
+                        data, lambda nm: not any(k in nm for k in EAT_NG))
+                    cand = _pick_least_recent(safe_hist.keys(), safe_hist, d)
+                    sug = f'「{cand[:20]}」等、食べにくさ該当の無いメニューに差し替え（最終判断は商品開発部）' \
+                        if cand else '商品開発部のたべやすさ基準で再確認'
                     viol.append({
                         '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 23,
                         'ルール': '食べにくさチェックリスト該当（要確認）',
                         '該当箇所': f'{n[:20]}（{kw}）', '理由': f'NG例「{kw}」に該当＝{reason}',
-                        '修正提案': '商品開発部のたべやすさ基準で再確認', '重要度': '低（参考実装・人による最終判断が必要）',
+                        '修正提案': sug, '重要度': '低（参考実装・人による最終判断が必要）',
                     })
     return pd.DataFrame(viol)
 
@@ -1854,12 +1987,14 @@ def check_rule30(data):
                 continue
             required = doubled_days if named1 else base_days
             if gap < required:
+                cand = _pick_least_recent(_flexible_veg_names(data), _usage_history(data), dt1)
+                sug = f'「{cand[:22]}」等、間隔制約の緩い野菜に差し替え' if cand else '使用日をずらす'
                 viol.append({
                     '日付': d1.strftime('%-m/%-d'), '曜日': f'{slot1}/{WD_JP[d1.weekday()]}', 'No': 30,
                     'ルール': f'野菜(FDメニュールール)の使用間隔違反：{label}',
                     '該当箇所': f'{n1[:24]}（前回{d0.strftime("%-m/%-d")}{slot0}）',
                     '理由': f'{gap:g}日しか空いていない（要{required}日以上{"・メニュー名記載のため2倍適用" if named1 else ""}）',
-                    '修正提案': '使用日をずらす', '重要度': '低（参考実装）',
+                    '修正提案': sug, '重要度': '低（参考実装）',
                 })
     return pd.DataFrame(viol)
 
@@ -1877,12 +2012,15 @@ def check_rule27(data):
                 if kw in n:
                     wd = d.weekday()
                     if wd >= 5:
+                        nxt = _next_weekday(d)
+                        sug = f'{nxt.strftime("%-m/%-d")}({WD_JP[nxt.weekday()]})等の平日枠に振り替える' \
+                            if nxt is not None else '平日の枠に振り替える'
                         viol.append({
                             '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[wd], 'No': 27,
                             'ルール': 'FD専用商材（魚弁当）は平日に入れる',
                             '該当箇所': n[:30],
                             '理由': f'FD専用魚商材「{kw}」が休日（{WD_JP[wd]}）に使用されている',
-                            '修正提案': '平日の枠に振り替える', '重要度': '中（参考実装・魚弁当のみ）',
+                            '修正提案': sug, '重要度': '中（参考実装・魚弁当のみ）',
                         })
     # ★マーク商品の「平日夜に◯回は入れる」月内最低回数チェック
     for pid, kw, min_count, waku in FD_WEEKDAY_NIGHT_QUOTA:
@@ -1929,12 +2067,15 @@ def check_rule28(data):
             if wd in ('土', '日'):
                 problems.append(f'{wd}曜（休日）に使用（要:平日）')
             if problems:
+                nxt = _next_weekday(d) if wd in ('土', '日') else None
+                sug = f'{nxt.strftime("%-m/%-d")}({WD_JP[nxt.weekday()]})等の平日の夜枠に振り替える' \
+                    if nxt is not None else '同日の夜枠に移す（平日夜が要件）'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': wd, 'No': 28,
                     'ルール': '本日の魚料理は平日の夜に採用する',
                     '該当箇所': name[:30],
                     '理由': ' / '.join(problems),
-                    '修正提案': '平日の夜枠に振り替える', '重要度': '中',
+                    '修正提案': sug, '重要度': '中',
                 })
     return pd.DataFrame(viol)
 
@@ -1997,11 +2138,15 @@ def check_rule31(data):
         names = raw_dish_names(data, d)
         mash = sorted(n for n in names if 'マッシュ' in n)
         if len(mash) >= 2:
+            nomash_hist = _filtered_dish_hist(data, lambda nm: 'マッシュ' not in nm)
+            cand = _pick_least_recent(nomash_hist.keys(), nomash_hist, d)
+            sug = f'一方を「{cand[:20]}」等に差し替え、またはメニュー名から「マッシュ」を外す' \
+                if cand else '一方を別の調理法名に'
             viol.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 31,
                 'ルール': 'メニュー名に「マッシュ」と明記された商材が同日2品以上',
                 '該当箇所': ' / '.join(mash), '理由': f'マッシュ系が{len(mash)}品',
-                '修正提案': '一方を別の調理法名に', '重要度': '低',
+                '修正提案': sug, '重要度': '低',
             })
     return pd.DataFrame(viol)
 
