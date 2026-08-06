@@ -689,6 +689,18 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
     months = sorted(set(shoku_sheets) | set(lunchdinner_sheets))
     if not months:
         raise ValueError('「N月使用食材」「N月昼夕...」形式のシートが見つかりませんでした。シート名をご確認ください。')
+    # 食材CSVが渡された場合は、そのCSVがある月だけを判定対象にする（ユーザー指定）。
+    # 1ヶ月分だけアップロードした時に、ワークブック内の他の月まで（使用食材シートへの
+    # フォールバックで）判定されてしまうのを防ぐ。
+    if day_csv_paths:
+        csv_months = {m for (m, _slot) in day_csv_paths}
+        excluded = [m for m in months if m not in csv_months]
+        if excluded and any(m in csv_months for m in months):
+            months = [m for m in months if m in csv_months]
+            data.warnings.append(
+                '食材CSVがある月のみを判定対象にしました（対象外: '
+                + '、'.join(f'{m}月' for m in excluded)
+                + '）。全期間を見る場合はその月の食材CSVも追加してください。')
     data.months = months
     NUTRI_COLS = ['カロリー', 'たんぱく質', '食塩相当量']
     for month in months:
