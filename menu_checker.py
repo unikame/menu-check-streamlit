@@ -2040,11 +2040,44 @@ BENTO_SIZE_SPEC = {
 }
 BENTO_SIZE = 'M'   # 実データがどのサイズのものかを指定する
 
+# 「備品」レシピの中に入っているが、実際には食べる食材（ユーザー確認済み・重量に加算する）。
+# 値は1個あたりのグラム数。None は「食材数量がそのままg」の意味。
+# 容器・蓋・フードカップ等の非食材は、ここに載っていないので加算されない。
+BIHIN_FOOD_ITEMS = {
+    '厚焼玉子': 15.0,   # 「450g 30カット」＝1切あたり15g
+    'つぼ漬': None,     # g単位で登録されているため数量をそのまま使う
+}
+
+
+def _bihin_food_g(sub_all):
+    """1食分の全行（備品レシピを含む）から、備品レシピ内の『食べる食材』の重量(g)を返す。
+    戻り値: (合計g, 内訳の文字列リスト)"""
+    b = sub_all[sub_all['レシピ名'].astype(str).str.contains('備品', na=False)]
+    total, detail, seen = 0.0, [], set()
+    for _, r in b.iterrows():
+        name = _nfkc(str(r['商品名']))
+        qty = pd.to_numeric(r.get('食材数量'), errors='coerce')
+        if pd.isna(qty) or float(qty) <= 0:
+            continue
+        for kw, per in BIHIN_FOOD_ITEMS.items():
+            if kw not in name:
+                continue
+            if kw in seen:
+                break
+            seen.add(kw)
+            w = float(qty) * per if per is not None else float(qty)
+            total += w
+            detail.append(f'{kw}{w:.0f}g')
+            break
+    return total, detail
+
 
 def check_rule18(data, size=None):
     """No.18: 1食あたりの重量下限。
     下限（Mサイズ=212g）は容器重量を含んだ総重量なので、
-        総重量 = 食材重量（_recipe_weight_g の合計） + 容器重量（M=18.0g）
+        総重量 = 食材重量（_recipe_weight_g の合計）
+                 + 備品レシピ内の食材（厚焼玉子・つぼ漬け等：BIHIN_FOOD_ITEMS）
+                 + 容器重量（M=18.0g）
     として比較する（ユーザー確認済み）。フードカップの重量は考慮しない。
     レシピごとに _recipe_weight_g() で重量を推定し、1食（昼/夜別）の合計を使う。
     サイズ別の値は BENTO_SIZE_SPEC を参照。下限が未設定のサイズ（現状S）は判定しない。"""
@@ -2066,7 +2099,8 @@ def check_rule18(data, size=None):
             df = data.day_csv.get((d.month, slot))
             if df is None:
                 continue
-            sub_day = df[(df['md'] == (d.month, d.day)) & (~df['レシピ名'].astype(str).str.contains('備品', na=False))]
+            sub_all = df[df['md'] == (d.month, d.day)]
+            sub_day = sub_all[~sub_all['レシピ名'].astype(str).str.contains('備品', na=False)]
             if not len(sub_day):
                 continue
             food = 0.0
@@ -2079,11 +2113,15 @@ def check_rule18(data, size=None):
                     continue
                 food += w
                 weights.append((w, str(recipe)))
+            # 備品レシピ内の食材（厚焼玉子・つぼ漬け等）も1食の重量に含める（ユーザー確認済み）
+            bihin_g, bihin_detail = _bihin_food_g(sub_all)
+            food += bihin_g
             if unknown:
                 # 重量不明レシピがあれば合計は過小評価の可能性が高いため、参考情報として理由に残す
                 unknown_note = f'（重量不明レシピ{len(unknown)}件を除く: ' + '/'.join(u[:10] for u in unknown[:3]) + '）'
             else:
                 unknown_note = ''
+            bihin_note = f'＋備品内の食材{bihin_g:.0f}g（{"・".join(bihin_detail)}）' if bihin_g else ''
             total = food + container_g
             if total < min_total_g:
                 short = min_total_g - total
@@ -2097,7 +2135,7 @@ def check_rule18(data, size=None):
                     'ルール': f'1食の重量が下限（{size}={min_total_g}g）未達',
                     '該当箇所': f'[{slot}] 総重量約{total:.0f}g',
                     '理由': f'下限{min_total_g}g（容器{container_g:g}g込み）に対し約{total:.0f}g'
-                            f'＝食材{food:.0f}g＋容器{container_g:g}g{unknown_note}'
+                            f'＝食材{food:.0f}g{bihin_note}＋容器{container_g:g}g{unknown_note}'
                             '※フードカップの重量は含まず',
                     '修正提案': sug, '重要度': '中',
                 })
