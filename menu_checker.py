@@ -122,9 +122,9 @@ def _derive_slot(row):
 
 
 def _date_sort_key(v):
-    """'7/1'→(7,1,1) / '7月'→(7,0,0)（月次集計行はその月の先頭）で並べ替えるキーを返す。"""
+    """'7/1'→(7,1,1) / '7月(月次)'→(7,0,0)（月次集計行はその月の先頭）で並べ替えるキーを返す。"""
     s = str(v)
-    m = re.match(r'^(\d{1,2})月$', s)
+    m = re.match(r'^(\d{1,2})月', s)
     if m:
         return (int(m.group(1)), 0, 0)
     m = re.match(r'^(\d{1,2})/(\d{1,2})', s)
@@ -1610,7 +1610,7 @@ def check_rule14(data):
         return f'{verb}（候補: {" / ".join(n[:16] for n in names)}）' if names else verb
     for month, df in data.nutrition_daily.items():
         avg = df[['kcal', 'protein', 'salt']].mean()
-        label = f'{month}月'
+        label = f'{month}月(月次)'
         if avg['kcal'] < bounds['kcal'][0] or avg['kcal'] > bounds['kcal'][1]:
             low = avg['kcal'] < bounds['kcal'][0]
             pos = '下限未達' if low else '上限超過'
@@ -1637,7 +1637,7 @@ def check_rule14(data):
         if not len(daily):
             continue
         avg = daily[['カロリー', 'たんぱく質', '食塩相当量']].mean()
-        label = f'{month}月'
+        label = f'{month}月(月次)'
         if avg['カロリー'] < bounds['kcal'][0] or avg['カロリー'] > bounds['kcal'][1]:
             low = avg['カロリー'] < bounds['kcal'][0]
             pos = '下限未達' if low else '上限超過'
@@ -2095,7 +2095,17 @@ def check_rule27(data):
                             '理由': f'FD専用魚商材「{kw}」が休日（{WD_JP[wd]}）に使用されている',
                             '修正提案': sug, '重要度': '中（参考実装・魚弁当のみ）',
                         })
-    # ★マーク商品の「平日夜に◯回は入れる」月内最低回数チェック
+    # ★マーク商品の「平日夜に◯回は入れる」月内最低回数チェック（月単位の集計）。
+    # 夜の食材データが無い月は、使用回数が常に0となり全★商材が誤検出になるためスキップする。
+    quota_months = []
+    for mth in data.months:
+        sn = data.shoku_night.get(mth)
+        if sn is None or not len(sn):
+            data.warnings.append(
+                f'{mth}月：夜の食材データが無いため、No.27の★商材「平日夜クオータ」判定をスキップしました'
+                '（夜のCSVを読み込むと判定できます）')
+        else:
+            quota_months.append(mth)
     for pid, kw, min_count, waku in FD_WEEKDAY_NIGHT_QUOTA:
         by_month = {}
         for d in dr:
@@ -2116,15 +2126,17 @@ def check_rule27(data):
                     sub['レシピ名'].astype(str).str.contains(kw, na=False).any()
             if hit:
                 by_month.setdefault(month, set()).add(d)
-        for month in data.months:
-            cnt = len(by_month.get(month, set()))
+        for month in quota_months:
+            used = sorted(by_month.get(month, set()))
+            cnt = len(used)
             if cnt < min_count:
+                used_txt = '／'.join(f'{u.strftime("%-m/%-d")}({WD_JP[u.weekday()]})' for u in used) or 'なし'
                 viol.append({
-                    '日付': f'{month}月', '曜日': '-', 'No': 27,
+                    '日付': f'{month}月(月次)', '曜日': '夜', 'No': 27,
                     'ルール': f'★商材の平日夜クオータ未達：{waku}「{kw}」',
-                    '該当箇所': f'{month}月',
-                    '理由': f'平日夜の使用が{cnt}回のみ（月{min_count}回以上必要）',
-                    '修正提案': f'平日夜の枠に「{kw}」を追加する', '重要度': '中（FDメニュールール準拠）',
+                    '該当箇所': f'{month}月の平日夜 全体（使用日: {used_txt}）',
+                    '理由': f'平日夜の使用が{cnt}回のみ（月{min_count}回以上必要）※日単位ではなく月単位の集計',
+                    '修正提案': f'平日夜の枠に「{kw}」をあと{min_count - cnt}回追加する', '重要度': '中（FDメニュールール準拠）',
                 })
     return pd.DataFrame(viol)
 
@@ -2170,7 +2182,7 @@ def check_rule29(data):
             if cnt < 2:
                 example = f'（例:「{omakase_names[0][:18]}」等）' if omakase_names else ''
                 viol.append({
-                    '日付': f'{month}月', '曜日': '-', 'No': 29,
+                    '日付': f'{month}月(月次)', '曜日': '-', 'No': 29,
                     'ルール': 'おまかせメニューを昼・夜月2回以上採用',
                     '該当箇所': f'{month}月{slot}',
                     '理由': f'おまかせメニューが{cnt}回のみ（月2回以上必要）',
