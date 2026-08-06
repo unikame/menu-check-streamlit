@@ -90,7 +90,47 @@ def _patched_group_from_name(n):
 cm.group_from_name = _patched_group_from_name
 
 WD_JP = ['月', '火', '水', '木', '金', '土', '日']
+# 各ルール関数が返す内部形式（曜日欄には slot や 曜日 が混在する）
 cols_std = ['日付', '曜日', 'No', 'ルール', '該当箇所', '理由', '修正提案', '重要度']
+# 最終出力の形式。「曜日」ではなく「昼夜」を出す（ユーザー指定）
+OUT_COLS = ['日付', '昼夜', 'No', 'ルール', '該当箇所', '理由', '修正提案', '重要度']
+
+
+def _derive_slot(row):
+    """行の内容から昼/夜を判定する。
+    ルール関数によって slot の持ち方が違う（曜日欄に'昼'/'夜/火'、該当箇所に'[昼]'/'夜サブ:'等）ため、
+    曜日欄→該当箇所→理由 の順に探す。昼夜を区別しない日単位ルールは'昼夜'、
+    月単位の集計行は'-'を返す。"""
+    wd = str(row.get('曜日', ''))
+    if '昼' in wd and '夜' in wd:
+        return '昼夜'
+    if '昼' in wd:
+        return '昼'
+    if '夜' in wd:
+        return '夜'
+    # 該当箇所は「夜サブ:○○ ← 前回 7/2 昼サブ:△△」のように前回分の昼夜も含むため、
+    # 最初に出てくる方（＝その違反行の当該食事）を採用する。
+    for col in ('該当箇所', '理由'):
+        s = str(row.get(col, ''))
+        i_l, i_n = s.find('昼'), s.find('夜')
+        if i_l < 0 and i_n < 0:
+            continue
+        if i_n < 0 or (0 <= i_l < i_n):
+            return '昼'
+        return '夜'
+    return '-' if str(row.get('日付', '')).endswith('月') else '昼夜'
+
+
+def _date_sort_key(v):
+    """'7/1'→(7,1,1) / '7月'→(7,0,0)（月次集計行はその月の先頭）で並べ替えるキーを返す。"""
+    s = str(v)
+    m = re.match(r'^(\d{1,2})月$', s)
+    if m:
+        return (int(m.group(1)), 0, 0)
+    m = re.match(r'^(\d{1,2})/(\d{1,2})', s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), 1)
+    return (99, 99, 9)
 
 BASE_SEASONING_KW = ['だし', '醤油', '塩こしょう', '片栗粉', '上白糖', 'コンソメ', 'ウスターソース',
                       'ごま油', '味覇', 'シャンタン', 'みりん', '料理酒', '食塩', 'こしょう', '胡椒',
@@ -2238,9 +2278,17 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
     if frames:
         combined = pd.concat(frames, ignore_index=True)
         combined['No'] = combined['No'].astype(int)
-        combined = combined.sort_values(['No', '日付']).reset_index(drop=True)
+        # 「曜日」を「昼夜」に置き換え、日付順（同日内は No 順）に並べる（ユーザー指定）
+        combined['昼夜'] = combined.apply(_derive_slot, axis=1)
+        combined['_k'] = combined['日付'].map(_date_sort_key)
+        slot_order = {'昼': 0, '昼夜': 1, '夜': 2, '-': 3}
+        combined['_s'] = combined['昼夜'].map(lambda x: slot_order.get(x, 9))
+        combined = (combined.sort_values(['_k', '_s', 'No'])
+                            .drop(columns=['_k', '_s', '曜日'])
+                            .reindex(columns=OUT_COLS)
+                            .reset_index(drop=True))
     else:
-        combined = pd.DataFrame(columns=cols_std)
+        combined = pd.DataFrame(columns=OUT_COLS)
     n_days = len(set(r[0] for r in data.rows)) if data.rows else 0
     summary = {
         'months': data.months,
@@ -2252,5 +2300,106 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
     return combined, summary
 
 
+RULE_NAME_JP = {
+    1: 'メイン/サブ商材1週間', 2: '見た目酷似1週間+月2回', 3: '挽肉のメイン/サブ重複',
+    4: 'コロッケ間隔', 5: '鶏豚牛のメイン/サブ重複', 6: '同一食材の複数レシピ重複',
+    7: '大豆系は半日空ける', 8: '食材と調味料の中身被り', 9: '同じ色の野菜が2日連続',
+    10: '単一食材メニュー1週間', 11: '自然解凍1品', 12: '当日揚げ3品まで',
+    13: '盛付工数3工程まで', 14: '栄養素基準（月平均）', 15: '健康食材 週1回以上',
+    16: '固形は2種まで', 17: '赤・黄・緑を使用', 18: '1食の重量下限',
+    19: '同じ調味料のみの味付け禁止', 20: 'だし味付け1品以上', 21: '禁止食材・調味料',
+    22: '魚メニュー3日に1回', 23: '食べにくさチェック', 24: '白和えの分類',
+    25: 'かぼちゃ週1回・同曜日4週間', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★平日夜クオータ',
+    28: '本日の魚料理は平日の夜', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
+    31: 'マッシュ系同日重複', 36: 'コロッケとクリームコロッケ',
+}
+
+
 def write_report(combined, n_days, out_path):
-    cm.write_report(combined, n_days, out_path)
+    """違反候補リスト／サマリー／チェックフローの3シートで出力する。
+    ・「曜日」ではなく「昼夜」列を出す（ユーザー指定）。
+    ・日付順（月次集計行はその月の先頭）に並べ、同日内は重要度順にする。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    order = {'高': 0, '中': 1, '低': 2}
+    out = combined.copy() if len(combined) else pd.DataFrame(columns=OUT_COLS)
+    if len(out):
+        out['_s'] = out['重要度'].map(lambda x: order.get(str(x)[:1], 9))
+        out['_k'] = out['日付'].map(_date_sort_key)
+        out = out.sort_values(['_k', '_s']).drop(columns=['_s', '_k']).reset_index(drop=True)
+    wb = Workbook()
+    H = Font(name='Meiryo', bold=True, color='FFFFFF', size=10)
+    HF = PatternFill('solid', fgColor='C0703B')
+    SUB = Font(name='Meiryo', bold=True, size=11, color='C0703B')
+    BODY = Font(name='Meiryo', size=10)
+    sevfill = {'高': PatternFill('solid', fgColor='F4CCCC'), '中': PatternFill('solid', fgColor='FFF2CC')}
+    thin = Side(style='thin', color='D9C9B5')
+    BORD = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def hdr(ws, n, row=1):
+        for c in range(1, n + 1):
+            cc = ws.cell(row, c)
+            cc.font = H
+            cc.fill = HF
+            cc.border = BORD
+            cc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    ws = wb.active
+    ws.title = '違反候補リスト'
+    ws.merge_cells('A1:H1')
+    ws['A1'] = '■ お弁当メニュー違反チェック結果（食材チェックAI）'
+    ws['A1'].font = Font(name='Meiryo', bold=True, size=13, color='C0703B')
+    ws.append([])
+    ws.append(OUT_COLS)
+    hdr(ws, len(OUT_COLS), row=3)
+    for _, r in out.iterrows():
+        ws.append([r.get(c) for c in OUT_COLS])
+    for row in ws.iter_rows(min_row=4, max_row=ws.max_row):
+        sev = str(row[7].value)[:1]
+        for cell in row:
+            cell.font = BODY
+            cell.border = BORD
+            cell.alignment = Alignment(vertical='center', wrap_text=True)
+            cell.fill = sevfill.get(sev, PatternFill())
+    if ws.max_row < 4:
+        ws.append(['(違反候補なし)'])
+    ws.freeze_panes = 'A4'
+    for col, w in zip('ABCDEFGH', [8, 6, 5, 24, 44, 30, 34, 10]):
+        ws.column_dimensions[col].width = w
+    ws2 = wb.create_sheet('サマリー')
+    ws2['A1'] = '検出サマリー'
+    ws2['A1'].font = SUB
+    ws2.append([])
+    ws2.append(['ルール', '検出件数', '重要度内訳'])
+    hdr(ws2, 3, row=3)
+    if len(out):
+        for no in sorted(out['No'].unique()):
+            s = out[out['No'] == no]
+            sv = '/'.join(f'{k}{v}' for k, v in s['重要度'].value_counts().items())
+            ws2.append([f'No.{no} {RULE_NAME_JP.get(no, "")}', len(s), sv])
+    for row in ws2.iter_rows(min_row=4, max_row=ws2.max_row):
+        for cell in row:
+            cell.font = BODY
+            cell.border = BORD
+            cell.alignment = Alignment(vertical='center', wrap_text=True)
+    ws2.append([])
+    ws2.append(['合計', len(out), f'検査日数 {n_days}日'])
+    ws2.cell(ws2.max_row, 1).font = Font(name='Meiryo', bold=True, size=10)
+    for col, w in zip('ABC', [30, 12, 28]):
+        ws2.column_dimensions[col].width = w
+    ws3 = wb.create_sheet('チェックフロー')
+    ws3['A1'] = '食材チェックAI 処理フロー'
+    ws3['A1'].font = Font(name='Meiryo', bold=True, size=13, color='C0703B')
+    ws3.append([])
+    flow = [('① ルール・マスタ内蔵', '構成ルールと、野菜マスタ(色)/調味料マスタ/当日揚げ・禁止食材マスタ/FDメニュールールを保持'),
+            ('② 入力', 'メニューワークブック＋食材CSV（昼/夜）＋各マスタファイル'),
+            ('③ 展開・紐づけ', '日×昼夜×5ポジションに分解→商品ID単位で食材を紐づけ→マスタで色/系統/調理法に変換'),
+            ('④ ルール適用', '基礎調味料・基礎野菜は除外、枠タイトル付きメニュー名は名寄せ、備品/水は除外'),
+            ('⑤ 出力', '違反候補のみを日付順に抽出（日付・昼夜・ルール・該当箇所・理由・代替え案・重要度）')]
+    for a, b in flow:
+        ws3.append([a, b])
+        for c in (1, 2):
+            ws3.cell(ws3.max_row, c).font = BODY
+            ws3.cell(ws3.max_row, c).alignment = Alignment(vertical='top', wrap_text=True)
+    ws3.column_dimensions['A'].width = 22
+    ws3.column_dimensions['B'].width = 78
+    wb.save(out_path)
