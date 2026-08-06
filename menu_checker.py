@@ -2321,12 +2321,13 @@ def write_report(combined, n_days, out_path):
     ・日付順（月次集計行はその月の先頭）に並べ、同日内は重要度順にする。"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    order = {'高': 0, '中': 1, '低': 2}
     out = combined.copy() if len(combined) else pd.DataFrame(columns=OUT_COLS)
     if len(out):
-        out['_s'] = out['重要度'].map(lambda x: order.get(str(x)[:1], 9))
+        # 日付順 → 同日内は 昼 → 昼夜 → 夜 → No順（重要度では並べ替えない。重要度は行の色で表現する）
+        slot_order = {'昼': 0, '昼夜': 1, '夜': 2, '-': 3}
         out['_k'] = out['日付'].map(_date_sort_key)
-        out = out.sort_values(['_k', '_s']).drop(columns=['_s', '_k']).reset_index(drop=True)
+        out['_s'] = out['昼夜'].map(lambda x: slot_order.get(x, 9)) if '昼夜' in out.columns else 0
+        out = out.sort_values(['_k', '_s', 'No']).drop(columns=['_k', '_s']).reset_index(drop=True)
     wb = Workbook()
     H = Font(name='Meiryo', bold=True, color='FFFFFF', size=10)
     HF = PatternFill('solid', fgColor='C0703B')
