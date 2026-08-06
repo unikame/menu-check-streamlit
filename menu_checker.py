@@ -26,7 +26,8 @@
   No.3/5 挽肉・鶏豚牛のメイン/サブ同日重複（昼夜別）
   No.4/36 コロッケ連日（同日の複数サイズ登録は対象外）
   No.6/8 1食内の食材/調味料重複（調味料.csv・基礎野菜を除外）
-  No.7  大豆系の同一食事内重複（昼夜は半日空きとみなし対象外）
+  No.7  大豆系は半日空ける（同じ日の昼と夜の両方に大豆系＝約6時間でNG。
+        同じ食事内の複数使用と、夜→翌日昼は対象外）
   No.9  野菜マスタの「色」が同じものの2日連続（昼夜別・基礎色/定番食材は除外）
   No.10 単一食材のみの副菜/サラダを1週間空けず再使用
   No.11 自然解凍品が1食に0品
@@ -1822,24 +1823,31 @@ def raw_dish_names_slot(data, date, slot):
 
 
 def check_rule7(data):
-    """No.7: 大豆系商材は半日空ける＝同じ食事（昼は昼同士、夜は夜同士）内での複数使用はNG。
-    昼と夜に分かれていれば半日以上空いているとみなし対象外とする（ユーザー確認済み）。"""
+    """No.7: 大豆系商材は半日空ける。
+    昼（12時頃）→夜（18時頃）は約6時間しか空かず半日未満のため、
+    同じ日の昼と夜の両方に大豆系があるとNG（夜側を違反として報告する）。
+    ・同じ食事の中での複数使用は「1回の食事」なので対象外（ユーザー確認済み）。
+      例：7/1の昼に大豆系が2品 → OK
+    ・夜→翌日の昼は約18時間空くため対象外。
+      例：7/1昼に大豆系、7/1夜にも大豆系 → 7/1夜がNG"""
     dr = data.date_range
     viol = []
     for d in dr:
-        for slot in ('昼', '夜'):
-            names = raw_dish_names_slot(data, d, slot)
-            soy = sorted(n for n in names if is_soy(n))
-            if len(soy) >= 2:
-                non_soy_hist = _filtered_dish_hist(data, lambda n: not is_soy(n))
-                cand = _pick_least_recent(non_soy_hist.keys(), non_soy_hist, d, spread=data.suggested)
-                suggestion = f'一方を非大豆系の「{cand[:20]}」等に変更' if cand else '一方を別の食事にずらす'
-                viol.append({
-                    '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 7,
-                    'ルール': '大豆系商材が同じ食事内で複数使用（半日未満）',
-                    '該当箇所': f'[{slot}] ' + ' / '.join(soy), '理由': f'{slot}に大豆系が{len(soy)}品',
-                    '修正提案': suggestion, '重要度': '中',
-                })
+        lunch = sorted(n for n in raw_dish_names_slot(data, d, '昼') if is_soy(n))
+        dinner = sorted(n for n in raw_dish_names_slot(data, d, '夜') if is_soy(n))
+        if not (lunch and dinner):
+            continue
+        # 代替え案はレシピ名で出す：大豆系を含まないメニュー
+        cand = _recipe_replacement(data, d, ok=lambda n: not is_soy(n), exclude=set(dinner))
+        suggestion = f'夜の「{dinner[0][:16]}」を「{cand[:24]}」等、非大豆系に変更' if cand \
+            else '夜の大豆系を非大豆系のメニューに変更'
+        viol.append({
+            '日付': d.strftime('%-m/%-d'), '曜日': f'夜/{WD_JP[d.weekday()]}', 'No': 7,
+            'ルール': '大豆系商材が同じ日の昼と夜で連続（半日未満）',
+            '該当箇所': f'[夜] {" / ".join(dinner)} ← 同日[昼] {" / ".join(lunch)}',
+            '理由': f'昼と夜の間隔は約6時間で半日未満（昼{len(lunch)}品・夜{len(dinner)}品）',
+            '修正提案': suggestion, '重要度': '中',
+        })
     return pd.DataFrame(viol)
 
 
@@ -2637,7 +2645,7 @@ ALL_RULES = [
     ('No.9 見た目（色）が同じ野菜の2日連続', check_rule9),
     ('No.10 単一食材メニューの1週間ルール', check_rule10),
     ('No.11 自然解凍1品ルール', check_rule11),
-    ('No.7 大豆系商材の同日重複', check_rule7),
+    ('No.7 大豆系は半日空ける（同日の昼と夜）', check_rule7),
     ('No.12 揚げ物3品まで', check_rule12),
     ('No.14 栄養素基準（月平均）', check_rule14),
     ('No.15 健康食材 週1回以上', check_rule15),
