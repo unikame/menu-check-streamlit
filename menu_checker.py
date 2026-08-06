@@ -873,12 +873,21 @@ POS_ORDER_5 = ['メイン', 'サブ', '副菜1', '副菜2', 'サラダ']
 
 def _usage_history(data):
     """商品名(NFKC)ごとに使用日(Timestamp)のソート済みリストを返す（day_csv全体から構築、キャッシュ有）。
-    代替え案（NG時の具体的な代替商材提案）で『直近使われていない候補』を選ぶために使う。"""
+    代替え案（NG時の具体的な代替商材提案）で『直近使われていない候補』を選ぶために使う。
+    day_csvが渡されていない場合は、「N月使用食材」シート由来のdata.shoku/shoku_nightから
+    同じ形の履歴を作る（day_csv無しでも代替え案を具体名で出せるようにするため）。"""
     if data._usage_hist is not None:
         return data._usage_hist
     md2date = {(ts.month, ts.day): ts for ts in (data.date_range if data.date_range is not None else [])}
     hist = {}
-    for (month, slot), df in data.day_csv.items():
+    sources = list(data.day_csv.values())
+    if not sources:
+        # フォールバック：day_csvが無い場合は使用食材シート（build_day_index済み）を使う
+        sources = [df for df in list(data.shoku.values()) + list(data.shoku_night.values())
+                   if df is not None]
+    for df in sources:
+        if df is None or '商品名' not in df.columns:
+            continue
         for _, r in df.iterrows():
             name = str(r['商品名'])
             if cm.is_noise(name) or '終売' in name:
@@ -1004,22 +1013,47 @@ def _flexible_veg_names(data):
     return data._flex_veg
 
 
-def _ng_replacement(data, prod_name, date):
-    """No.21用：禁止商品の具体的な代替案を返す。
-    調味料マスタに載っている商品なら別の調味料を、そうでなければ同じ主原料グループの
-    別商材を、いずれも『その時点で直近使われていないもの』から選ぶ。"""
+def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=()):
+    """No.21用：禁止商品／禁止ワード該当メニューの具体的な代替案を返す。
+    優先順位：
+      1) 禁止対象が調味料（味付けの素/タレ類）→ 別の調味料商品名を提案
+      2) 同じ主原料グループの別商材（商品名）を提案
+      3) 商品を特定できない（メニュー名だけがNGワードに該当した）場合 → 同系統で
+         禁止ワードを含まない『別メニュー名』を提案
+    いずれも『その時点で直近使われていないもの』から選ぶ。"""
     hist = _usage_history(data)
-    if data.seasoning_names:
-        # 禁止商品が調味料（味付けの素/タレ類）なら、別の調味料を提案する
-        if any(k in _nfkc(prod_name) for k in ['素', 'タレ', 'たれ', 'ジャン', 'ソース', 'ドレッシング']):
-            cand = _pick_least_recent(list(data.seasoning_names.values()), hist, date,
-                                       exclude={prod_name})
+    SAUCE_KW = ['素', 'タレ', 'たれ', 'ジャン', 'ソース', 'ドレッシング', 'あん', 'ダレ']
+    if prod_name:
+        if data.seasoning_names and any(k in _nfkc(prod_name) for k in SAUCE_KW):
+            # 味付けの素/タレ類は、同じく「味付けの素/タレ類」の中から提案する
+            # （調味料マスタ全体から選ぶと、サフランライス用など用途の違う商品が出てしまうため）。
+            # かつ、実際に使用実績のある商品を優先する（未使用商品は候補の最後に回す）。
+            sauces = [n for n in data.seasoning_names.values() if any(k in _nfkc(n) for k in SAUCE_KW)]
+            used = [n for n in sauces if n in hist]
+            cand = _pick_least_recent(used or sauces, hist, date, exclude={prod_name})
             if cand:
-                return f'「{cand[:24]}」等、別の調味料に差し替え'
-    group = cm.group_from_name(prod_name)
-    cand = _pick_least_recent(_group_products_map(data).get(group, []), hist, date, exclude={prod_name})
-    if cand:
-        return f'同系統（{group}）の「{cand[:24]}」に差し替え'
+                return f'「{cand[:24]}」等、別の味付け（タレ/ソース類）に差し替え'
+        group = cm.group_from_name(prod_name)
+        cand = _pick_least_recent(_group_products_map(data).get(group, []), hist, date,
+                                   exclude={prod_name})
+        if cand:
+            return f'同系統（{group}）の「{cand[:24]}」に差し替え'
+    # 商品名で候補が出せない場合：メニュー（レシピ）名ベースで、禁止ワードを含まない
+    # 同系統のメニューを提案する
+    words = list(ng_words) or NG_WORDS
+    def _safe(nm):
+        return not any(w in str(nm) for w in words)
+    dish_hist = _dish_usage_history(data)
+    if dish_hist:
+        base = recipe_name or prod_name or ''
+        group = cm.group_from_name(base)
+        same_group = [n for n in dish_hist if _safe(n) and cm.group_from_name(n) == group]
+        cand = _pick_least_recent(same_group, dish_hist, date, exclude={base})
+        if cand:
+            return f'同系統（{group}）の「{cand[:24]}」に差し替え'
+        cand = _pick_least_recent([n for n in dish_hist if _safe(n)], dish_hist, date, exclude={base})
+        if cand:
+            return f'「{cand[:24]}」等、禁止食材を含まないメニューに差し替え'
     return '代替食材/調味料に変更'
 
 
@@ -1891,13 +1925,16 @@ def check_rule21(data):
                         'ルール': '禁止食材・調味料の使用（禁止食材マスタ照合）',
                         '該当箇所': f'[{slot}] {str(recipe)[:22]} → {"/".join(prods)[:30]}',
                         '理由': '「禁止食材・調味料該当」シート登録商品を使用',
-                        '修正提案': _ng_replacement(data, prods[0], d) if prods else '代替食材/調味料に変更',
+                        '修正提案': _ng_replacement(data, prods[0] if prods else None, d,
+                                                    recipe_name=str(recipe)),
                         '重要度': '高',
                     })
         return pd.DataFrame(viol)
     # フォールバック：禁止食材マスタが無い場合は従来のキーワード判定
     pattern = '|'.join(NG_WORDS)
     viol = []
+    md2date = {(ts.month, ts.day): ts for ts in (data.date_range if data.date_range is not None else [])}
+    base_year = data.date_range[0].year if data.date_range is not None and len(data.date_range) else 2025
     for month in data.months:
         for label, shoku in [('昼', data.shoku.get(month)), ('夜', data.shoku_night.get(month))]:
             if shoku is None:
@@ -1917,11 +1954,21 @@ def check_rule21(data):
                             if w in str(r['商品名']):
                                 matched_prods.append(str(r['商品名']))
                 matched_prods = list(dict.fromkeys(matched_prods))[:3]
+                # 違反日を実日付に解決してから代替え案を出す（履歴の「直近使用日」比較に必要）
+                vdate = md2date.get((m, d))
+                if vdate is None:
+                    try:
+                        vdate = pd.Timestamp(year=base_year, month=int(m), day=int(d))
+                    except ValueError:
+                        vdate = None
+                sug = _ng_replacement(data, matched_prods[0] if matched_prods else None, vdate,
+                                       recipe_name=str(recipe), ng_words=matched_words) \
+                    if vdate is not None else '代替食材/調味料に変更'
                 viol.append({
                     '日付': f'{m}/{d}', '曜日': label, 'No': 21, 'ルール': '禁止食材・調味料の使用（キーワード判定・参考）',
                     '該当箇所': f'{str(recipe)[:22]}' + (f' → {"/".join(matched_prods)[:30]}' if matched_prods else ''),
                     '理由': f'禁止ワード「{"/".join(sorted(matched_words))}」に該当',
-                    '修正提案': '代替食材/調味料に変更', '重要度': '高',
+                    '修正提案': sug, '重要度': '高',
                 })
     return pd.DataFrame(viol)
 
