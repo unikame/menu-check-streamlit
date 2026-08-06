@@ -953,6 +953,87 @@ def _dish_usage_history(data):
     return data._dish_hist
 
 
+def _recipe_products(data):
+    """レシピ名 -> そのレシピで使う {商品名, ...} のマップ（キャッシュ有）。
+    代替え案を「商材」ではなく「レシピ（メニュー）」で出すために、
+    『この食材/調味料を使っていないレシピ』を絞り込む用途で使う（ユーザー指定）。"""
+    if getattr(data, '_recipe_prods', None) is not None:
+        return data._recipe_prods
+    out = {}
+    sources = list(data.day_csv.values())
+    if not sources:
+        sources = [df for df in list(data.shoku.values()) + list(data.shoku_night.values())
+                   if df is not None]
+    for df in sources:
+        if df is None or 'レシピ名' not in df.columns or '商品名' not in df.columns:
+            continue
+        for recipe, grp in df.groupby('レシピ名', sort=False):
+            rn = str(recipe)
+            if '備品' in rn:
+                continue
+            out.setdefault(rn, set()).update(grp['商品名'].astype(str).tolist())
+    data._recipe_prods = out
+    return out
+
+
+def _recipe_product_ids(data):
+    """レシピ名 -> そのレシピで使う {商品ID(int), ...} のマップ（キャッシュ有）。No.30等のID判定用。"""
+    if getattr(data, '_recipe_pids', None) is not None:
+        return data._recipe_pids
+    out = {}
+    sources = list(data.day_csv.values())
+    if not sources:
+        sources = [df for df in list(data.shoku.values()) + list(data.shoku_night.values())
+                   if df is not None]
+    for df in sources:
+        if df is None or 'レシピ名' not in df.columns or '商品ID' not in df.columns:
+            continue
+        for recipe, grp in df.groupby('レシピ名', sort=False):
+            rn = str(recipe)
+            if '備品' in rn:
+                continue
+            ids = pd.to_numeric(grp['商品ID'], errors='coerce').dropna().astype(int)
+            out.setdefault(rn, set()).update(ids.tolist())
+    data._recipe_pids = out
+    return out
+
+
+def _recipe_has(data, recipe, kw):
+    """そのレシピが、商品名またはレシピ名に kw を含むか（NFKC正規化して判定）"""
+    if kw in _nfkc(recipe):
+        return True
+    return any(kw in _nfkc(p) for p in _recipe_products(data).get(recipe, ()))
+
+
+def _recipe_replacement(data, date, ok=None, group=None, exclude=()):
+    """レシピ（メニュー）単位の代替え案を1つ返す。候補が無ければ None。
+    ・ok    : そのレシピ名を候補にしてよいか判定する関数（Noneなら全て可）
+    ・group : 同系統（cm.group_from_name）を優先したい場合に指定
+    ・exclude: 除外するレシピ名
+    いずれも『その日時点で最も長く使われていないレシピ』を選ぶ。
+    ユーザー指定により、代替え案は原則すべて商材名ではなくレシピ名で出す。"""
+    return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude)[0]
+
+
+def _recipe_replacement2(data, date, ok=None, group=None, exclude=()):
+    """_recipe_replacement の (レシピ名, 同系統で見つかったか) を返す版。
+    「同系統（◯◯）の…」という文言を出してよいかを呼び出し側が判断できるようにするため。
+    主原料グループ '他' は寄せ集めのため、同系統扱いにはしない。"""
+    hist = _dish_usage_history(data)
+    if not hist:
+        return None, False
+    ex = set(exclude)
+    cands = [n for n in hist if n not in ex and (ok is None or ok(n))]
+    if not cands:
+        return None, False
+    if group and group != '他':
+        same = [n for n in cands if cm.group_from_name(n) == group]
+        pick = _pick_least_recent(same, hist, date)
+        if pick:
+            return pick, True
+    return _pick_least_recent(cands, hist, date), False
+
+
 def _nonfried_dish_names(data):
     """当日揚げ（data.fried_recipe_ids）に該当しないレシピ名の集合（キャッシュ有）。
     No.12（揚げ物超過）の『非揚げ物への差し替え』代替案候補に使う。"""
@@ -1014,47 +1095,30 @@ def _flexible_veg_names(data):
 
 
 def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=()):
-    """No.21用：禁止商品／禁止ワード該当メニューの具体的な代替案を返す。
-    優先順位：
-      1) 禁止対象が調味料（味付けの素/タレ類）→ 別の調味料商品名を提案
-      2) 同じ主原料グループの別商材（商品名）を提案
-      3) 商品を特定できない（メニュー名だけがNGワードに該当した）場合 → 同系統で
-         禁止ワードを含まない『別メニュー名』を提案
-    いずれも『その時点で直近使われていないもの』から選ぶ。"""
-    hist = _usage_history(data)
-    SAUCE_KW = ['素', 'タレ', 'たれ', 'ジャン', 'ソース', 'ドレッシング', 'あん', 'ダレ']
-    if prod_name:
-        if data.seasoning_names and any(k in _nfkc(prod_name) for k in SAUCE_KW):
-            # 味付けの素/タレ類は、同じく「味付けの素/タレ類」の中から提案する
-            # （調味料マスタ全体から選ぶと、サフランライス用など用途の違う商品が出てしまうため）。
-            # かつ、実際に使用実績のある商品を優先する（未使用商品は候補の最後に回す）。
-            sauces = [n for n in data.seasoning_names.values() if any(k in _nfkc(n) for k in SAUCE_KW)]
-            used = [n for n in sauces if n in hist]
-            cand = _pick_least_recent(used or sauces, hist, date, exclude={prod_name})
-            if cand:
-                return f'「{cand[:24]}」等、別の味付け（タレ/ソース類）に差し替え'
-        group = cm.group_from_name(prod_name)
-        cand = _pick_least_recent(_group_products_map(data).get(group, []), hist, date,
-                                   exclude={prod_name})
-        if cand:
-            return f'同系統（{group}）の「{cand[:24]}」に差し替え'
-    # 商品名で候補が出せない場合：メニュー（レシピ）名ベースで、禁止ワードを含まない
-    # 同系統のメニューを提案する
-    words = list(ng_words) or NG_WORDS
-    def _safe(nm):
-        return not any(w in str(nm) for w in words)
-    dish_hist = _dish_usage_history(data)
-    if dish_hist:
-        base = recipe_name or prod_name or ''
-        group = cm.group_from_name(base)
-        same_group = [n for n in dish_hist if _safe(n) and cm.group_from_name(n) == group]
-        cand = _pick_least_recent(same_group, dish_hist, date, exclude={base})
-        if cand:
-            return f'同系統（{group}）の「{cand[:24]}」に差し替え'
-        cand = _pick_least_recent([n for n in dish_hist if _safe(n)], dish_hist, date, exclude={base})
-        if cand:
-            return f'「{cand[:24]}」等、禁止食材を含まないメニューに差し替え'
-    return '代替食材/調味料に変更'
+    """No.21用：禁止食材・調味料に該当したメニューの代替え案を『レシピ（メニュー）名』で返す。
+    ユーザー指定により、調味料（タレ/ソース/〜の素）が禁止対象の場合も、調味料の差し替えでは
+    なくレシピごと差し替える案を出す。
+    候補は「禁止対象（商品名・禁止ワード）を含まないレシピ」で、同系統(cm.group_from_name)を
+    優先し、その日時点で最も長く使われていないものを選ぶ。"""
+    words = [w for w in (list(ng_words) or NG_WORDS)]
+
+    def _safe(n):
+        if any(w in str(n) for w in words):
+            return False
+        if prod_name and prod_name in _recipe_products(data).get(n, ()):
+            return False
+        if any(_recipe_has(data, n, w) for w in words):
+            return False
+        return True
+
+    base = recipe_name or prod_name or ''
+    group = cm.group_from_name(base)
+    cand, same_group = _recipe_replacement2(data, date, ok=_safe, group=group, exclude={base})
+    if cand and same_group:
+        return f'同系統（{group}）の「{cand[:26]}」に差し替え'
+    if cand:
+        return f'「{cand[:26]}」等、禁止食材を含まないメニューに差し替え'
+    return '禁止食材を含まないメニューに差し替え'
 
 
 def _filtered_dish_hist(data, match_fn):
@@ -1146,8 +1210,16 @@ def check_rule1(data):
             gap = (d - prev_d).days
             if 0 < gap <= 7:
                 group = cm.group_from_name(pname)
-                cand = _pick_least_recent(group_map.get(group, []), hist, d, exclude={pname})
-                suggestion = f'同系統（{group}）の別商材「{cand[:24]}」に変更を検討' if cand else '該当日か次回使用日をずらす'
+                # 代替え案はレシピ（メニュー）名で出す：同系統で、その商材を使っていないレシピ
+                cand, same_group = _recipe_replacement2(
+                    data, d, ok=lambda n: pname not in _recipe_products(data).get(n, ()),
+                    group=group, exclude={recipe, prev_recipe})
+                if cand and same_group:
+                    suggestion = f'同系統（{group}）の「{cand[:26]}」に変更を検討'
+                elif cand:
+                    suggestion = f'「{cand[:26]}」等、{pname[:14]}を使わないメニューに変更'
+                else:
+                    suggestion = '該当日か次回使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 1,
                     'ルール': '同一商品（単体商材）をメイン/サブで1週間空けず再使用',
@@ -1353,11 +1425,12 @@ def check_rule8(data):
                     seen.add(key)
                     frecipe = str(hit['レシピ名'].iloc[0])
                     srecipe = str(sr['レシピ名'])
-                    cand = _pick_least_recent(
-                        [n for n in data.seasoning_names.values() if kw not in _nfkc(n)],
-                        _usage_history(data), d, exclude={sname})
-                    suggestion = f'調味料を「{cand[:22]}」等、{kw}を含まないものに変更' if cand \
-                        else f'調味料か食材のどちらかを{kw}以外に変更'
+                    # 代替え案はレシピ名で出す：その素材（kw）を含まない別メニュー
+                    cand = _recipe_replacement(
+                        data, d, ok=lambda n: not _recipe_has(data, n, kw),
+                        exclude={frecipe, srecipe})
+                    suggestion = f'「{srecipe[:16]}」を「{cand[:24]}」等、{kw}を含まないメニューに差し替え' if cand \
+                        else f'どちらかを{kw}を含まないメニューに変更'
                     viol.append({
                         '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 8,
                         'ルール': '1食内で食材と調味料の中身が被っている',
@@ -1410,12 +1483,16 @@ def check_rule9(data):
             if prev_date is not None and (d - prev_date).days == 1:
                 overlap = set(today_colors) & set(prev_colors)
                 for c in overlap:
-                    veg_hist = _veg_usage_history(data)
-                    candidates = [vn for vn, cset in data.veg_color_map
-                                  if c not in cset and not (cset & COMMON_VEG_COLORS and len(cset) <= 1)
-                                  and vn not in COMMON_VEG_NAMES]
-                    cand = _pick_least_recent(candidates, veg_hist, d)
-                    suggestion = f'「{cand}」等、別の色の野菜に変更を検討' if cand else '別の色の野菜に変更'
+                    # 代替え案はレシピ名で出す：その色の野菜を含まないメニュー
+                    def _no_color(n, _c=c):
+                        prods = _recipe_products(data).get(n, ())
+                        cols = set()
+                        for p in prods:
+                            cols |= veg_colors_for(p, data.veg_color_map)
+                        return bool(cols) and _c not in cols
+                    cand = _recipe_replacement(data, d, ok=_no_color)
+                    suggestion = f'「{cand[:26]}」等、{c}以外の色の野菜メニューに変更を検討' if cand \
+                        else f'{c}以外の色の野菜メニューに変更'
                     viol.append({
                         '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 9,
                         'ルール': '見た目（色）が同じ野菜が2日連続',
@@ -1507,9 +1584,10 @@ def check_rule11(data):
                 continue
             has_natural = sub['商品名'].astype(str).str.contains('自然解凍', na=False).any()
             if not has_natural:
-                natural_hist = {k: v for k, v in _usage_history(data).items() if '自然解凍' in _nfkc(k)}
-                cand = _pick_least_recent(natural_hist.keys(), natural_hist, d)
-                suggestion = f'副菜等を「{cand[:26]}」等の自然解凍品に変更' if cand else '副菜等を自然解凍品に変更'
+                # 代替え案はレシピ名で出す：自然解凍品を使っているメニュー
+                cand = _recipe_replacement(data, d, ok=lambda n: _recipe_has(data, n, '自然解凍'))
+                suggestion = f'副菜等を「{cand[:26]}」等、自然解凍品を使うメニューに変更' if cand \
+                    else '副菜等を自然解凍品のメニューに変更'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': meal, 'No': 11,
                     'ルール': '1食1メニューは自然解凍品',
@@ -1542,10 +1620,12 @@ def check_rule6(data):
                 prod_recipes.setdefault(prod, set()).add(recipe)
             for prod, recipes in prod_recipes.items():
                 if len(recipes) >= 2:
-                    group = cm.group_from_name(prod)
-                    cand = _pick_least_recent(_group_products_map(data).get(group, []),
-                                               _usage_history(data), d, exclude={prod})
-                    suggestion = f'一方を同系統（{group}）の「{cand[:22]}」に変更' if cand else 'いずれかを別食材に'
+                    # 代替え案はレシピ名で出す：その食材を使っていない別レシピ
+                    cand = _recipe_replacement(
+                        data, d, ok=lambda n: prod not in _recipe_products(data).get(n, ()),
+                        exclude=set(recipes))
+                    suggestion = f'一方を「{cand[:26]}」等、{prod[:14]}を使わないメニューに変更' if cand \
+                        else 'いずれかを別食材のメニューに変更'
                     viol.append({
                         '日付': d.strftime('%-m/%-d'), '曜日': meal, 'No': 6,
                         'ルール': '1食内で同一食材が複数レシピに重複使用',
@@ -1720,14 +1800,19 @@ def check_rule17(data):
                 colors |= veg_colors_for(prod, data.veg_color_map)
             missing = [c for c in ('赤', '黄', '緑') if c not in colors]
             if missing:
-                veg_hist = _veg_usage_history(data)
+                # 代替え案はレシピ名で出す：不足している色の野菜を含むメニュー
                 sugs = []
                 for c in missing:
-                    candidates = [vn for vn, cset in data.veg_color_map if c in cset]
-                    cand = _pick_least_recent(candidates, veg_hist, d)
+                    def _has_color(n, _c=c):
+                        cols = set()
+                        for p in _recipe_products(data).get(n, ()):
+                            cols |= veg_colors_for(p, data.veg_color_map)
+                        return _c in cols
+                    cand = _recipe_replacement(data, d, ok=_has_color)
                     if cand:
-                        sugs.append(f'{c}:{cand}')
-                suggestion = ('候補 ' + ' / '.join(sugs) + ' を追加検討') if sugs else f'{"".join(missing)}系の食材を1品追加'
+                        sugs.append(f'{c}:「{cand[:22]}」')
+                suggestion = ('不足色を補うメニュー候補 ' + ' / '.join(sugs)) if sugs \
+                    else f'{"".join(missing)}系の食材を含むメニューを1品追加'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 17,
                     'ルール': '1食につき赤・黄・緑の食材を必ず使用', '該当箇所': f'[{slot}]',
@@ -1853,10 +1938,16 @@ def check_rule19(data):
             if len(uniq) == 1:
                 name = str(uniq['商品名'].iloc[0])
                 used_id = int(uniq['商品ID'].iloc[0])
-                hist = _usage_history(data)
-                other_names = [nm for pid, nm in data.seasoning_names.items() if pid != used_id]
-                cand = _pick_least_recent(other_names, hist, d, exclude={name})
-                suggestion = f'一部の料理を「{cand[:24]}」等、別の調味料に変更' if cand else '一部の料理の味付けを別の調味料に変更'
+                # 代替え案はレシピ名で出す：その調味料を使わず、別の調味料で味付けしているメニュー
+                today_recipes = set(sub_day['レシピ名'].astype(str))
+
+                def _other_seasoning(n, _uid=used_id):
+                    pids = _recipe_product_ids(data).get(n, set())
+                    seas = pids & data.seasoning_ids
+                    return bool(seas) and _uid not in seas
+                cand = _recipe_replacement(data, d, ok=_other_seasoning, exclude=today_recipes)
+                suggestion = f'一部を「{cand[:26]}」等、別の調味料で味付けしたメニューに差し替え' if cand \
+                    else '一部の料理を別の調味料で味付けしたメニューに差し替え'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 19,
                     'ルール': '1食につき同じ調味料のみでの味付け',
@@ -1892,11 +1983,19 @@ def check_rule20(data):
                 continue
             has_dashi = sub_day['商品名'].astype(str).apply(is_dashi).any()
             if not has_dashi:
+                # 代替え案はレシピ名で出す：だしで味付けしているメニュー
+                today_recipes = set(sub_day['レシピ名'].astype(str))
+                cand = _recipe_replacement(
+                    data, d,
+                    ok=lambda n: any(is_dashi(p) for p in _recipe_products(data).get(n, ())),
+                    exclude=today_recipes)
+                sug = f'いずれかを「{cand[:26]}」等、だしで味付けしたメニューに差し替え' if cand \
+                    else 'いずれかの料理をだし（和風だし）で味付けしたメニューに差し替え'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 20,
                     'ルール': '1食につきだしの味付けが0品',
                     '該当箇所': f'[{slot}]', '理由': '商品名に「だし/出汁」を含む商材が0品',
-                    '修正提案': 'いずれかの料理を「☆☆やどかり弁当 和風だし」で味付けに変更（実データ上の唯一の候補）', '重要度': '中',
+                    '修正提案': sug, '重要度': '中',
                 })
     return pd.DataFrame(viol)
 
@@ -2108,8 +2207,19 @@ def check_rule30(data):
                 continue
             required = doubled_days if named1 else base_days
             if gap < required:
-                cand = _pick_least_recent(_flexible_veg_names(data), _usage_history(data), dt1)
-                sug = f'「{cand[:22]}」等、間隔制約の緩い野菜に差し替え' if cand else '使用日をずらす'
+                # 代替え案はレシピ名で出す：当該野菜を使わず、間隔制約の緩い野菜を使うメニュー
+                flex = set(VEG_FLEXIBLE_IDS)
+
+                def _flex_recipe(n, _pid=(key if match_type == 'id' else None), _kws=name_kws):
+                    if _pid is not None:
+                        if _pid in _recipe_product_ids(data).get(n, set()):
+                            return False
+                    elif any(_recipe_has(data, n, k) for k in _kws):
+                        return False
+                    return bool(_recipe_product_ids(data).get(n, set()) & flex)
+                cand = _recipe_replacement(data, dt1, ok=_flex_recipe)
+                sug = f'「{cand[:26]}」等、間隔制約の緩い野菜を使うメニューに差し替え' if cand \
+                    else '使用日をずらす'
                 viol.append({
                     '日付': d1.strftime('%-m/%-d'), '曜日': f'{slot1}/{WD_JP[d1.weekday()]}', 'No': 30,
                     'ルール': f'野菜(FDメニュールール)の使用間隔違反：{label}',
