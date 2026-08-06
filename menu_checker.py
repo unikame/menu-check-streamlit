@@ -34,7 +34,8 @@
   No.14 栄養素の月平均（「N月栄養価」シート優先。夜はデータ未入手のため昼のみ）
   No.15 健康食材 週1回以上
   No.17 1食で赤・黄・緑を使用（野菜マスタの色列・昼夜別）
-  No.18 1食の重量下限（M=212g。容器・カップ重量は含まないため下限側の目安）
+  No.18 1食の重量下限（M=212g・容器18.0g込みの総重量で判定。カップ重量は考慮しない。
+        Sは容器17.5gのみ判明・下限値未確定のため判定しない → BENTO_SIZE_SPEC）
   No.19 同じ調味料のみでの味付け禁止
   No.20 だし味付け1品以上
   No.21 禁止食材・調味料（禁止食材マスタ照合／無ければキーワード判定）
@@ -492,12 +493,18 @@ def load_veg_color_map(veg_master_path):
     正規化名が長い順に並べ替えて返す（後段の部分一致で、短い名前が長い名前の一部に
     誤って先にマッチしないようにするため。例：「ピーマン」が「ピーマン肉詰めフライ」に
     誤爆しないよう、より具体的な名前を優先する）。"""
-    wb = openpyxl.load_workbook(veg_master_path, data_only=True)
-    sheet = next((s for s in wb.sheetnames if 'マスタ' in s and 'テンプレート' in s), wb.sheetnames[0])
-    ws = wb[sheet]
+    # CSV（Googleスプレッドシートの1タブをCSVで取得した場合）にも対応する。
+    # 列構成は xlsx と同じ：A=商品コード / B=商品名（原文）/ C=正規化名 / D=色（彩り）
+    if str(veg_master_path).lower().endswith(('.csv', '.tsv')):
+        df = pd.read_csv(veg_master_path, header=0, dtype=str).fillna('')
+        data_rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
+    else:
+        wb = openpyxl.load_workbook(veg_master_path, data_only=True)
+        sheet = next((s for s in wb.sheetnames if 'マスタ' in s and 'テンプレート' in s), wb.sheetnames[0])
+        data_rows = list(wb[sheet].iter_rows(min_row=2, values_only=True))
     out = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or row[0] is None:
+    for row in data_rows:
+        if not row or row[0] is None or str(row[0]).strip() == '':
             continue
         name = row[2] if len(row) > 2 else None
         color = row[3] if len(row) > 3 else None
@@ -1878,13 +1885,35 @@ def _recipe_weight_g(sub):
     return total if found else None
 
 
-def check_rule18(data, min_weight_g=212):
-    """No.18: 1食あたりの重量下限（現状Mサイズのみ判定：212g／Sは実データ未入手のためユーザー指定によりスキップ）。
-    レシピごとに _recipe_weight_g() で重量を推定し、1食（昼/夜別）に登場する全レシピの合計と下限を比較する。
-    ※容器・カップ重量は含まれていない（ルール文言上は下限に容器＋カップ重量を含む）。
-    そのため本チェックは食材のみの重量であり、実際の総重量はこれより大きくなる＝本チェックは
-    「これを下回れば確実にNG」という下限側の目安として運用する（容器分の上乗せは考慮できていない点に注意）。"""
+# No.18用：弁当サイズ別の「総重量の下限」と「容器重量」（ユーザー確認済み）。
+#   ・min_total_g は容器込みの総重量の下限。判定は 食材重量 + 容器重量 >= min_total_g で行う。
+#   ・フードカップ（仕切りカップ）の重量は考慮しない（ユーザー指定）。
+#   ・Sサイズは容器重量のみ判明。総重量の下限が未確定のため、判定は行わない
+#     （min_total_g に数値を入れれば、そのまま判定対象になる）。
+BENTO_SIZE_SPEC = {
+    'M': {'min_total_g': 212, 'container_g': 18.0},
+    'S': {'min_total_g': None, 'container_g': 17.5},
+}
+BENTO_SIZE = 'M'   # 実データがどのサイズのものかを指定する
+
+
+def check_rule18(data, size=None):
+    """No.18: 1食あたりの重量下限。
+    下限（Mサイズ=212g）は容器重量を含んだ総重量なので、
+        総重量 = 食材重量（_recipe_weight_g の合計） + 容器重量（M=18.0g）
+    として比較する（ユーザー確認済み）。フードカップの重量は考慮しない。
+    レシピごとに _recipe_weight_g() で重量を推定し、1食（昼/夜別）の合計を使う。
+    サイズ別の値は BENTO_SIZE_SPEC を参照。下限が未設定のサイズ（現状S）は判定しない。"""
     if not data.day_csv:
+        return pd.DataFrame()
+    size = size or BENTO_SIZE
+    spec = BENTO_SIZE_SPEC.get(size, {})
+    min_total_g = spec.get('min_total_g')
+    container_g = spec.get('container_g', 0.0)
+    if min_total_g is None:
+        data.warnings.append(
+            f'{size}サイズは総重量の下限が未設定のため、No.18（1食の重量下限）を'
+            'スキップしました（BENTO_SIZE_SPECに下限値を設定すると判定できます）')
         return pd.DataFrame()
     viol = []
     dr = data.date_range
@@ -1896,7 +1925,7 @@ def check_rule18(data, min_weight_g=212):
             sub_day = df[(df['md'] == (d.month, d.day)) & (~df['レシピ名'].astype(str).str.contains('備品', na=False))]
             if not len(sub_day):
                 continue
-            total = 0.0
+            food = 0.0
             unknown = []
             weights = []
             for recipe, grp in sub_day.groupby('レシピ名', sort=False):
@@ -1904,15 +1933,16 @@ def check_rule18(data, min_weight_g=212):
                 if w is None:
                     unknown.append(str(recipe))
                     continue
-                total += w
+                food += w
                 weights.append((w, str(recipe)))
             if unknown:
                 # 重量不明レシピがあれば合計は過小評価の可能性が高いため、参考情報として理由に残す
                 unknown_note = f'（重量不明レシピ{len(unknown)}件を除く: ' + '/'.join(u[:10] for u in unknown[:3]) + '）'
             else:
                 unknown_note = ''
-            if total < min_weight_g:
-                short = min_weight_g - total
+            total = food + container_g
+            if total < min_total_g:
+                short = min_total_g - total
                 if weights:
                     w_min, r_min = min(weights)
                     sug = f'最も軽い「{r_min[:18]}」（約{w_min:.0f}g）を中心に、計{short:.0f}g分を増量'
@@ -1920,9 +1950,11 @@ def check_rule18(data, min_weight_g=212):
                     sug = f'副菜等で計{short:.0f}g分を増量'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 18,
-                    'ルール': '1食の重量が下限（M=212g）未達',
-                    '該当箇所': f'[{slot}] 合計約{total:.0f}g',
-                    '理由': f'下限{min_weight_g}gに対し約{total:.0f}g{unknown_note}（容器・カップ重量は含まず）',
+                    'ルール': f'1食の重量が下限（{size}={min_total_g}g）未達',
+                    '該当箇所': f'[{slot}] 総重量約{total:.0f}g',
+                    '理由': f'下限{min_total_g}g（容器{container_g:g}g込み）に対し約{total:.0f}g'
+                            f'＝食材{food:.0f}g＋容器{container_g:g}g{unknown_note}'
+                            '※フードカップの重量は含まず',
                     '修正提案': sug, '重要度': '中',
                 })
     return pd.DataFrame(viol)
