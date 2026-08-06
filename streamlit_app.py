@@ -50,6 +50,17 @@ MASTER_SHEET_URLS = {
     'shoku': 'https://docs.google.com/spreadsheets/d/1bPju1fjNDDV59eCFrzStjGFoM0RhVzzrPk_MMLu20v0/edit?gid=1718859394#gid=1718859394',
 }
 
+# ============================================================================
+# ★ 過去メニュー（履歴）の参照先URL ★
+#   違反判定には使わず、代替え案の候補と「直近いつ使ったか」の参照にだけ使います。
+#   URLのgidで指定したタブをCSVとして取得します。月を増やす場合はここに追記してください。
+# ============================================================================
+HISTORY_SHEET_URLS = [
+    ('2604', 'https://docs.google.com/spreadsheets/d/1xJQRuCBesO6dqTdLjBjx1QIZQ3BA_fjC0XNT_nV1mBA/edit?gid=1390280937#gid=1390280937'),
+    ('2605', 'https://docs.google.com/spreadsheets/d/1_KLuG2AqF37fNSskyP-BrHIUKoJQtpeDISvpqChBPBo/edit?gid=1241683169#gid=1241683169'),
+    ('2606', 'https://docs.google.com/spreadsheets/d/1BKW8BzkUujyIPbrmXo9mgzc5Zr5Pi6H2n-KwOT5ELCk/edit?gid=66760815#gid=66760815'),
+]
+
 MASTER_META = {
     'veg':       ('野菜マスタ', 'csv',  '野菜マスタ_テンプレート.csv', 'No.9 / No.17'),
     'seasoning': ('調味料',     'csv',  '調味料.csv',                  'No.8 / No.19'),
@@ -209,6 +220,26 @@ def resolve_master(key):
     return path, f'{label}（{rules}）', True
 
 
+def resolve_history():
+    """HISTORY_SHEET_URLS を取得して一時ファイルに書き出し、(パス一覧, 状態メッセージ一覧) を返す。"""
+    paths, msgs = [], []
+    for label, url in HISTORY_SHEET_URLS:
+        url = (url or '').strip()
+        if not url:
+            continue
+        try:
+            data = fetch_master_bytes(url, 'csv')
+        except Exception as e:  # noqa: BLE001
+            msgs.append((False, f'{label}：取得に失敗（{e}）'))
+            continue
+        path = os.path.join(TMP_DIR, f'{label}メニュー.csv')
+        with open(path, 'wb') as f:
+            f.write(data)
+        paths.append(path)
+        msgs.append((True, f'{label}メニュー'))
+    return paths, msgs
+
+
 def parse_month_slot(filename):
     """ファイル名から (月, '昼'|'夜') を推定する。'7月昼.csv' → (7, '昼')。"""
     name = os.path.basename(str(filename))
@@ -241,9 +272,9 @@ with st.sidebar:
              'アップロードした月だけが判定対象になります。')
 
     hist_csvs = st.file_uploader(
-        '過去メニューCSV（任意／複数可）', type=['csv'], accept_multiple_files=True,
-        help='例：2604〜2606MLメニュー.csv。違反判定には使わず、'
-             '代替え案の候補と「直近いつ使ったか」の参照にだけ使います。')
+        '過去メニューCSVを追加（任意／複数可）', type=['csv'], accept_multiple_files=True,
+        help='下の「過去メニュー」はスプレッドシートから自動取得します。'
+             'それ以外の月を足したい場合だけ、ここにアップロードしてください。')
 
     run = st.button('チェックを実行', type='primary', use_container_width=True)
 
@@ -258,7 +289,15 @@ with st.sidebar:
         icon = '●' if ok else '▲'
         st.markdown(f'<div class="{cls}">{icon} {msg}</div>', unsafe_allow_html=True)
 
-    if st.button('マスタを再読込', use_container_width=True):
+    st.markdown('## 過去メニュー')
+    st.caption('違反判定には使わず、代替え案の候補にだけ使います。')
+    history_paths, history_msgs = resolve_history()
+    for ok, msg in history_msgs:
+        cls = 'ms-ok' if ok else 'ms-ng'
+        st.markdown(f'<div class="{cls}">{"●" if ok else "▲"} {msg}</div>',
+                    unsafe_allow_html=True)
+
+    if st.button('マスタ・過去メニューを再読込', use_container_width=True):
         fetch_master_bytes.clear()
         st.rerun()
 
@@ -310,7 +349,8 @@ if run:
             if month and slot == '夜':
                 night_csv_paths[month] = path
 
-        hist_paths = [save_upload(f, 'history') for f in (hist_csvs or [])]
+        # スプレッドシートから取得した履歴＋手動追加分
+        hist_paths = list(history_paths) + [save_upload(f, 'history') for f in (hist_csvs or [])]
 
         ai_client = mc.get_anthropic_client() if use_ai else None
         if use_ai and ai_client is None:
