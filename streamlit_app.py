@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-やどかり弁当 メニュー違反チェック（Streamlit画面）
+高齢者向け弁当 メニュー違反チェック（Streamlit画面）
 
 menu_checker.run_all_checks() を呼び出して結果を表示するだけの薄いUI層。
 判定ロジックは一切ここに書かない（ルールの追加・修正は menu_checker.py 側で行う）。
