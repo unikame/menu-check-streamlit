@@ -271,11 +271,6 @@ with st.sidebar:
              '「S・M混在・昼夜1ファイル」形式。中身から月・昼夜・サイズを判定します。'
              'アップロードした月だけが判定対象になります。')
 
-    hist_csvs = st.file_uploader(
-        '過去メニューCSVを追加（任意／複数可）', type=['csv'], accept_multiple_files=True,
-        help='下の「過去メニュー」はスプレッドシートから自動取得します。'
-             'それ以外の月を足したい場合だけ、ここにアップロードしてください。')
-
     run = st.button('チェックを実行', type='primary', use_container_width=True)
 
     st.divider()
@@ -349,8 +344,8 @@ if run:
             if month and slot == '夜':
                 night_csv_paths[month] = path
 
-        # スプレッドシートから取得した履歴＋手動追加分
-        hist_paths = list(history_paths) + [save_upload(f, 'history') for f in (hist_csvs or [])]
+        # 過去メニューは HISTORY_SHEET_URLS からの取得のみ（アップロード欄は無し）
+        hist_paths = list(history_paths)
 
         ai_client = mc.get_anthropic_client() if use_ai else None
         if use_ai and ai_client is None:
