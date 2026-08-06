@@ -97,12 +97,14 @@ st.markdown(
       button[data-baseweb="tab"] { font-size:.85rem !important; padding:.35rem .1rem !important; }
       /* 表・入力まわりの文字 */
       div[data-testid="stDataFrame"] { font-size:.82rem; }
-      section[data-testid="stSidebar"] { font-size:.85rem; }
-      section[data-testid="stSidebar"] h2 { font-size:.95rem !important; }
       .stCaption, div[data-testid="stCaptionContainer"] p { font-size:.75rem !important; }
-      /* マスタ接続状態の行 */
-      .ms-ok, .ms-ng { font-size:.78rem; padding:.18rem 0; }
+      /* マスタ・過去メニューの接続状態（1行表示） */
+      .statusline { font-size:.78rem; margin:.15rem 0; color:#374151; }
+      .statusline b { font-weight:600; color:#111827; margin-right:.2rem; }
       .ms-ok { color:#15803D; } .ms-ng { color:#B45309; }
+      .muted { color:#9CA3AF; }
+      /* 入力の折りたたみ見出し */
+      details summary p { font-size:.9rem !important; font-weight:600 !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -259,62 +261,6 @@ def date_sort_key(v):
 
 
 # ----------------------------------------------------------------------------
-# サイドバー（入力）
-# ----------------------------------------------------------------------------
-with st.sidebar:
-    st.markdown('## 入力')
-
-    menu_xlsx = st.file_uploader('メニューワークブック（必須）', type=['xlsx'])
-    day_csvs = st.file_uploader(
-        '食材CSV（チェック対象／複数可）', type=['csv'], accept_multiple_files=True,
-        help='例：7月昼.csv / 7月夜.csv、または 2607MLメニュー.csv のような'
-             '「S・M混在・昼夜1ファイル」形式。中身から月・昼夜・サイズを判定します。'
-             'アップロードした月だけが判定対象になります。')
-
-    run = st.button('チェックを実行', type='primary', use_container_width=True)
-
-    st.divider()
-    st.markdown('## マスタ')
-
-    master_paths, master_ok = {}, {}
-    for key in MASTER_META:
-        path, msg, ok = resolve_master(key)
-        master_paths[key], master_ok[key] = path, ok
-        cls = 'ms-ok' if ok else 'ms-ng'
-        icon = '●' if ok else '▲'
-        st.markdown(f'<div class="{cls}">{icon} {msg}</div>', unsafe_allow_html=True)
-
-    st.markdown('## 過去メニュー')
-    st.caption('違反判定には使わず、代替え案の候補にだけ使います。')
-    history_paths, history_msgs = resolve_history()
-    for ok, msg in history_msgs:
-        cls = 'ms-ok' if ok else 'ms-ng'
-        st.markdown(f'<div class="{cls}">{"●" if ok else "▲"} {msg}</div>',
-                    unsafe_allow_html=True)
-
-    if st.button('マスタ・過去メニューを再読込', use_container_width=True):
-        fetch_master_bytes.clear()
-        st.rerun()
-
-    if not all(master_ok.values()):
-        with st.expander('取得できないマスタを手動で指定'):
-            manual = {
-                'veg': st.file_uploader('野菜マスタ', type=['xlsx', 'csv'],
-                                        disabled=master_ok['veg']),
-                'seasoning': st.file_uploader('調味料', type=['csv'],
-                                              disabled=master_ok['seasoning']),
-                'shoku': st.file_uploader('食材データ', type=['xlsx'],
-                                          disabled=master_ok['shoku']),
-            }
-            for key, up in manual.items():
-                if up is not None:
-                    master_paths[key] = save_upload(up, 'master')
-
-    st.divider()
-    use_ai = st.checkbox('No.1の酷似判定にAIを使う', value=False,
-                         help='ANTHROPIC_API_KEY が設定されている場合のみ有効です。')
-
-# ----------------------------------------------------------------------------
 # ヘッダ
 # ----------------------------------------------------------------------------
 st.markdown('# 高齢者向け弁当 メニュー違反チェック')
@@ -322,6 +268,66 @@ st.markdown(
     '<p class="app-sub">メニュー構成ルールに照らして違反候補を抽出し、'
     'レシピ単位の代替え案を提示します。</p>',
     unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------------
+# 入力（1カラム・上部にまとめる）
+#   結果が出たあとは自動でたたむ
+# ----------------------------------------------------------------------------
+with st.expander('入力ファイルと設定', expanded=('result' not in st.session_state)):
+    u1, u2 = st.columns(2)
+    with u1:
+        menu_xlsx = st.file_uploader('メニューワークブック（必須）', type=['xlsx'])
+    with u2:
+        day_csvs = st.file_uploader(
+            '食材CSV（チェック対象／複数可）', type=['csv'], accept_multiple_files=True,
+            help='例：7月昼.csv / 7月夜.csv、または 2607MLメニュー.csv のような'
+                 '「S・M混在・昼夜1ファイル」形式。中身から月・昼夜・サイズを判定します。'
+                 'アップロードした月だけが判定対象になります。')
+
+    # ---- マスタ・過去メニューの接続状態（1行にまとめる）----
+    master_paths, master_ok = {}, {}
+    chips = []
+    for key in MASTER_META:
+        path, msg, ok = resolve_master(key)
+        master_paths[key], master_ok[key] = path, ok
+        chips.append(f'<span class="{"ms-ok" if ok else "ms-ng"}">'
+                     f'{"●" if ok else "▲"} {msg}</span>')
+    history_paths, history_msgs = resolve_history()
+    hchips = [f'<span class="{"ms-ok" if ok else "ms-ng"}">'
+              f'{"●" if ok else "▲"} {msg}</span>' for ok, msg in history_msgs]
+
+    st.markdown(
+        '<div class="statusline"><b>マスタ</b>　' + '　'.join(chips) + '</div>'
+        '<div class="statusline"><b>過去メニュー</b>　' + '　'.join(hchips)
+        + '　<span class="muted">※判定には使わず、代替え案の候補にのみ使用</span></div>',
+        unsafe_allow_html=True)
+
+    o1, o2, o3 = st.columns([1.2, 2, 1.4])
+    with o1:
+        if st.button('マスタ・過去メニューを再読込', use_container_width=True):
+            fetch_master_bytes.clear()
+            st.rerun()
+    with o2:
+        use_ai = st.checkbox('No.1の酷似判定にAIを使う', value=False,
+                             help='ANTHROPIC_API_KEY が設定されている場合のみ有効です。')
+    with o3:
+        run = st.button('チェックを実行', type='primary', use_container_width=True)
+
+    # ---- 取得できなかったマスタだけ手動指定を出す ----
+    if not all(master_ok.values()):
+        st.caption('取得できなかったマスタを手動で指定してください')
+        m1, m2, m3 = st.columns(3)
+        manual = {
+            'veg': m1.file_uploader('野菜マスタ', type=['xlsx', 'csv'],
+                                    disabled=master_ok['veg']),
+            'seasoning': m2.file_uploader('調味料', type=['csv'],
+                                          disabled=master_ok['seasoning']),
+            'shoku': m3.file_uploader('食材データ', type=['xlsx'],
+                                      disabled=master_ok['shoku']),
+        }
+        for key, up in manual.items():
+            if up is not None:
+                master_paths[key] = save_upload(up, 'master')
 
 # ----------------------------------------------------------------------------
 # 実行
@@ -389,7 +395,7 @@ if run:
 result = st.session_state.get('result')
 
 if not result:
-    st.info('左のサイドバーでファイルを指定し、「チェックを実行」を押してください。')
+    st.info('上の「入力ファイルと設定」からファイルを指定し、「チェックを実行」を押してください。')
     st.stop()
 
 combined = result['combined']
@@ -497,5 +503,6 @@ with tab_note:
         '- 重要度は付けていません。結果は日付順に並びます（月次集計の行はその月の先頭）。\n'
         '- 代替え案は商材名ではなくレシピ（メニュー）名で、その日時点で最も長く使われていないものを選びます。\n'
         '- 食材CSVをアップロードした月だけが判定対象です。\n'
-        '- マスタは1時間キャッシュします。更新直後はサイドバーの「マスタを再読込」を押してください。\n'
+        '- マスタ・過去メニューは1時間キャッシュします。'
+        '更新直後は「入力ファイルと設定」の再読込ボタンを押してください。\n'
         '- 対象外：No.2（見た目酷似）／No.23（食べにくさ）。未対応：No.13 / No.16 / No.32〜35 / No.37。')
