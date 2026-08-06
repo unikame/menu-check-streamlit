@@ -414,6 +414,8 @@ class MenuData:
         self.ng_product_ids = set()      # 食材データ.xlsx「禁止食材・調味料該当」由来の商品ID集合。No.21専用
         self.ng_product_names = {}       # 同シート由来の 商品ID -> 商品名
         self.recipe_nutrition = None     # 食材データ.xlsx由来のレシピ別栄養価。No.14の代替メニュー提案用
+        self.history = None              # 過去メニューCSV由来の使用履歴（代替え案の候補選定専用）
+        self.suggested = {}              # 今回の実行で提案済みの候補と回数（提案の分散用）
         self._usage_hist = None          # 商品名(NFKC) -> 使用日リスト（キャッシュ、代替案提案用）
 
 
@@ -640,8 +642,103 @@ def load_recipe_nutrition(shoku_data_path):
     return out
 
 
+_FULLDATE_RE = re.compile(r'(\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日')
+_SIZE_RE = re.compile(r'【([SML])】')
+_SLOT_RE = re.compile(r'の(昼|夜|夕)')
+
+
+def _parse_full_date(name):
+    """名称欄（例：高齢者 S・M 26年4月1日(水)の昼【M】）から実日付を返す。取れなければNone。"""
+    m = _FULLDATE_RE.search(str(name))
+    if not m:
+        return None
+    yy, mm, dd = (int(x) for x in m.groups())
+    try:
+        return pd.Timestamp(2000 + yy, mm, dd)
+    except ValueError:
+        return None
+
+
+def _parse_slot(name):
+    m = _SLOT_RE.search(str(name))
+    if not m:
+        return None
+    return '夜' if m.group(1) in ('夜', '夕') else '昼'
+
+
+def _filter_size(df, size='M'):
+    """名称欄の【S】【M】表記でサイズを絞る。サイズ表記が無いファイルはそのまま返す。"""
+    if '名称' not in df.columns:
+        return df
+    sz = df['名称'].astype(str).str.extract(_SIZE_RE)[0]
+    if not sz.notna().any():
+        return df
+    return df[sz.isna() | (sz == size)]
+
+
+def _read_day_csv(path):
+    df = pd.read_csv(path)
+    df = _normalize_text_columns(df)
+    df['md'] = df['名称'].apply(cm.yobento_md)
+    return df
+
+
+def _split_day_csv(df, size='M'):
+    """1つのCSVを {(月, '昼'|'夜'): DataFrame} に分割する。
+    「S・M混在／昼夜1ファイル」形式（例：2604MLメニュー.csv）にも、
+    従来の「昼だけ・Mだけ」形式（例：7月昼.csv）にも同じ処理で対応できる。"""
+    df = _filter_size(df, size)
+    if not len(df):
+        return {}
+    slots = df['名称'].apply(_parse_slot)
+    months = df['md'].map(lambda x: x[0] if isinstance(x, tuple) else None)
+    work = df.assign(_slot=slots, _month=months).dropna(subset=['_slot', '_month'])
+    out = {}
+    for (month, slot), grp in work.groupby(['_month', '_slot'], sort=False):
+        out[(int(month), str(slot))] = grp.drop(columns=['_slot', '_month'])
+    return out
+
+
+def load_history(history_csv_paths, size='M'):
+    """過去メニューCSV（複数月分）を読み、代替え案の候補選定に使う履歴を返す。
+    判定（違反チェック）には一切使わず、『どのレシピ/商品を、いつ使ったか』だけを取り出す。
+    戻り値: dict(dish=..., prod=..., recipe_products=..., all_names=..., fried_names=...)"""
+    dish, prod, recipe_prods = {}, {}, {}
+    all_names, fried_ids_by_name = set(), {}
+    for path in history_csv_paths or []:
+        df = pd.read_csv(path)
+        df = _normalize_text_columns(df)
+        df = _filter_size(df, size)
+        df = df.assign(_dt=df['名称'].apply(_parse_full_date)).dropna(subset=['_dt'])
+        df = df[~df['レシピ名'].astype(str).str.contains('備品', na=False)]
+        if not len(df):
+            continue
+        for recipe, grp in df.groupby('レシピ名', sort=False):
+            rn = str(recipe)
+            dish.setdefault(rn, set()).update(grp['_dt'].tolist())
+            recipe_prods.setdefault(rn, set()).update(grp['商品名'].astype(str).tolist())
+            all_names.add(rn)
+            if 'レシピID' in grp.columns:
+                ids = pd.to_numeric(grp['レシピID'], errors='coerce').dropna().astype(int)
+                if len(ids):
+                    fried_ids_by_name.setdefault(rn, set()).update(ids.tolist())
+        for p, grp in df.groupby('商品名', sort=False):
+            pn = str(p)
+            if cm.is_noise(pn) or '終売' in pn:
+                continue
+            prod.setdefault(pn, set()).update(grp['_dt'].tolist())
+    return {
+        'dish': {k: sorted(v) for k, v in dish.items()},
+        'prod': {k: sorted(v) for k, v in prod.items()},
+        'recipe_products': recipe_prods,
+        'all_names': all_names,
+        'recipe_ids': fried_ids_by_name,
+    }
+
+
 def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
-                        seasoning_csv_path=None, fried_master_path=None):
+                        seasoning_csv_path=None, fried_master_path=None, history_csv_paths=None,
+                        size='M'):
     """xlsx_path: メインのメニューワークブック。
     night_csv_paths: {month: csv_path} 夜食材CSV（任意）。
     day_csv_paths: {(month, '昼'|'夜'): csv_path} 商品ID単位のNo.1判定用CSV（任意）。
@@ -677,14 +774,37 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
             data.recipe_nutrition = load_recipe_nutrition(fried_master_path)
         except Exception as e:
             data.warnings.append(f'食材データ.xlsx（レシピ別栄養価）の読み込みに失敗しました（{e}）')
-    for key, path in day_csv_paths.items():
+    # day_csv_paths は {(月, '昼'|'夜'): path} でも、パスのリストでも受け付ける。
+    # 中身の名称欄から月・昼夜・サイズを判定するため、「S・M混在／昼夜1ファイル」形式でも読める。
+    items = (list(day_csv_paths.items()) if isinstance(day_csv_paths, dict)
+             else [(None, p) for p in (day_csv_paths or [])])
+    for key, path in items:
         try:
-            df = pd.read_csv(path)
-            df = _normalize_text_columns(df)
-            df['md'] = df['名称'].apply(cm.yobento_md)
-            data.day_csv[key] = df
+            df = _read_day_csv(path)
+            parts = _split_day_csv(df, size)
+            if not parts and isinstance(key, tuple):
+                # 名称から昼夜を判定できない旧形式は、指定されたキーをそのまま使う
+                parts = {key: _filter_size(df, size)}
+            if not parts:
+                data.warnings.append(
+                    f'{os.path.basename(str(path))}：月・昼夜を判定できず読み込めませんでした')
+                continue
+            for k, sub in parts.items():
+                if k in data.day_csv:
+                    data.day_csv[k] = pd.concat([data.day_csv[k], sub], ignore_index=True)
+                else:
+                    data.day_csv[k] = sub
         except Exception as e:
-            data.warnings.append(f'{key}：day_csv読み込みに失敗しました（{e}）')
+            data.warnings.append(f'{key or path}：day_csv読み込みに失敗しました（{e}）')
+    if history_csv_paths:
+        try:
+            data.history = load_history(history_csv_paths, size)
+            n_dish = len(data.history['dish'])
+            data.warnings.append(
+                f'過去メニュー{len(history_csv_paths)}ファイル（レシピ{n_dish}種類）を'
+                '代替え案の候補として読み込みました（違反判定には使いません）')
+        except Exception as e:
+            data.warnings.append(f'過去メニューの読み込みに失敗しました（{e}）')
     xl = pd.ExcelFile(xlsx_path)
     wb_raw = openpyxl.load_workbook(xlsx_path, data_only=True)
     sheet_names = xl.sheet_names
@@ -838,7 +958,7 @@ def _min_gap_check(data, match_fn, min_gap, rule_no, rule_name, severity='中'):
         gap = (d1 - d0).days
         if gap <= min_gap:
             pool = _filtered_dish_hist(data, match_fn)
-            cand = _pick_least_recent(pool.keys(), pool, d1, exclude={h1[0]})
+            cand = _pick_least_recent(pool.keys(), pool, d1, exclude={h1[0]}, spread=data.suggested)
             suggestion = f'代わりに「{cand[:20]}」等に変更' if cand else '使用日をずらす'
             viol.append({
                 '日付': d1.strftime('%-m/%-d'), '曜日': WD_JP[d1.weekday()], 'No': rule_no, 'ルール': rule_name,
@@ -863,7 +983,7 @@ def _max_gap_check(data, match_fn, max_gap, rule_no, rule_name, severity='中'):
     if dates_with:
         gap0 = (dates_with[0][0] - dr[0]).days
         if gap0 > max_gap:
-            cand = _pick_least_recent(pool.keys(), pool, dr[0])
+            cand = _pick_least_recent(pool.keys(), pool, dr[0], spread=data.suggested)
             suggestion = f'「{cand[:20]}」等を追加検討' if cand else '追加を検討'
             viol.append({
                 '日付': dr[0].strftime('%-m/%-d'), '曜日': WD_JP[dr[0].weekday()], 'No': rule_no,
@@ -876,7 +996,7 @@ def _max_gap_check(data, match_fn, max_gap, rule_no, rule_name, severity='中'):
         d1, h1 = dates_with[i]
         gap = (d1 - d0).days
         if gap > max_gap:
-            cand = _pick_least_recent(pool.keys(), pool, d1)
+            cand = _pick_least_recent(pool.keys(), pool, d1, spread=data.suggested)
             suggestion = f'間隔内に「{cand[:20]}」等を追加' if cand else '間隔内に追加'
             viol.append({
                 '日付': d1.strftime('%-m/%-d'), '曜日': WD_JP[d1.weekday()], 'No': rule_no, 'ルール': rule_name,
@@ -921,6 +1041,10 @@ def _usage_history(data):
             if dt is None:
                 continue
             hist.setdefault(name, set()).add(dt)
+    # 過去メニュー（履歴）があれば統合する。判定には使わず、代替え案の候補選定にだけ効く。
+    if data.history:
+        for name, dates in data.history['prod'].items():
+            hist.setdefault(name, set()).update(dates)
     data._usage_hist = {k: sorted(v) for k, v in hist.items()}
     return data._usage_hist
 
@@ -936,16 +1060,22 @@ def _days_since_last_use(hist, name, before_date):
     return (bd - uses[-1]).days
 
 
-def _pick_least_recent(candidates, hist, before_date, exclude=()):
-    """candidates（商品名のiterable）の中から、before_date時点で最も長く使われていない
-    （＝直近未使用の）ものを選んで返す。excludeに含まれるものは除外。"""
-    best, best_gap = None, -1
+def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None):
+    """candidates（商品名/レシピ名のiterable）の中から、before_date時点で最も長く
+    使われていない（＝直近未使用の）ものを選んで返す。excludeに含まれるものは除外。
+    spread に Counter を渡すと『今回の実行で既に提案した回数』が少ないものを優先し、
+    同じ候補が何度も提案されるのを防ぐ（提案の分散）。選んだ候補は自動でカウントする。
+    優先順位：提案済み回数の少なさ → 直近未使用の長さ。"""
+    best, best_key = None, None
     for c in candidates:
         if c in exclude:
             continue
         gap = _days_since_last_use(hist, c, before_date)
-        if gap > best_gap:
-            best, best_gap = c, gap
+        key = ((spread.get(c, 0) if spread is not None else 0), -gap)
+        if best_key is None or key < best_key:
+            best, best_key = c, key
+    if best is not None and spread is not None:
+        spread[best] = spread.get(best, 0) + 1
     return best
 
 
@@ -971,6 +1101,11 @@ def _dish_usage_history(data):
     for d in data.date_range:
         for n in raw_dish_names(data, d):
             hist.setdefault(n, set()).add(d)
+    # 過去メニュー（履歴）があれば統合する。候補プールが広がり、
+    # 「直近いつ使ったか」も実日付で比較できるようになる。
+    if data.history:
+        for n, dates in data.history['dish'].items():
+            hist.setdefault(n, set()).update(dates)
     data._dish_hist = {k: sorted(v) for k, v in hist.items()}
     return data._dish_hist
 
@@ -994,6 +1129,9 @@ def _recipe_products(data):
             if '備品' in rn:
                 continue
             out.setdefault(rn, set()).update(grp['商品名'].astype(str).tolist())
+    if data.history:
+        for rn, prods in data.history['recipe_products'].items():
+            out.setdefault(rn, set()).update(prods)
     data._recipe_prods = out
     return out
 
@@ -1050,10 +1188,10 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=()):
         return None, False
     if group and group != '他':
         same = [n for n in cands if cm.group_from_name(n) == group]
-        pick = _pick_least_recent(same, hist, date)
+        pick = _pick_least_recent(same, hist, date, spread=data.suggested)
         if pick:
             return pick, True
-    return _pick_least_recent(cands, hist, date), False
+    return _pick_least_recent(cands, hist, date, spread=data.suggested), False
 
 
 def _nonfried_dish_names(data):
@@ -1070,6 +1208,11 @@ def _nonfried_dish_names(data):
             ids = grp['レシピID'].dropna().astype(int)
             if ids.isin(data.fried_recipe_ids).any():
                 fried_names.add(str(recipe))
+    if data.history:
+        for rn, ids in data.history['recipe_ids'].items():
+            all_names.add(rn)
+            if ids & data.fried_recipe_ids:
+                fried_names.add(rn)
     data._nonfried_names = all_names - fried_names
     return data._nonfried_names
 
@@ -1331,7 +1474,8 @@ def check_rule3_5(data):
             if is_exception:
                 continue
             cand = _pick_least_recent(
-                [n for n in dish_hist if cm.group_from_name(n) != gm], dish_hist, d, exclude={nm_m, nm_s})
+                [n for n in dish_hist if cm.group_from_name(n) != gm], dish_hist, d,
+                exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v3.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 3,
@@ -1342,7 +1486,7 @@ def check_rule3_5(data):
         if gm in ('鶏肉系', '豚肉系', '牛肉系'):
             cand = _pick_least_recent(
                 [n for n in dish_hist if cm.group_from_name(n) not in ('鶏肉系', '豚肉系', '牛肉系')],
-                dish_hist, d, exclude={nm_m, nm_s})
+                dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v5.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 5,
@@ -1376,7 +1520,7 @@ def check_rule4_36(data):
             if gap == 1:
                 candidates = [n2 for n2 in dish_hist if 'コロッケ' in n2 and
                               (('クリーム' in n2) == (cat == 'クリーム'))]
-                cand = _pick_least_recent(candidates, dish_hist, d, exclude={n})
+                cand = _pick_least_recent(candidates, dish_hist, d, exclude={n}, spread=data.suggested)
                 suggestion = f'別のコロッケ「{cand[:20]}」に変更を検討' if cand else '使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 4,
@@ -1688,7 +1832,7 @@ def check_rule7(data):
             soy = sorted(n for n in names if is_soy(n))
             if len(soy) >= 2:
                 non_soy_hist = _filtered_dish_hist(data, lambda n: not is_soy(n))
-                cand = _pick_least_recent(non_soy_hist.keys(), non_soy_hist, d)
+                cand = _pick_least_recent(non_soy_hist.keys(), non_soy_hist, d, spread=data.suggested)
                 suggestion = f'一方を非大豆系の「{cand[:20]}」等に変更' if cand else '一方を別の食事にずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 7,
@@ -1718,7 +1862,7 @@ def check_rule12(data):
             if len(fried) >= 4:
                 names = '/'.join(fried['レシピ名'].astype(str).str[:12].tolist())
                 nonfried_hist = _filtered_dish_hist(data, lambda n: n in _nonfried_dish_names(data))
-                cand = _pick_least_recent(nonfried_hist.keys(), nonfried_hist, d)
+                cand = _pick_least_recent(nonfried_hist.keys(), nonfried_hist, d, spread=data.suggested)
                 suggestion = f'いずれか1品を「{cand[:18]}」等の非揚げ物に変更' if cand else '1品を煮/和え等に'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 12,
@@ -2144,7 +2288,7 @@ def check_rule23(data):
                     seen.add(key)
                     safe_hist = _filtered_dish_hist(
                         data, lambda nm: not any(k in nm for k in EAT_NG))
-                    cand = _pick_least_recent(safe_hist.keys(), safe_hist, d)
+                    cand = _pick_least_recent(safe_hist.keys(), safe_hist, d, spread=data.suggested)
                     sug = f'「{cand[:20]}」等、食べにくさ該当の無いメニューに差し替え（最終判断は商品開発部）' \
                         if cand else '商品開発部のたべやすさ基準で再確認'
                     viol.append({
@@ -2172,7 +2316,7 @@ def check_rule25(data):
         d1, n1 = kabocha_dates[i]
         gap = (d1 - d0).days
         if gap > 7:
-            cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d1)
+            cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d1, spread=data.suggested)
             suggestion = f'間の週に「{cand[:18]}」等を追加' if cand else '間の週にかぼちゃメニューを追加'
             viol.append({
                 '日付': d1.strftime('%-m/%-d'), '曜日': WD_JP[d1.weekday()], 'No': 25,
@@ -2187,7 +2331,7 @@ def check_rule25(data):
             pd0, pn0 = by_weekday[wd]
             gap = (d - pd0).days
             if gap <= 28:
-                cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d, exclude={n})
+                cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d, exclude={n}, spread=data.suggested)
                 suggestion = f'この曜日は「{cand[:18]}」等に変更、または間隔を空ける' if cand else '曜日をずらすか間隔を空ける'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[wd], 'No': 25,
@@ -2433,7 +2577,7 @@ def check_rule31(data):
         mash = sorted(n for n in names if 'マッシュ' in n)
         if len(mash) >= 2:
             nomash_hist = _filtered_dish_hist(data, lambda nm: 'マッシュ' not in nm)
-            cand = _pick_least_recent(nomash_hist.keys(), nomash_hist, d)
+            cand = _pick_least_recent(nomash_hist.keys(), nomash_hist, d, spread=data.suggested)
             sug = f'一方を「{cand[:20]}」等に差し替え、またはメニュー名から「マッシュ」を外す' \
                 if cand else '一方を別の調理法名に'
             viol.append({
@@ -2478,9 +2622,10 @@ ALL_RULES = [
 
 
 def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
-                    seasoning_csv_path=None, fried_master_path=None, ai_client=None):
+                    seasoning_csv_path=None, fried_master_path=None, ai_client=None,
+                    history_csv_paths=None, size='M'):
     data = load_workbook_data(xlsx_path, night_csv_paths, day_csv_paths, veg_master_path,
-                               seasoning_csv_path, fried_master_path)
+                               seasoning_csv_path, fried_master_path, history_csv_paths, size)
     data.ai_client = ai_client
     frames = []
     for label, fn in ALL_RULES:
