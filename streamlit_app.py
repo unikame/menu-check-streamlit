@@ -234,9 +234,15 @@ with st.sidebar:
 
     menu_xlsx = st.file_uploader('メニューワークブック（必須）', type=['xlsx'])
     day_csvs = st.file_uploader(
-        '食材CSV（昼・夜／複数可）', type=['csv'], accept_multiple_files=True,
-        help='例：7月昼.csv / 7月夜.csv。ファイル名から月と昼夜を判定します。'
+        '食材CSV（チェック対象／複数可）', type=['csv'], accept_multiple_files=True,
+        help='例：7月昼.csv / 7月夜.csv、または 2607MLメニュー.csv のような'
+             '「S・M混在・昼夜1ファイル」形式。中身から月・昼夜・サイズを判定します。'
              'アップロードした月だけが判定対象になります。')
+
+    hist_csvs = st.file_uploader(
+        '過去メニューCSV（任意／複数可）', type=['csv'], accept_multiple_files=True,
+        help='例：2604〜2606MLメニュー.csv。違反判定には使わず、'
+             '代替え案の候補と「直近いつ使ったか」の参照にだけ使います。')
 
     run = st.button('チェックを実行', type='primary', use_container_width=True)
 
@@ -293,16 +299,17 @@ if run:
     with st.spinner('チェック中…'):
         xlsx_path = save_upload(menu_xlsx)
 
-        day_csv_paths, night_csv_paths, unknown_csvs = {}, {}, []
-        for f in (day_csvs or []):
+        # 月・昼夜はCSVの中身（名称欄）から判定するため、キーはファイル名からの推定でよい。
+        # 推定できない場合も、中身から判定できればそのまま読み込まれる。
+        day_csv_paths, night_csv_paths = {}, {}
+        for i, f in enumerate(day_csvs or []):
             month, slot = parse_month_slot(f.name)
             path = save_upload(f, 'daycsv')
-            if month is None or slot is None:
-                unknown_csvs.append(f.name)
-                continue
-            day_csv_paths[(month, slot)] = path
-            if slot == '夜':
+            day_csv_paths[(month, slot) if (month and slot) else f'file{i}'] = path
+            if month and slot == '夜':
                 night_csv_paths[month] = path
+
+        hist_paths = [save_upload(f, 'history') for f in (hist_csvs or [])]
 
         ai_client = mc.get_anthropic_client() if use_ai else None
         if use_ai and ai_client is None:
@@ -317,6 +324,7 @@ if run:
                 seasoning_csv_path=master_paths.get('seasoning'),
                 fried_master_path=master_paths.get('shoku'),
                 ai_client=ai_client,
+                history_csv_paths=hist_paths or None,
             )
         except Exception as e:  # noqa: BLE001
             st.error(f'チェック中にエラーが発生しました：{e}')
@@ -327,7 +335,7 @@ if run:
 
     st.session_state['result'] = {
         'combined': combined, 'summary': summary,
-        'out_path': out_path, 'unknown_csvs': unknown_csvs,
+        'out_path': out_path, 'n_history': len(hist_paths),
     }
 
 # ----------------------------------------------------------------------------
@@ -350,11 +358,8 @@ k1.metric('違反候補', f'{summary["total"]:,}')
 k2.metric('対象月', '、'.join(f'{m}月' for m in summary['months']) or '—')
 k3.metric('検査日数', f'{summary["n_days"]}日')
 k4.metric('該当ルール数', f'{len(by_rule)}件')
-k5.metric('注記', f'{len(summary["warnings"])}件')
+k5.metric('過去メニュー', f'{result.get("n_history", 0)}ヶ月分')
 
-if result['unknown_csvs']:
-    st.warning('月と昼夜を判定できなかったCSV：' + '、'.join(result['unknown_csvs'])
-               + '（「7月昼.csv」のような名前にしてください）')
 
 st.write('')
 tab_list, tab_rule, tab_note = st.tabs(['違反一覧', 'ルール別', '注記・出力'])
