@@ -15,6 +15,7 @@ menu_checker.run_all_checks() を呼び出して結果を表示するだけの�
   推奨：食材CSV（7月昼.csv / 7月夜.csv …）※CSVがある月だけが判定対象になる
   マスタ3種はGoogleスプレッドシートから自動取得（MASTER_SHEET_URLS）
 """
+import inspect
 import io
 import os
 import re
@@ -315,20 +316,29 @@ if run:
         if use_ai and ai_client is None:
             st.warning('ANTHROPIC_API_KEY が見つからないため、AI判定なしで実行します。')
 
+        kwargs = {
+            'night_csv_paths': night_csv_paths or None,
+            'day_csv_paths': day_csv_paths or None,
+            'veg_master_path': master_paths.get('veg'),
+            'seasoning_csv_path': master_paths.get('seasoning'),
+            'fried_master_path': master_paths.get('shoku'),
+            'ai_client': ai_client,
+            'history_csv_paths': hist_paths or None,
+        }
+        # menu_checker.py が古い場合に落ちないよう、対応していない引数は落とす
+        supported = set(inspect.signature(mc.run_all_checks).parameters)
+        dropped = [k for k in kwargs if k not in supported]
+        kwargs = {k: v for k, v in kwargs.items() if k in supported}
+
         try:
-            combined, summary = mc.run_all_checks(
-                xlsx_path,
-                night_csv_paths=night_csv_paths or None,
-                day_csv_paths=day_csv_paths or None,
-                veg_master_path=master_paths.get('veg'),
-                seasoning_csv_path=master_paths.get('seasoning'),
-                fried_master_path=master_paths.get('shoku'),
-                ai_client=ai_client,
-                history_csv_paths=hist_paths or None,
-            )
+            combined, summary = mc.run_all_checks(xlsx_path, **kwargs)
         except Exception as e:  # noqa: BLE001
             st.error(f'チェック中にエラーが発生しました：{e}')
             st.stop()
+
+        if 'history_csv_paths' in dropped and hist_paths:
+            st.warning('menu_checker.py が過去メニューに未対応のため、履歴を使わずに実行しました。'
+                       'menu_checker.py も最新版に差し替えてください。')
 
         out_path = os.path.join(TMP_DIR, '弁当メニューチェック_代替案付き.xlsx')
         mc.write_report(combined, summary['n_days'], out_path)
