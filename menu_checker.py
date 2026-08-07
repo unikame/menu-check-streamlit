@@ -1166,6 +1166,29 @@ def _recipe_has(data, recipe, kw):
     return any(kw in _nfkc(p) for p in _recipe_products(data).get(recipe, ()))
 
 
+def _ng_recipe_names(data):
+    """禁止食材・調味料を使っているレシピ名の集合（キャッシュ有）。
+    代替え案の候補からは必ず除外する（ユーザー指定）。判定には影響しない。
+    ・食材データ.xlsx「禁止食材・調味料該当」シートの商品IDを使っているレシピ
+    ・レシピ名／商品名に NG_WORDS を含むレシピ（マスタが無い場合の保険）"""
+    if getattr(data, '_ng_names', None) is not None:
+        return data._ng_names
+    out = set()
+    if data.ng_product_ids:
+        for rn, pids in _recipe_product_ids(data).items():
+            if pids & data.ng_product_ids:
+                out.add(rn)
+    for rn, prods in _recipe_products(data).items():
+        if any(w in rn for w in NG_WORDS) or any(
+                any(w in _nfkc(p) for w in NG_WORDS) for p in prods):
+            out.add(rn)
+    for rn in _dish_usage_history(data):
+        if any(w in rn for w in NG_WORDS):
+            out.add(rn)
+    data._ng_names = out
+    return out
+
+
 def _recipe_replacement(data, date, ok=None, group=None, exclude=()):
     """レシピ（メニュー）単位の代替え案を1つ返す。候補が無ければ None。
     ・ok    : そのレシピ名を候補にしてよいか判定する関数（Noneなら全て可）
@@ -1183,7 +1206,8 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=()):
     hist = _dish_usage_history(data)
     if not hist:
         return None, False
-    ex = set(exclude)
+    # 禁止食材を使っているレシピは、どのルールの代替え案にも出さない
+    ex = set(exclude) | _ng_recipe_names(data)
     cands = [n for n in hist if n not in ex and (ok is None or ok(n))]
     if not cands:
         return None, False
@@ -1220,16 +1244,21 @@ def _nonfried_dish_names(data):
 
 def _nutrition_candidates(data, column, ascending=False, top=3):
     """レシピ別栄養価マスタ(recipe_nutrition)から、指定栄養素の多い順（または少ない順）に
-    レシピ名を返す。No.14の「具体的にどのメニューを足す/差し替えるか」の提案に使う。"""
+    レシピ名を返す。No.14の「具体的にどのメニューを足す/差し替えるか」の提案に使う。
+    禁止食材を使っているレシピは候補から除外する。"""
     df = data.recipe_nutrition
     if df is None or not len(df) or column not in df.columns:
         return []
+    ng = _ng_recipe_names(data)
     sub = df.dropna(subset=[column]).sort_values(column, ascending=ascending)
     names = []
     for nm in sub['名称'].astype(str):
         nm = nm.strip()
-        if nm and nm not in names:
-            names.append(nm)
+        if not nm or nm in names or nm in ng:
+            continue
+        if any(w in nm for w in NG_WORDS):
+            continue
+        names.append(nm)
         if len(names) >= top:
             break
     return names
@@ -1289,8 +1318,11 @@ def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=()):
 
 def _filtered_dish_hist(data, match_fn):
     """_dish_usage_history() のうち、match_fn(name)がTrueのものだけに絞ったdict（キャッシュ無し・軽量）。
-    「頻度/間隔系」ルール（No.15/22/25/26/29等）で、追加すべき具体的な代替候補を選ぶのに使う。"""
-    return {k: v for k, v in _dish_usage_history(data).items() if match_fn(k)}
+    「頻度/間隔系」ルール（No.15/22/25/26/29等）で、追加すべき具体的な代替候補を選ぶのに使う。
+    禁止食材を使っているレシピは候補から除外する。"""
+    ng = _ng_recipe_names(data)
+    return {k: v for k, v in _dish_usage_history(data).items()
+            if k not in ng and match_fn(k)}
 
 
 def veg_names_for(name, veg_color_map):
@@ -1469,14 +1501,15 @@ def check_rule3_5(data):
         if gm != gs:
             continue
         dish_hist = _dish_usage_history(data)
+        ng_names = _ng_recipe_names(data)   # 禁止食材を使うレシピは提案しない
         if gm == 'ひき肉系':
             is_exception = ('豆腐ハンバーグ' in nm_m and 'ハンバーグ' in nm_s and '豆腐ハンバーグ' not in nm_s) or \
                             ('豆腐ハンバーグ' in nm_s and 'ハンバーグ' in nm_m and '豆腐ハンバーグ' not in nm_m)
             if is_exception:
                 continue
             cand = _pick_least_recent(
-                [n for n in dish_hist if cm.group_from_name(n) != gm], dish_hist, d,
-                exclude={nm_m, nm_s}, spread=data.suggested)
+                [n for n in dish_hist if cm.group_from_name(n) != gm and n not in ng_names],
+                dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v3.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 3,
@@ -1486,7 +1519,8 @@ def check_rule3_5(data):
             })
         if gm in ('鶏肉系', '豚肉系', '牛肉系'):
             cand = _pick_least_recent(
-                [n for n in dish_hist if cm.group_from_name(n) not in ('鶏肉系', '豚肉系', '牛肉系')],
+                [n for n in dish_hist
+                 if cm.group_from_name(n) not in ('鶏肉系', '豚肉系', '牛肉系') and n not in ng_names],
                 dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v5.append({
@@ -1519,7 +1553,9 @@ def check_rule4_36(data):
             # 同日内の複数サイズ登録（例：S用30g・M用50g）は重複とみなさない（ユーザー確認済み）。
             # gap==1（翌日）のみ「連日重複」としてNG。
             if gap == 1:
+                ng_names = _ng_recipe_names(data)
                 candidates = [n2 for n2 in dish_hist if 'コロッケ' in n2 and
+                              n2 not in ng_names and
                               (('クリーム' in n2) == (cat == 'クリーム'))]
                 cand = _pick_least_recent(candidates, dish_hist, d, exclude={n}, spread=data.suggested)
                 suggestion = f'別のコロッケ「{cand[:20]}」に変更を検討' if cand else '使用日をずらす'
@@ -1717,8 +1753,9 @@ def check_rule10(data, min_gap_days=8):
             gap = (d - prev_d).days
             if 0 < gap < min_gap_days:
                 best_key, best_gap = None, -1
+                ng_names = _ng_recipe_names(data)
                 for k2, dates2 in key_dates.items():
-                    if k2 == key:
+                    if k2 == key or key_recipe.get(k2) in ng_names:
                         continue
                     past = [dt for dt in dates2 if dt < d]
                     g2 = (d - past[-1]).days if past else 10 ** 6
