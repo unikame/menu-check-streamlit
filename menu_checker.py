@@ -173,7 +173,8 @@ LOOKALIKE_PAIRS = [
 # canon_name ではこれらのプレフィックスを検出したら☆/※より後ろの実料理名を名寄せキーにする。
 # (新構成ルール確認.xlsx 7月/8月の実データを全件走査して確認した一覧。新しい枠タイトルが
 #  出てきた場合はここに追加する)
-FRAME_TITLES = ['お楽しみの1品', 'お楽しみの揚げ物', '店主おすすめの1品', 'おまかせの副菜', '本日の魚料理']
+FRAME_TITLES = ['お楽しみの1品', 'お楽しみの揚げ物', '店主おすすめの1品', 'おまかせの副菜',
+                'おまかせの揚げ物', '本日の魚料理']
 VEG_TIERS = [
     (1, ['ほうれん草']),
     (1, ['インゲンカット', 'ミニミニブロッコリー', 'オクラ', 'ささがきごぼう', '大根乱切り', '冷凍かぶ', '竹の子千切り', 'スナップピース']),
@@ -417,6 +418,7 @@ class MenuData:
         self.recipe_nutrition = None     # 食材データ.xlsx由来のレシピ別栄養価。No.14の代替メニュー提案用
         self.history = None              # 過去メニューCSV由来の使用履歴（代替え案の候補選定専用）
         self.suggested = {}              # 今回の実行で提案済みの候補と回数（提案の分散用）
+        self.base_year = datetime.date.today().year   # 食材CSVの名称欄（例:26年6月1日）から設定
         self._usage_hist = None          # 商品名(NFKC) -> 使用日リスト（キャッシュ、代替案提案用）
 
 
@@ -700,6 +702,88 @@ def _split_day_csv(df, size='M'):
     return out
 
 
+def _slot_key(name):
+    """同じ枠に入っている選択肢を1つにまとめるためのキーを返す。
+    ・「店主おすすめの1品☆○○」のような枠タイトル形式は、枠タイトル自体をキーにする
+      （同じ枠に別料理が複数登録されるため）
+    ・「さばの竜田揚げ 豆乳坦々ソース☆ジャパンフード」のような仕入先違いは、
+      cm.norm_recipe が☆以降を落とすので同じキーになる"""
+    s = str(name).replace('　', ' ').strip()
+    for ft in FRAME_TITLES:
+        if s.startswith(ft):
+            return ft
+    return cm.norm_recipe(s) or s
+
+
+def rows_from_day_csv(data, size='M'):
+    """食材CSVだけから (date, 曜日, slot, pos, レシピ名) のリストを作る。
+    メニューワークブックの「N月昼夕」シートが無い月でも、No.3/5・No.10・No.24・
+    No.28・No.29 のような『枠（メイン/サブ/副菜/サラダ）』を見るルールを動かすために使う。
+    枠はCSVのレシピ出現順に割り当てる（ユーザー確認済みの並び）：
+        メイン → サブ → 副菜1 → 副菜2 → サラダ →（6枠目以降は混ぜご飯とみなし対象外）
+    同じ枠に複数の選択肢（仕入先違い・枠タイトル形式）が並ぶため、_slot_key で名寄せしてから割り当てる。"""
+    rows = []
+    for (month, slot), df in sorted(data.day_csv.items()):
+        sub = df[~df['レシピ名'].astype(str).str.contains('備品', na=False)]
+        for md, grp in sub.groupby('md', sort=False):
+            if not isinstance(md, tuple):
+                continue
+            keys, first_name = [], {}
+            for rn in grp['レシピ名'].astype(str):
+                k = _slot_key(rn)
+                if k not in keys:
+                    keys.append(k)
+                    first_name[k] = rn
+            try:
+                d = datetime.date(data.base_year, int(md[0]), int(md[1]))
+            except ValueError:
+                continue
+            for i, k in enumerate(keys):
+                if i >= len(POS_ORDER_5):
+                    break   # 6枠目以降（混ぜご飯）は対象外
+                rows.append((d, WD_JP[d.weekday()], slot, POS_ORDER_5[i], _nfkc(first_name[k])))
+    return rows
+
+
+def nutrition_from_day_csv(data):
+    """食材CSVが栄養価列（カロリー/たんぱく質/食塩相当量）を持つ場合に、
+    昼の日別栄養価を集計して {月: DataFrame(date,kcal,protein,salt)} を返す。No.14用。
+    同じ枠の選択肢が複数並ぶと二重計上になるため、_slot_key で1枠1レシピに絞る。"""
+    NUTRI = ['カロリー', 'たんぱく質', '食塩相当量']
+    out = {}
+    for (month, slot), df in data.day_csv.items():
+        if slot != '昼' or not all(c in df.columns for c in NUTRI):
+            continue
+        sub = df[~df['レシピ名'].astype(str).str.contains('備品', na=False)]
+        recs = []
+        for md, grp in sub.groupby('md', sort=False):
+            if not isinstance(md, tuple):
+                continue
+            seen, keep = set(), []
+            for rn, g2 in grp.groupby('レシピ名', sort=False):
+                k = _slot_key(rn)
+                if k in seen:
+                    continue
+                seen.add(k)
+                keep.append(g2)
+            if not keep:
+                continue
+            one = pd.concat(keep)
+            try:
+                d = datetime.date(data.base_year, int(md[0]), int(md[1]))
+            except ValueError:
+                continue
+            recs.append({
+                'date': d,
+                'kcal': pd.to_numeric(one['カロリー'], errors='coerce').sum(),
+                'protein': pd.to_numeric(one['たんぱく質'], errors='coerce').sum(),
+                'salt': pd.to_numeric(one['食塩相当量'], errors='coerce').sum(),
+            })
+        if recs:
+            out[month] = pd.DataFrame(recs)
+    return out
+
+
 def load_history(history_csv_paths, size='M'):
     """過去メニューCSV（複数月分）を読み、代替え案の候補選定に使う履歴を返す。
     判定（違反チェック）には一切使わず、『どのレシピ/商品を、いつ使ったか』だけを取り出す。
@@ -790,6 +874,12 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
                 data.warnings.append(
                     f'{os.path.basename(str(path))}：月・昼夜を判定できず読み込めませんでした')
                 continue
+            # 名称欄（例:高齢者 S・M 26年6月1日(月)の昼【M】）から年を拾っておく
+            for nm in df['名称'].astype(str).head(50):
+                dt = _parse_full_date(nm)
+                if dt is not None:
+                    data.base_year = dt.year
+                    break
             for k, sub in parts.items():
                 if k in data.day_csv:
                     data.day_csv[k] = pd.concat([data.day_csv[k], sub], ignore_index=True)
@@ -806,9 +896,14 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
                 '代替え案の候補として読み込みました（違反判定には使いません）')
         except Exception as e:
             data.warnings.append(f'過去メニューの読み込みに失敗しました（{e}）')
-    xl = pd.ExcelFile(xlsx_path)
-    wb_raw = openpyxl.load_workbook(xlsx_path, data_only=True)
-    sheet_names = xl.sheet_names
+    # メニューワークブックは任意。無い場合は食材CSVだけで判定する（ユーザー指定）。
+    if xlsx_path:
+        xl = pd.ExcelFile(xlsx_path)
+        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=True)
+        sheet_names = xl.sheet_names
+    else:
+        xl = wb_raw = None
+        sheet_names = []
     shoku_sheets = _find_month_sheets(sheet_names, r'使用食材$')
     lunchdinner_sheets = _find_month_sheets(sheet_names, r'昼夕')
     lunch_tagged_sheets = _find_month_sheets(sheet_names, r'昼$')
@@ -816,19 +911,41 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
     nutrition_daily_sheets = _find_month_sheets(sheet_names, r'栄養価$')
     months = sorted(set(shoku_sheets) | set(lunchdinner_sheets))
     if not months:
-        raise ValueError('「N月使用食材」「N月昼夕...」形式のシートが見つかりませんでした。シート名をご確認ください。')
+        # ワークブックが無い（または該当シートが無い）場合は、食材CSVの月を対象にする
+        months = sorted({m for (m, _slot) in data.day_csv})
+        if not months:
+            raise ValueError(
+                'チェックする月を特定できませんでした。食材CSV（または「N月使用食材」'
+                '「N月昼夕...」シートを含むワークブック）をアップロードしてください。')
+        data.warnings.append(
+            'メニューワークブックが無いため、食材CSVだけで判定しました（対象: '
+            + '、'.join(f'{m}月' for m in months) + '）。'
+            'メイン/サブ/副菜/サラダの枠はCSVのレシピ出現順から復元しています。')
     # 食材CSVが渡された場合は、そのCSVがある月だけを判定対象にする（ユーザー指定）。
     # 1ヶ月分だけアップロードした時に、ワークブック内の他の月まで（使用食材シートへの
     # フォールバックで）判定されてしまうのを防ぐ。
-    if day_csv_paths:
-        csv_months = {m for (m, _slot) in day_csv_paths}
+    # 判定対象月は、実際に読み込めた食材CSVの中身（名称欄の日付）から決める。
+    # 引数のキーはファイル名由来で当てにならない場合があるため使わない。
+    if data.day_csv:
+        csv_months = {m for (m, _slot) in data.day_csv}
         excluded = [m for m in months if m not in csv_months]
-        if excluded and any(m in csv_months for m in months):
-            months = [m for m in months if m in csv_months]
+        if any(m in csv_months for m in months):
+            if excluded:
+                months = [m for m in months if m in csv_months]
+                data.warnings.append(
+                    '食材CSVがある月のみを判定対象にしました（対象外: '
+                    + '、'.join(f'{m}月' for m in excluded)
+                    + '）。全期間を見る場合はその月の食材CSVも追加してください。')
+        else:
+            # ワークブックと食材CSVの月がまったく噛み合っていない＝設定ミスの可能性が高い。
+            # 黙って食材CSVを無視すると、古い月の結果が出て誤解を招くため明示的に警告する。
             data.warnings.append(
-                '食材CSVがある月のみを判定対象にしました（対象外: '
-                + '、'.join(f'{m}月' for m in excluded)
-                + '）。全期間を見る場合はその月の食材CSVも追加してください。')
+                '【要確認】食材CSVの月（'
+                + '、'.join(f'{m}月' for m in sorted(csv_months))
+                + '）が、メニューワークブックの月（'
+                + '、'.join(f'{m}月' for m in months)
+                + '）と一致しません。食材CSVは判定に使われていません。'
+                '同じ月のワークブックをアップロードしてください。')
     data.months = months
     NUTRI_COLS = ['カロリー', 'たんぱく質', '食塩相当量']
     for month in months:
@@ -879,11 +996,32 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
         if month in lunchdinner_sheets:
             ws = wb_raw[lunchdinner_sheets[month]]
             data.rows += _parse_lunch_dinner_sheet(ws)
-        else:
-            data.warnings.append(f'{month}月：「{month}月昼夕...」シートが見つからず、No.24/28/29の判定をスキップしました')
         if month in lunch_tagged_sheets:
             df = pd.read_excel(xl, lunch_tagged_sheets[month], header=None)
             data.menu_lunch_tagged[month] = df
+    # 「N月昼夕」シートが無い月は、食材CSVのレシピ出現順から枠を復元する
+    missing_rows_months = [m for m in months if m not in lunchdinner_sheets]
+    if missing_rows_months and data.day_csv:
+        derived = [r for r in rows_from_day_csv(data, size) if r[0].month in missing_rows_months]
+        if derived:
+            data.rows += derived
+            data.warnings.append(
+                '、'.join(f'{m}月' for m in missing_rows_months)
+                + '：「N月昼夕...」シートが無いため、食材CSVのレシピ出現順から'
+                'メイン/サブ/副菜1/副菜2/サラダを復元しました'
+                '（同じ枠の選択肢は名寄せし、6枠目以降＝混ぜご飯は対象外）')
+    elif missing_rows_months:
+        data.warnings.append(
+            '、'.join(f'{m}月' for m in missing_rows_months)
+            + '：「N月昼夕...」シートも食材CSVも無く、No.3/5・No.24・No.28・No.29 をスキップしました')
+    # 栄養価シートが無い月は、栄養価列を持つ食材CSVから日別に集計する
+    if data.day_csv:
+        for month, df_n in nutrition_from_day_csv(data).items():
+            if month in months and month not in data.nutrition_daily and len(df_n):
+                data.nutrition_daily[month] = df_n
+                data.warnings.append(
+                    f'{month}月：「{month}月栄養価」シートが無いため、'
+                    '食材CSVの栄養価列から日別に集計しました（昼のみ・同じ枠の選択肢は1つに名寄せ）')
     all_dates = [r[0] for r in data.rows]
     if all_dates:
         data.date_range = pd.date_range(min(all_dates), max(all_dates))
@@ -893,7 +1031,7 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
         for month, shoku in data.shoku.items():
             for md in shoku['md'].dropna().unique():
                 try:
-                    mds.append(datetime.date(2000 + (0 if month >= 1 else 0), int(md[0]), int(md[1])))
+                    mds.append(datetime.date(data.base_year, int(md[0]), int(md[1])))
                 except Exception:
                     pass
         if mds:
