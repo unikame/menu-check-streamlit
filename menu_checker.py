@@ -784,6 +784,40 @@ def nutrition_from_day_csv(data):
     return out
 
 
+def _drop_history_months(history, exclude_months):
+    """履歴から、指定した月のデータを取り除く。
+    チェック対象の月が履歴にも含まれていると『過去』として機能しないため、
+    判定対象月が確定した時点で除外する（ユーザー指定）。
+    その月にしか登場しないレシピ／商品は履歴から消えるが、
+    判定対象月のデータは day_csv 側から候補に入るため問題ない。"""
+    if not history or not exclude_months:
+        return history, 0
+    dropped = 0
+
+    def _filt(dmap):
+        nonlocal dropped
+        out = {}
+        for name, dates in dmap.items():
+            keep = [d for d in dates if pd.Timestamp(d).month not in exclude_months]
+            dropped_here = len(dates) - len(keep)
+            dropped += dropped_here
+            if keep:
+                out[name] = keep
+        return out
+
+    kept_dish = _filt(history['dish'])
+    removed_names = set(history['dish']) - set(kept_dish)
+    return {
+        'dish': kept_dish,
+        'prod': _filt(history['prod']),
+        'recipe_products': {k: v for k, v in history['recipe_products'].items()
+                            if k not in removed_names},
+        'all_names': history['all_names'] - removed_names,
+        'recipe_ids': {k: v for k, v in history['recipe_ids'].items()
+                       if k not in removed_names},
+    }, len(removed_names)
+
+
 def load_history(history_csv_paths, size='M'):
     """過去メニューCSV（複数月分）を読み、代替え案の候補選定に使う履歴を返す。
     判定（違反チェック）には一切使わず、『どのレシピ/商品を、いつ使ったか』だけを取り出す。
@@ -947,6 +981,15 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
                 + '）と一致しません。食材CSVは判定に使われていません。'
                 '同じ月のワークブックをアップロードしてください。')
     data.months = months
+    # チェック対象月が履歴にも入っていると「過去」として機能しないため取り除く（ユーザー指定）
+    if data.history:
+        before = len(data.history['dish'])
+        data.history, removed = _drop_history_months(data.history, set(months))
+        if removed:
+            data.warnings.append(
+                'チェック対象月（' + '、'.join(f'{m}月' for m in months)
+                + '）と重なる過去メニューを候補から除外しました'
+                f'（レシピ {before}→{len(data.history["dish"])}種類）')
     NUTRI_COLS = ['カロリー', 'たんぱく質', '食塩相当量']
     for month in months:
         # 食材ベースの判定（No.4/6/7/21/25/27/28/29/30/31等）は、メニュー一覧と同じ商品ライン
