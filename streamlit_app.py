@@ -51,10 +51,25 @@ MASTER_SHEET_URLS = {
 }
 
 # ============================================================================
-# ★ 過去メニュー（履歴）の参照先URL ★
+# ★ 過去メニュー（履歴）の管理 ★
 #   違反判定には使わず、代替え案の候補と「直近いつ使ったか」の参照にだけ使います。
-#   URLのgidで指定したタブをCSVとして取得します。月を増やす場合はここに追記してください。
+#
+#   HISTORY_REGISTRY_URL に「管理用スプレッドシート」のURLを設定すると、
+#   そこに並んだ行が過去メニューの一覧になります。行を足す＝月を追加、
+#   行を消す（または「有効」を空にする）＝月を削除、です。コードの修正は不要です。
+#
+#   管理用シートの形式（1行目は見出し）:
+#       月      | URL                                   | 有効
+#       2603    | https://docs.google.com/spreadsheets/… | ○
+#       2604    | https://docs.google.com/spreadsheets/… | ○
+#   ・「月」は 2604 のような年月4桁（26年4月）。表示用なので他の書き方でも動きます。
+#   ・「有効」は ○/はい/TRUE/1 で有効。空欄や × は読み込みません。列自体が無ければ全て有効。
+#   ・管理用シートも「リンクを知っている全員（閲覧者）」にしてください。
+#
+#   HISTORY_REGISTRY_URL が空の場合は、下の HISTORY_SHEET_URLS を使います。
 # ============================================================================
+HISTORY_REGISTRY_URL = ''
+
 HISTORY_SHEET_URLS = [
     ('2604', 'https://docs.google.com/spreadsheets/d/1xJQRuCBesO6dqTdLjBjx1QIZQ3BA_fjC0XNT_nV1mBA/edit?gid=1390280937#gid=1390280937'),
     ('2605', 'https://docs.google.com/spreadsheets/d/1_KLuG2AqF37fNSskyP-BrHIUKoJQtpeDISvpqChBPBo/edit?gid=1241683169#gid=1241683169'),
@@ -222,24 +237,90 @@ def resolve_master(key):
     return path, f'{label}（{rules}）', True
 
 
+def history_label(code):
+    """'2604' → '26年4月' のように読みやすくする。解釈できなければそのまま返す。"""
+    m = re.fullmatch(r'(\d{2})(\d{2})', str(code))
+    return f'{m.group(1)}年{int(m.group(2))}月' if m else str(code)
+
+
+_TRUE_WORDS = {'○', '◯', '〇', 'o', 'O', '有効', 'はい', 'yes', 'YES', 'true', 'TRUE',
+               '1', '1.0', 'y', 'Y', '✓'}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_history_registry(url):
+    """管理用スプレッドシートから [(月ラベル, URL), ...] を読む。
+    列名は「月」「URL」「有効」を想定するが、見つからない場合は
+    1列目=月・URLらしき列=URL として推定する。"""
+    data = fetch_master_bytes(url, 'csv')
+    df = pd.read_csv(io.BytesIO(data), dtype=str).fillna('')
+    if df.empty:
+        return []
+    cols = {str(c).strip(): c for c in df.columns}
+
+    def pick(*names):
+        for n in names:
+            for c in cols:
+                if n in c:
+                    return cols[c]
+        return None
+
+    c_url = pick('URL', 'url', 'リンク')
+    if c_url is None:   # URLらしい値が最も多い列を採用
+        c_url = max(df.columns, key=lambda c: df[c].astype(str).str.contains('docs.google').sum())
+    c_month = pick('月', 'ラベル', '名前') or df.columns[0]
+    c_on = pick('有効', '使用', 'ON')
+
+    out = []
+    for _, r in df.iterrows():
+        u = str(r[c_url]).strip()
+        if 'docs.google' not in u and 'drive.google' not in u:
+            continue
+        if c_on is not None and str(r[c_on]).strip() not in _TRUE_WORDS:
+            continue
+        out.append((str(r[c_month]).strip() or '過去メニュー', u))
+    return out
+
+
+def history_sources():
+    """過去メニューの一覧を返す。管理用シートがあればそちらを優先する。"""
+    url = (HISTORY_REGISTRY_URL or '').strip()
+    if not url:
+        return list(HISTORY_SHEET_URLS), None
+    try:
+        rows = load_history_registry(url)
+    except Exception as e:  # noqa: BLE001
+        return list(HISTORY_SHEET_URLS), f'管理用シートを読めませんでした（{e}）。コード内の一覧を使用します。'
+    if not rows:
+        return list(HISTORY_SHEET_URLS), '管理用シートに有効な行がありません。コード内の一覧を使用します。'
+    return rows, None
+
+
 def resolve_history():
-    """HISTORY_SHEET_URLS を取得して一時ファイルに書き出し、(パス一覧, 状態メッセージ一覧) を返す。"""
-    paths, msgs = [], []
-    for label, url in HISTORY_SHEET_URLS:
+    """過去メニューを取得して一時ファイルに書き出し、
+    (パス一覧, 状態メッセージ一覧, 月ラベル一覧) を返す。"""
+    paths, msgs, labels = [], [], []
+    sources, note = history_sources()
+    if note:
+        msgs.append((False, note))
+    for code, url in sources:
         url = (url or '').strip()
         if not url:
             continue
+        label = history_label(code)
         try:
             data = fetch_master_bytes(url, 'csv')
         except Exception as e:  # noqa: BLE001
             msgs.append((False, f'{label}：取得に失敗（{e}）'))
             continue
-        path = os.path.join(TMP_DIR, f'{label}メニュー.csv')
+        safe = re.sub(r'[^0-9A-Za-z一-龥ぁ-んァ-ヶ]', '_', str(code)) or f'hist{len(paths)}'
+        path = os.path.join(TMP_DIR, f'{safe}メニュー.csv')
         with open(path, 'wb') as f:
             f.write(data)
         paths.append(path)
-        msgs.append((True, f'{label}メニュー'))
-    return paths, msgs
+        msgs.append((True, label))
+        labels.append(label)
+    return paths, msgs, labels
 
 
 def parse_month_slot(filename):
@@ -295,7 +376,7 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
         master_paths[key], master_ok[key] = path, ok
         chips.append(f'<span class="{"ms-ok" if ok else "ms-ng"}">'
                      f'{"●" if ok else "▲"} {msg}</span>')
-    history_paths, history_msgs = resolve_history()
+    history_paths, history_msgs, history_labels = resolve_history()
     hchips = [f'<span class="{"ms-ok" if ok else "ms-ng"}">'
               f'{"●" if ok else "▲"} {msg}</span>' for ok, msg in history_msgs]
 
@@ -309,6 +390,7 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
     with o1:
         if st.button('マスタ・過去メニューを再読込', use_container_width=True):
             fetch_master_bytes.clear()
+            load_history_registry.clear()
             st.rerun()
     with o2:
         use_ai = st.checkbox('No.1の酷似判定にAIを使う', value=False,
@@ -404,7 +486,7 @@ if run:
 
     st.session_state['result'] = {
         'combined': combined, 'summary': summary,
-        'out_path': out_path, 'n_history': len(hist_paths),
+        'out_path': out_path, 'history_labels': list(history_labels),
     }
 
 # ----------------------------------------------------------------------------
@@ -427,8 +509,20 @@ k1.metric('違反候補', f'{summary["total"]:,}')
 k2.metric('対象月', '、'.join(f'{m}月' for m in summary['months']) or '—')
 k3.metric('検査日数', f'{summary["n_days"]}日')
 k4.metric('該当ルール数', f'{len(by_rule)}件')
-k5.metric('過去メニュー', f'{result.get("n_history", 0)}ヶ月分')
+hist_labels = result.get('history_labels', [])
+# チェック対象と同じ月が履歴に入っている場合は、実質の過去分が減るので注記する
+target_months = set(summary['months'])
+overlap = [x for x in hist_labels
+           if (m := re.search(r'(\d+)月', x)) and int(m.group(1)) in target_months]
+k5.metric('過去メニュー', '・'.join(hist_labels) if hist_labels else 'なし',
+          help='違反判定には使わず、代替え案の候補と「直近いつ使ったか」の参照にのみ使います。'
+               + ('　※' + '・'.join(overlap) + ' はチェック対象月と重複しています' if overlap else ''))
 
+
+if overlap:
+    st.warning('過去メニューの ' + '・'.join(overlap)
+               + ' は、いまチェックしている月と同じです。実質の過去データが減るため、'
+               'HISTORY_SHEET_URLS から外すか、別の月に差し替えることを検討してください。')
 
 st.write('')
 tab_list, tab_rule, tab_note = st.tabs(['違反一覧', 'ルール別', '注記・出力'])
