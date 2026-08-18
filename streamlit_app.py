@@ -276,10 +276,13 @@ st.markdown(
 with st.expander('入力ファイルと設定', expanded=('result' not in st.session_state)):
     u1, u2 = st.columns(2)
     with u1:
-        menu_xlsx = st.file_uploader('メニューワークブック（必須）', type=['xlsx'])
+        menu_xlsx = st.file_uploader(
+            'メニューワークブック（任意）', type=['xlsx'],
+            help='「N月昼夕」「N月栄養価」シートがあれば、枠（メイン/サブ/副菜/サラダ）と'
+                 '栄養価をそちらから読みます。無い場合は食材CSVから復元します。')
     with u2:
         day_csvs = st.file_uploader(
-            '食材CSV（チェック対象／複数可）', type=['csv'], accept_multiple_files=True,
+            '食材CSV（チェック対象・必須／複数可）', type=['csv'], accept_multiple_files=True,
             help='例：7月昼.csv / 7月夜.csv、または 2607MLメニュー.csv のような'
                  '「S・M混在・昼夜1ファイル」形式。中身から月・昼夜・サイズを判定します。'
                  'アップロードした月だけが判定対象になります。')
@@ -333,22 +336,37 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
 # 実行
 # ----------------------------------------------------------------------------
 if run:
-    if menu_xlsx is None:
-        st.error('メニューワークブック（.xlsx）をアップロードしてください。')
+    if menu_xlsx is None and not day_csvs:
+        st.error('食材CSV（またはメニューワークブック）をアップロードしてください。')
         st.stop()
 
     with st.spinner('チェック中…'):
         xlsx_path = save_upload(menu_xlsx)
 
-        # 月・昼夜はCSVの中身（名称欄）から判定するため、キーはファイル名からの推定でよい。
-        # 推定できない場合も、中身から判定できればそのまま読み込まれる。
-        day_csv_paths, night_csv_paths = {}, {}
-        for i, f in enumerate(day_csvs or []):
-            month, slot = parse_month_slot(f.name)
+        # 月・昼夜・サイズはCSVの中身（名称欄）から判定するため、パスの一覧を渡すだけでよい。
+        # ファイル名に依存しないので、bentos_xxx.csv のような名前でも読み込める。
+        # ただし menu_checker.py が古いとリストを受け取れないため、その場合は
+        # 従来どおりファイル名から推定した {(月, 昼夜): パス} を渡す。
+        content_split = hasattr(mc, '_split_day_csv')
+        day_csv_paths = [] if content_split else {}
+        night_csv_paths, unnamed = {}, []
+        for f in (day_csvs or []):
             path = save_upload(f, 'daycsv')
-            day_csv_paths[(month, slot) if (month and slot) else f'file{i}'] = path
+            month, slot = parse_month_slot(f.name)
+            if content_split:
+                day_csv_paths.append(path)
+            elif month and slot:
+                day_csv_paths[(month, slot)] = path
+            else:
+                unnamed.append(f.name)
             if month and slot == '夜':
                 night_csv_paths[month] = path
+
+        if unnamed:
+            st.warning(
+                'menu_checker.py が古いため、ファイル名から月・昼夜を判定できないCSVを'
+                'スキップしました：' + '、'.join(unnamed)
+                + '。menu_checker.py を最新版に差し替えると、ファイル名に関係なく読み込めます。')
 
         # 過去メニューは HISTORY_SHEET_URLS からの取得のみ（アップロード欄は無し）
         hist_paths = list(history_paths)
@@ -503,6 +521,9 @@ with tab_note:
         '- 重要度は付けていません。結果は日付順に並びます（月次集計の行はその月の先頭）。\n'
         '- 代替え案は商材名ではなくレシピ（メニュー）名で、その日時点で最も長く使われていないものを選びます。\n'
         '- 食材CSVをアップロードした月だけが判定対象です。\n'
+        '- メニューワークブックは任意です。無い場合は、枠（メイン/サブ/副菜1/副菜2/サラダ）を'
+        '食材CSVのレシピ出現順から復元し、栄養価もCSVの列から集計します。'
+        '同じ枠に複数の選択肢がある日は名寄せし、6枠目以降（混ぜご飯）は対象外です。\n'
         '- マスタ・過去メニューは1時間キャッシュします。'
         '更新直後は「入力ファイルと設定」の再読込ボタンを押してください。\n'
         '- 対象外：No.2（見た目酷似）／No.23（食べにくさ）。未対応：No.13 / No.16 / No.32〜35 / No.37。')
