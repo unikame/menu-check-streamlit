@@ -70,10 +70,15 @@ MASTER_SHEET_URLS = {
 # ============================================================================
 HISTORY_REGISTRY_URL = ''
 
+#   左の名前は目印です。実際の月は取り込んだデータの名称欄（例:26年4月1日）から
+#   自動判定して表示するので、多少ずれていても判定には影響しません。
 HISTORY_SHEET_URLS = [
     ('2604', 'https://docs.google.com/spreadsheets/d/1xJQRuCBesO6dqTdLjBjx1QIZQ3BA_fjC0XNT_nV1mBA/edit?gid=1390280937#gid=1390280937'),
     ('2605', 'https://docs.google.com/spreadsheets/d/1_KLuG2AqF37fNSskyP-BrHIUKoJQtpeDISvpqChBPBo/edit?gid=1241683169#gid=1241683169'),
     ('2606', 'https://docs.google.com/spreadsheets/d/1BKW8BzkUujyIPbrmXo9mgzc5Zr5Pi6H2n-KwOT5ELCk/edit?gid=66760815#gid=66760815'),
+    ('追加1', 'https://docs.google.com/spreadsheets/d/1nFthViWDJ76XbRBJ6Zriwel1hGXovpI_TGL5AyTjGSU/edit?gid=748510641#gid=748510641'),
+    ('追加2', 'https://docs.google.com/spreadsheets/d/14p8krKoARZz1cv7ixURUxg_tdSHgoww3esS5EU-GelA/edit?gid=1263604096#gid=1263604096'),
+    ('追加3', 'https://docs.google.com/spreadsheets/d/1Hl8USvY6nb0czO_nBksLJXkXIqIVhitRrzpAnpyQHZ8/edit?gid=2107519398#gid=2107519398'),
 ]
 
 MASTER_META = {
@@ -243,6 +248,19 @@ def history_label(code):
     return f'{m.group(1)}年{int(m.group(2))}月' if m else str(code)
 
 
+def detect_history_month(data_bytes):
+    """取り込んだCSVの名称欄（例:高齢者 S・M 26年4月1日(月)の昼【M】）から
+    '26年4月' を取り出す。コード側の名前が実態とずれていても正しく表示するため。"""
+    try:
+        head = pd.read_csv(io.BytesIO(data_bytes), usecols=['名称'], nrows=300, dtype=str)
+    except Exception:  # noqa: BLE001
+        return None
+    ext = head['名称'].astype(str).str.extract(r'(\d{2})年\s*(\d{1,2})月').dropna()
+    if not len(ext):
+        return None
+    return f'{ext.iloc[0, 0]}年{int(ext.iloc[0, 1])}月'
+
+
 _TRUE_WORDS = {'○', '◯', '〇', 'o', 'O', '有効', 'はい', 'yes', 'YES', 'true', 'TRUE',
                '1', '1.0', 'y', 'Y', '✓'}
 
@@ -313,6 +331,10 @@ def resolve_history():
         except Exception as e:  # noqa: BLE001
             msgs.append((False, f'{label}：取得に失敗（{e}）'))
             continue
+        # 実データから月を判定し、コード側の名前より優先して表示する
+        detected = detect_history_month(data)
+        if detected:
+            label = detected
         safe = re.sub(r'[^0-9A-Za-z一-龥ぁ-んァ-ヶ]', '_', str(code)) or f'hist{len(paths)}'
         path = os.path.join(TMP_DIR, f'{safe}メニュー.csv')
         with open(path, 'wb') as f:
@@ -482,7 +504,11 @@ if run:
                        'menu_checker.py も最新版に差し替えてください。')
 
         out_path = os.path.join(TMP_DIR, '弁当メニューチェック_代替案付き.xlsx')
-        mc.write_report(combined, summary['n_days'], out_path)
+        rules_df = summary.get('rules')
+        try:
+            mc.write_report(combined, summary['n_days'], out_path, rules_df=rules_df)
+        except TypeError:      # 旧 menu_checker.py（ルール一覧シート未対応）
+            mc.write_report(combined, summary['n_days'], out_path)
 
     st.session_state['result'] = {
         'combined': combined, 'summary': summary,
@@ -525,7 +551,12 @@ if overlap:
                'HISTORY_SHEET_URLS から外すか、別の月に差し替えることを検討してください。')
 
 st.write('')
-tab_list, tab_rule, tab_note = st.tabs(['違反一覧', 'ルール別', '注記・出力'])
+rules_df = summary.get('rules')
+has_rules = rules_df is not None and len(rules_df)
+tabs = ['違反一覧', 'ルール別', '注記・出力'] + (['ルール定義'] if has_rules else [])
+tab_objs = st.tabs(tabs)
+tab_list, tab_rule, tab_note = tab_objs[0], tab_objs[1], tab_objs[2]
+tab_def = tab_objs[3] if has_rules else None
 
 # ---- 違反一覧 ----
 with tab_list:
@@ -609,6 +640,10 @@ with tab_note:
     else:
         st.caption('注記はありません。')
 
+    if not has_rules:
+        st.caption('メニューワークブックをアップロードすると、'
+                   'ルールの正文と実装状況を「ルール定義」タブに表示します。')
+
     st.markdown('##### このチェックについて')
     st.markdown(
         '- 判定は可能な限りキーワード推測ではなく、実際のマスタデータ（商品ID / レシピID）で行っています。\n'
@@ -621,3 +656,31 @@ with tab_note:
         '- マスタ・過去メニューは1時間キャッシュします。'
         '更新直後は「入力ファイルと設定」の再読込ボタンを押してください。\n'
         '- 対象外：No.2（見た目酷似）／No.23（食べにくさ）。未対応：No.13 / No.16 / No.32〜35 / No.37。')
+
+# ---- ルール定義（ワークブックのルールシート） ----
+if tab_def is not None:
+    with tab_def:
+        st.caption('メニューワークブックの「新メニュー構成ルール」シートを読み込んでいます。'
+                   'ルールが変わったらワークブックを差し替えてください。')
+        c1, c2, c3 = st.columns(3)
+        vc = rules_df['実装状況'].value_counts()
+        c1.metric('ルール総数', len(rules_df))
+        c2.metric('実装済み', int(vc.get('実装済み', 0)))
+        c3.metric('未実装・対象外', int(len(rules_df) - vc.get('実装済み', 0)))
+
+        only_todo = st.checkbox('未実装・対象外だけ表示', value=False)
+        view_r = rules_df if not only_todo else rules_df[rules_df['実装状況'] != '実装済み']
+        st.dataframe(
+            view_r, use_container_width=True, hide_index=True, height=520,
+            column_config={
+                'No': st.column_config.NumberColumn('No', width='small', format='%d'),
+                '目的': st.column_config.TextColumn('目的', width='small'),
+                'ルール': st.column_config.TextColumn('ルール（正文）', width='large'),
+                '実装状況': st.column_config.TextColumn('実装状況', width='small'),
+                '適用中の数値': st.column_config.TextColumn('適用中の数値', width='medium'),
+            })
+        st.caption(
+            '「適用中の数値」は判定に使っている閾値です。ルールシートに '
+            '「間隔日数」「上限」「下限」「同曜日日数」「月最低回数」 の列を足して数値を入れると、'
+            'コードを直さずにその値で判定します（列が無い場合は既定値）。'
+            '判定の条件そのものを変える場合はロジックの改修が必要です。')
