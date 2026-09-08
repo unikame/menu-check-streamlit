@@ -35,7 +35,7 @@
   No.14 栄養素の月平均（「N月栄養価」シート優先。夜はデータ未入手のため昼のみ）
   No.15 健康食材 週1回以上
   No.17 1食で赤・黄・緑を使用（野菜マスタの色列・昼夜別。黄(卵焼き)は毎食入っている前提のため
-        常にクリア済みとして扱う。赤は赤ピーマン/かに風味蒲鉾ほぐし/花がんもも野菜マスタ未登録でも加味）
+        常にクリア済みとして扱う。赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんもも野菜マスタ未登録でも加味）
   No.18 1食の重量下限（M=212g・容器18.0g込みの総重量で判定。カップ重量は考慮しない。
         Sは容器17.5gのみ判明・下限値未確定のため判定しない → BENTO_SIZE_SPEC）
   No.19 同じ調味料のみでの味付け禁止
@@ -209,12 +209,13 @@ VEG_TIER_MASTER = [
     ('id', 3001594, '竹の子', 1.5, 1.5, False, '冷凍竹の子千切り 500g'),
     ('id', 3000084, 'スナップ', 1.5, 1.5, False, 'アイガースナップピース 500g'),
     # 3日空けばOK（メニュー名に無ければ2日でも可）階層。芋(じゃがいも/さつまいも/里芋)とかぼちゃは
-    # 昼夜連続使用（半日空き）は例外的にOK（シートD42注記）。れんこん・油調ナスは対象外。
+    # 昼夜連続使用（半日空き）は例外的にOK（シートD42注記）。
+    # れんこん・油調ナス・スイートポテトは芋の例外に含めず対象外（ユーザー確認済み）。
     ('id', 3002377, '油調ナス', 2, 3, False, '油調ナス(自然解凍) 500g'),
     ('id', 3003062, ('さといも', '里芋'), 2, 3, True, 'さといもSS 500g'),
     ('id', 3002214, 'じゃがいも', 2, 3, True, '乱切りじゃがいも 500g'),
     ('id', 3001814, ('さつま芋', 'さつまいも'), 2, 3, True, 'ひとくち焼きいも(さつま芋)'),
-    ('id', 3001964, 'スイートポテト', 2, 3, True, 'スイートポテト 1kg'),
+    ('id', 3001964, 'スイートポテト', 2, 3, False, 'スイートポテト 1kg'),
     ('id', 3002355, 'れんこん', 2, 3, False, 'れんこん乱切り 500g'),
     # 2日空けばOK（かぼちゃ3商品）階層。同上、昼夜連続はOK。
     # 「栗南瓜コロッケ」のように「南瓜」表記の商品もあるため、両表記で拾う（ユーザー確認済み）。
@@ -243,8 +244,8 @@ NUTRI_BOUNDS = {'昼': {'kcal': (415, 455), 'salt_max': 3.8, 'protein_min': 12},
                 '夜': {'kcal': (245, 275), 'salt_max': 3.0, 'protein_min': 12}}
 # No.17: 1食につき赤・黄・緑を必ず使用（キーワード方式・暫定版。商材マスタの「色」列が整備され次第、
 # そちらを正とする判定に切り替える想定）
-RED_KW = ['人参', 'にんじん', '3色ピーマン', '3色パプリカ', '赤パプリカ', '赤ピーマン', 'レッドピーマン',
-          '紅芯大根', 'トマト', 'ミニトマト', '紅生姜', 'いちご', 'かに風味蒲鉾ほぐし', '花がんも' ]
+RED_KW = ['人参', 'にんじん', '3色ピーマン', '3色パプリカ', '赤パプリカ', 'レッドピーマン',
+          '紅芯大根', 'トマト', 'ミニトマト', '紅生姜', 'いちご']
 YELLOW_KW = ['3色ピーマン', '3色パプリカ', '黄パプリカ', '黄ピーマン', 'イエローピーマン', 'コーン', 'とうもろこし',
              'かぼちゃ', '卵', 'たまご', '玉子', 'たくあん', 'パイナップル', 'レモン']
 GREEN_KW = ['ほうれん草', '小松菜', 'ブロッコリー', 'いんげん', 'インゲン', 'オクラ', 'きゅうり', 'キュウリ',
@@ -1293,6 +1294,22 @@ def _dish_usage_history(data):
     return data._dish_hist
 
 
+def _dish_positions(data):
+    """レシピ名 -> そのレシピが使われた枠（'メイン'/'サブ'/'副菜1'/'副菜2'/'サラダ'）の集合（キャッシュ有）。
+    data.rows（(date, 曜日, slot, pos, name) のリスト。メニューワークブックの「N月昼夕」シート、
+    または食材CSVのレシピ出現順から復元したもの）から作る。
+    代替え案（修正提案）を出すときに、『メインの違反にはメインで使われていたメニューから、
+    サブの違反にはサブで使われていたメニューから』候補を絞り込むために使う（ユーザー指定）。
+    data.rowsに一度も出てこないレシピ（例：過去メニュー履歴だけにあるもの）は集合が空になる。"""
+    if getattr(data, '_dish_pos', None) is not None:
+        return data._dish_pos
+    out = {}
+    for (_d, _wd, _slot, pos, name) in data.rows:
+        out.setdefault(name, set()).add(pos)
+    data._dish_pos = out
+    return out
+
+
 def _recipe_products(data):
     """レシピ名 -> そのレシピで使う {商品名, ...} のマップ（キャッシュ有）。
     代替え案を「商材」ではなく「レシピ（メニュー）」で出すために、
@@ -1371,34 +1388,49 @@ def _ng_recipe_names(data):
     return out
 
 
-def _recipe_replacement(data, date, ok=None, group=None, exclude=()):
+def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=None):
     """レシピ（メニュー）単位の代替え案を1つ返す。候補が無ければ None。
     ・ok    : そのレシピ名を候補にしてよいか判定する関数（Noneなら全て可）
     ・group : 同系統（cm.group_from_name）を優先したい場合に指定
     ・exclude: 除外するレシピ名
+    ・position: 'メイン'/'サブ'/'副菜1'/'副菜2'/'サラダ' のいずれかを指定すると、
+      その枠で実際に使われたことがあるレシピだけを候補にする（ユーザー指定：
+      メインの違反にはメインの候補、サブの違反にはサブの候補を出す）。
+      指定した枠の候補が見つからない場合は、枠を問わず候補を探す（提案なしより優先）。
     いずれも『その日時点で最も長く使われていないレシピ』を選ぶ。
     ユーザー指定により、代替え案は原則すべて商材名ではなくレシピ名で出す。"""
-    return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude)[0]
+    return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude, position=position)[0]
 
 
-def _recipe_replacement2(data, date, ok=None, group=None, exclude=()):
+def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=None):
     """_recipe_replacement の (レシピ名, 同系統で見つかったか) を返す版。
     「同系統（◯◯）の…」という文言を出してよいかを呼び出し側が判断できるようにするため。
-    主原料グループ '他' は寄せ集めのため、同系統扱いにはしない。"""
+    主原料グループ '他' は寄せ集めのため、同系統扱いにはしない。
+    position指定時は、まずその枠で使われた実績があるレシピに絞って候補を探し、
+    見つからなければ枠を問わず候補を探す（フォールバック）。"""
     hist = _dish_usage_history(data)
     if not hist:
         return None, False
     # 禁止食材を使っているレシピは、どのルールの代替え案にも出さない
     ex = set(exclude) | _ng_recipe_names(data)
-    cands = [n for n in hist if n not in ex and (ok is None or ok(n))]
-    if not cands:
+    base_cands = [n for n in hist if n not in ex and (ok is None or ok(n))]
+    if not base_cands:
         return None, False
-    if group and group != '他':
-        same = [n for n in cands if cm.group_from_name(n) == group]
-        pick = _pick_least_recent(same, hist, date, spread=data.suggested)
+    positions = _dish_positions(data) if position else {}
+    cand_sets = [[n for n in base_cands if position in positions.get(n, ())]] if position else []
+    cand_sets.append(base_cands)  # フォールバック：枠を問わない全候補
+    for cands in cand_sets:
+        if not cands:
+            continue
+        if group and group != '他':
+            same = [n for n in cands if cm.group_from_name(n) == group]
+            pick = _pick_least_recent(same, hist, date, spread=data.suggested)
+            if pick:
+                return pick, True
+        pick = _pick_least_recent(cands, hist, date, spread=data.suggested)
         if pick:
-            return pick, True
-    return _pick_least_recent(cands, hist, date, spread=data.suggested), False
+            return pick, False
+    return None, False
 
 
 def _nonfried_dish_names(data):
@@ -1590,10 +1622,11 @@ def check_rule1(data):
             gap = (d - prev_d).days
             if 0 < gap <= 7:
                 group = cm.group_from_name(pname)
-                # 代替え案はレシピ（メニュー）名で出す：同系統で、その商材を使っていないレシピ
+                # 代替え案はレシピ（メニュー）名で出す：同系統・同じ枠（メイン/サブ）で、
+                # その商材を使っていないレシピ（ユーザー指定：メインの違反にはメインの候補を出す）
                 cand, same_group = _recipe_replacement2(
                     data, d, ok=lambda n: pname not in _recipe_products(data).get(n, ()),
-                    group=group, exclude={recipe, prev_recipe})
+                    group=group, exclude={recipe, prev_recipe}, position=pos)
                 if cand and same_group:
                     suggestion = f'同系統（{group}）の「{cand[:26]}」に変更を検討'
                 elif cand:
@@ -1684,14 +1717,17 @@ def check_rule3_5(data):
             continue
         dish_hist = _dish_usage_history(data)
         ng_names = _ng_recipe_names(data)   # 禁止食材を使うレシピは提案しない
+        dish_pos = _dish_positions(data)
+        # 提案は「サブを変更」なので、まずサブの枠で使われた実績があるレシピから選び、
+        # 見つからなければ枠を問わず探す（ユーザー指定：サブの違反にはサブの候補を出す）
         if gm == 'ひき肉系':
             is_exception = ('豆腐ハンバーグ' in nm_m and 'ハンバーグ' in nm_s and '豆腐ハンバーグ' not in nm_s) or \
                             ('豆腐ハンバーグ' in nm_s and 'ハンバーグ' in nm_m and '豆腐ハンバーグ' not in nm_m)
             if is_exception:
                 continue
-            cand = _pick_least_recent(
-                [n for n in dish_hist if cm.group_from_name(n) != gm and n not in ng_names],
-                dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
+            pool = [n for n in dish_hist if cm.group_from_name(n) != gm and n not in ng_names]
+            sub_pool = [n for n in pool if 'サブ' in dish_pos.get(n, ())]
+            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v3.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 3,
@@ -1700,10 +1736,10 @@ def check_rule3_5(data):
                 '修正提案': suggestion, '重要度': '高',
             })
         if gm in ('鶏肉系', '豚肉系', '牛肉系'):
-            cand = _pick_least_recent(
-                [n for n in dish_hist
-                 if cm.group_from_name(n) not in ('鶏肉系', '豚肉系', '牛肉系') and n not in ng_names],
-                dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
+            pool = [n for n in dish_hist
+                    if cm.group_from_name(n) not in ('鶏肉系', '豚肉系', '牛肉系') and n not in ng_names]
+            sub_pool = [n for n in pool if 'サブ' in dish_pos.get(n, ())]
+            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v5.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 5,
