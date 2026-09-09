@@ -783,25 +783,56 @@ def _slot_key(name):
     return cm.norm_recipe(s) or s
 
 
+# 副菜1/副菜2優先判定用：「個」扱いとして同等に見るユニット（ユーザー確認済み。
+# 「切」も個数カウントの意味合いは同じなので「個」と同じ扱いでOKとのこと）
+FUKUSAI_PIECE_UNITS = {'個', '切'}
+
+
+def _is_fukusai_priority(row):
+    """副菜1/副菜2の優先判定（ユーザー確認済みルール）：
+    その副菜レシピ名の一番上の行の J列「食材数量」が30未満かつK列「ユニット名」が'g'、
+    または K列「ユニット名」が個数カウント系（'個'/'切'。FUKUSAI_PIECE_UNITS参照）
+    のいずれかを満たすものが副菜1に来る。
+    ユニット名は全角/半角が混在する（WEIGHT_UNITS参照）ため_nfkcで正規化して比較する。"""
+    if row is None:
+        return False
+    qty = pd.to_numeric(row.get('食材数量'), errors='coerce')
+    unit = _nfkc(str(row.get('ユニット名', '')).strip())
+    return (pd.notna(qty) and qty < 30 and unit == 'g') or unit in FUKUSAI_PIECE_UNITS
+
+
 def rows_from_day_csv(data, size='M'):
     """食材CSVだけから (date, 曜日, slot, pos, レシピ名) のリストを作る。
     メニューワークブックの「N月昼夕」シートが無い月でも、No.3/5・No.10・No.24・
     No.28・No.29 のような『枠（メイン/サブ/副菜/サラダ）』を見るルールを動かすために使う。
     枠はCSVのレシピ出現順に割り当てる（ユーザー確認済みの並び）：
         メイン → サブ → 副菜1 → 副菜2 → サラダ →（6枠目以降は混ぜご飯とみなし対象外）
-    同じ枠に複数の選択肢（仕入先違い・枠タイトル形式）が並ぶため、_slot_key で名寄せしてから割り当てる。"""
+    同じ枠に複数の選択肢（仕入先違い・枠タイトル形式）が並ぶため、_slot_key で名寄せしてから割り当てる。
+    ただし副菜1/副菜2（3枠目・4枠目）については例外があり（ユーザー確認済み）：
+    各副菜候補について、そのレシピ名が最初に出現する行のJ列「食材数量」とK列「ユニット名」を見て、
+    (食材数量が30未満 かつ ユニット名が'g') または (ユニット名が'個') を満たす方を副菜1として優先する。
+    両方満たす・両方満たさない場合は従来通りCSV出現順のままにする（ユーザー確認済み）。"""
     rows = []
     for (month, slot), df in sorted(data.day_csv.items()):
         sub = df[~df['レシピ名'].astype(str).str.contains('備品', na=False)]
         for md, grp in sub.groupby('md', sort=False):
             if not isinstance(md, tuple):
                 continue
-            keys, first_name = [], {}
-            for rn in grp['レシピ名'].astype(str):
+            keys, first_name, first_row = [], {}, {}
+            for _, r in grp.iterrows():
+                rn = str(r['レシピ名'])
                 k = _slot_key(rn)
                 if k not in keys:
                     keys.append(k)
                     first_name[k] = rn
+                    first_row[k] = r
+            if len(keys) > 3:
+                k2, k3 = keys[2], keys[3]
+                p2 = _is_fukusai_priority(first_row.get(k2))
+                p3 = _is_fukusai_priority(first_row.get(k3))
+                if p3 and not p2:
+                    keys[2], keys[3] = k3, k2
+                # p2とp3が両方True/両方Falseの場合は従来通り（何もしない）
             try:
                 d = datetime.date(data.base_year, int(md[0]), int(md[1]))
             except ValueError:
@@ -1672,20 +1703,33 @@ def _veg_usage_history(data):
 
 
 def _day_recipe_order(day_csv, month, day, slot):
-    """食材CSV上で、その日・その時間帯（昼/夜）に登場するレシピ名を初出順に並べる。
+    """食材CSV上で、その日・その時間帯（昼/夜）に登場する枠（メイン/サブ/副菜1/副菜2/サラダ...）の
+    最初に出現したレシピ名（生の文字列）を枠の並び順に返す。
+    rows_from_day_csv と同じロジック（_slot_keyでの仕入先違い等の名寄せ、および副菜1/副菜2の
+    優先入れ替えルール）を使うことで、data.rows（他の多くのルールが使う枠割り当て）との
+    整合性を保つ（ユーザー確認済みの副菜1/副菜2ルールが両方に反映されるようにするため）。
     （メニュー一覧シートの並び=メイン→サブ→副菜1→副菜2→サラダ と、食材CSV内の
     レシピ出現順が一致することを実データで確認済み。備品行は除外）"""
     df = day_csv.get((month, slot))
     if df is None:
         return []
-    sub = df[df['md'] == (month, day)]
-    seen = []
-    for rn in sub['レシピ名'].astype(str):
-        if '備品' in rn:
-            continue
-        if rn not in seen:
-            seen.append(rn)
-    return seen
+    sub = df[(df['md'] == (month, day)) & (~df['レシピ名'].astype(str).str.contains('備品', na=False))]
+    keys, first_name, first_row = [], {}, {}
+    for _, r in sub.iterrows():
+        rn = str(r['レシピ名'])
+        k = _slot_key(rn)
+        if k not in keys:
+            keys.append(k)
+            first_name[k] = rn
+            first_row[k] = r
+    if len(keys) > 3:
+        k2, k3 = keys[2], keys[3]
+        p2 = _is_fukusai_priority(first_row.get(k2))
+        p3 = _is_fukusai_priority(first_row.get(k3))
+        if p3 and not p2:
+            keys[2], keys[3] = k3, k2
+        # p2とp3が両方True/両方Falseの場合は従来通り（何もしない）
+    return [first_name[k] for k in keys]
 
 
 def _primary_product(day_csv, month, day, slot, recipe):
