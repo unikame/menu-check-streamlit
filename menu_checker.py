@@ -240,8 +240,10 @@ FD_WEEKDAY_NIGHT_QUOTA = [
 
 FISH_FD_ONLY = ['いわしの梅煮', 'マスの塩焼き', 'サーモン塩焼き', 'ぶりのみぞれ', 'さばの味噌煮',
                 'さわらの西京焼き', 'タラの香草焼き', 'あじみりん焼き', 'あじの塩焼き']
-NUTRI_BOUNDS = {'昼': {'kcal': (415, 455), 'salt_max': 3.8, 'protein_min': 12},
-                '夜': {'kcal': (245, 275), 'salt_max': 3.0, 'protein_min': 12}}
+# No.14用の栄養素基準（2026/9時点・ユーザー指定で昼夜共通に変更）。
+# エネルギー：343～465kcal、たんぱく質：12g以上、食塩相当量：3.0g以下（いずれも昼夜共通）。
+NUTRI_BOUNDS = {'昼': {'kcal': (343, 465), 'salt_max': 3.0, 'protein_min': 12},
+                '夜': {'kcal': (343, 465), 'salt_max': 3.0, 'protein_min': 12}}
 # No.17: 1食につき赤・黄・緑を必ず使用（キーワード方式・暫定版。商材マスタの「色」列が整備され次第、
 # そちらを正とする判定に切り替える想定）
 RED_KW = ['人参', 'にんじん', '3色ピーマン', '3色パプリカ', '赤パプリカ', 'レッドピーマン',
@@ -1874,10 +1876,15 @@ def check_rule9(data):
     昼は昼同士、夜は夜同士で前日と比較する（日をまたいだ昼→夜比較はしない）。
     マスタに登録の無い野菜（色が未入力/未登録）は判定対象外。
     緑・黄・白はほぼ毎日どこかに使われる基礎色のため対象外とし（No.6/8と同じ方針）、
-    彩りとして目立つ赤・紫・茶などの重複のみを検出する。"""
+    彩りとして目立つ赤・紫・茶などの重複のみを検出する。
+    さらに、No.30のFDメニュールール（野菜）で『昼夜/夜昼使用可能・連続OK』と定義されている
+    間隔制約のほぼ無い商品（VEG_FLEXIBLE_IDS）は、商品ID一致で判定対象から除外する
+    （赤ピーマン/3色ピーマン等がFD野菜ルール上は連日使用OKなのにNo.9では色重複として
+    引っかかってしまう食い違いを解消するため。ユーザー確認済み）。"""
     if not data.veg_color_map:
         return pd.DataFrame()
     dr = data.date_range
+    flexible_ids = set(VEG_FLEXIBLE_IDS)
     viol = []
     for slot, shoku_dict in [('昼', data.shoku), ('夜', data.shoku_night)]:
         prev_date = None
@@ -1896,6 +1903,9 @@ def check_rule9(data):
                 if pd.isna(qty) or qty == 0 or cm.is_noise(prod):
                     continue
                 if any(k in _nfkc(prod) for k in COMMON_VEG_NAMES):
+                    continue
+                pid = pd.to_numeric(r.get('商品ID'), errors='coerce')
+                if pd.notna(pid) and int(pid) in flexible_ids:
                     continue
                 for c in veg_colors_for(prod, data.veg_color_map):
                     if c in COMMON_VEG_COLORS:
