@@ -1454,6 +1454,24 @@ def _dish_positions(data):
     return out
 
 
+def _pos_on(data, d, slot, name):
+    """指定した日付・時間帯（昼/夜）における、そのレシピ名の枠（メイン/サブ/副菜1/副菜2/サラダ）を返す。
+    _dish_positions（全期間の集計）とは異なり、その日その回に実際に使われた枠だけをdata.rowsから
+    厳密に特定する（No.7/No.9のように『違反した特定の料理と同じ枠の候補を出す』ために使う。
+    ユーザー指定：違反した料理と違うジャンルの代替案が出るのを防ぐ）。見つからなければNone。
+    data.rows内のレシピ名は_nfkcで正規化済み（rows_from_day_csv参照）だが、呼び出し側から
+    渡されるnameは正規化前（生の文字列。例：全角スペースや全角カッコを含む）のことがあるため、
+    ここで_nfkcしてから引き比べる。"""
+    if name is None:
+        return None
+    if getattr(data, '_dish_pos_by_day', None) is None:
+        m = {}
+        for (dd, _wd, ss, pos, nm) in data.rows:
+            m[(dd, ss, nm)] = pos
+        data._dish_pos_by_day = m
+    return data._dish_pos_by_day.get((d, slot, _nfkc(str(name))))
+
+
 def _recipe_products(data):
     """レシピ名 -> そのレシピで使う {商品名, ...} のマップ（キャッシュ有）。
     代替え案を「商材」ではなく「レシピ（メニュー）」で出すために、
@@ -1537,9 +1555,12 @@ def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=No
     ・ok    : そのレシピ名を候補にしてよいか判定する関数（Noneなら全て可）
     ・group : 同系統（cm.group_from_name）を優先したい場合に指定
     ・exclude: 除外するレシピ名
-    ・position: 'メイン'/'サブ'/'副菜1'/'副菜2'/'サラダ' のいずれかを指定すると、
-      その枠で実際に使われたことがあるレシピだけを候補にする（ユーザー指定：
-      メインの違反にはメインの候補、サブの違反にはサブの候補を出す）。
+    ・position: 'メイン'/'サブ'/'副菜1'/'副菜2'/'サラダ' のいずれか1つ、または
+      それらの複数（タプル/リスト/集合。例:('副菜1','副菜2','サラダ')）を指定すると、
+      その枠（のいずれか）で実際に使われたことがあるレシピだけを候補にする（ユーザー指定：
+      メインの違反にはメインの候補、サブの違反にはサブの候補を出す。違反した特定の料理が無く
+      『不足分を補う/いずれかを差し替える』形のルールでは、メイン/サブではなく副菜1/副菜2/
+      サラダ等の複数枠を許容範囲として渡す）。
       指定した枠の候補が見つからない場合は、枠を問わず候補を探す（提案なしより優先）。
     いずれも『その日時点で最も長く使われていないレシピ』を選ぶ。
     ユーザー指定により、代替え案は原則すべて商材名ではなくレシピ名で出す。"""
@@ -1550,8 +1571,8 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
     """_recipe_replacement の (レシピ名, 同系統で見つかったか) を返す版。
     「同系統（◯◯）の…」という文言を出してよいかを呼び出し側が判断できるようにするため。
     主原料グループ '他' は寄せ集めのため、同系統扱いにはしない。
-    position指定時は、まずその枠で使われた実績があるレシピに絞って候補を探し、
-    見つからなければ枠を問わず候補を探す（フォールバック）。"""
+    position指定時は、まずその枠（複数指定時はいずれか）で使われた実績があるレシピに絞って
+    候補を探し、見つからなければ枠を問わず候補を探す（フォールバック）。"""
     hist = _dish_usage_history(data)
     if not hist:
         return None, False
@@ -1561,7 +1582,11 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
     if not base_cands:
         return None, False
     positions = _dish_positions(data) if position else {}
-    cand_sets = [[n for n in base_cands if position in positions.get(n, ())]] if position else []
+    allowed_pos = ({position} if isinstance(position, str) else set(position)) if position else set()
+    # positions（_dish_positions）はdata.rows由来で_nfkc正規化済みのレシピ名がキーだが、
+    # base_cands（hist/_recipe_products由来）は生の文字列（全角スペース等を含む）なので、
+    # ここで_nfkcしてから引き比べないと、全角文字を含むレシピ名でほぼ一致しなくなる。
+    cand_sets = [[n for n in base_cands if positions.get(_nfkc(n), set()) & allowed_pos]] if position else []
     cand_sets.append(base_cands)  # フォールバック：枠を問わない全候補
     for cands in cand_sets:
         if not cands:
@@ -2035,7 +2060,9 @@ def check_rule9(data):
     さらに、No.30のFDメニュールール（野菜）で『昼夜/夜昼使用可能・連続OK』と定義されている
     間隔制約のほぼ無い商品（VEG_FLEXIBLE_IDS）は、商品ID一致で判定対象から除外する
     （赤ピーマン/3色ピーマン等がFD野菜ルール上は連日使用OKなのにNo.9では色重複として
-    引っかかってしまう食い違いを解消するため。ユーザー確認済み）。"""
+    引っかかってしまう食い違いを解消するため。ユーザー確認済み）。
+    代替案は、その色を使っている当日のレシピと同じ枠（メイン/サブ/副菜1/副菜2/サラダ）から
+    選ぶ（ユーザー指定：ジャンルが違う代替案が出ないようにするため）。"""
     if not data.veg_color_map:
         return pd.DataFrame()
     dr = data.date_range
@@ -2052,6 +2079,7 @@ def check_rule9(data):
             md = (d.month, d.day)
             sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
             today_colors = {}
+            today_recipe = {}  # 色 -> その色を使った当日のレシピ名（代替案の枠を絞るため）
             for _, r in sub.iterrows():
                 prod = str(r['商品名'])
                 qty = r.get('食材数量')
@@ -2062,10 +2090,12 @@ def check_rule9(data):
                 pid = pd.to_numeric(r.get('商品ID'), errors='coerce')
                 if pd.notna(pid) and int(pid) in flexible_ids:
                     continue
+                rn = str(r.get('レシピ名'))
                 for c in veg_colors_for(prod, data.veg_color_map):
                     if c in COMMON_VEG_COLORS:
                         continue
                     today_colors.setdefault(c, prod)
+                    today_recipe.setdefault(c, rn)
             if prev_date is not None and (d - prev_date).days == 1:
                 overlap = set(today_colors) & set(prev_colors)
                 for c in overlap:
@@ -2076,7 +2106,8 @@ def check_rule9(data):
                         for p in prods:
                             cols |= veg_colors_for(p, data.veg_color_map)
                         return bool(cols) and _c not in cols
-                    cand = _recipe_replacement(data, d, ok=_no_color)
+                    pos9 = _pos_on(data, d, slot, today_recipe.get(c))
+                    cand = _recipe_replacement(data, d, ok=_no_color, position=pos9)
                     suggestion = f'「{cand[:26]}」等、{c}以外の色の野菜メニューに変更を検討' if cand \
                         else f'{c}以外の色の野菜メニューに変更'
                     viol.append({
@@ -2157,7 +2188,10 @@ def check_rule10(data, min_gap_days=8):
 
 def check_rule11(data):
     """No.11: 1食1メニューは自然解凍品。商品名に「自然解凍」を含む商材が
-    その食事（昼/夜）に1品も無ければNG（ユーザー指定：商品名の「自然解凍」表記で判定）。"""
+    その食事（昼/夜）に1品も無ければNG（ユーザー指定：商品名の「自然解凍」表記で判定）。
+    このルールは特定の1品を『違反した料理』として置き換えるものではなく、食事全体に
+    自然解凍品を1品足りない状態のため、代替案は副菜1/副菜2/サラダの枠に限定する
+    （メインやサブを丸ごと差し替える提案になってしまうのを避けるため。ユーザー指定）。"""
     dr = data.date_range
     viol = []
     for d in dr:
@@ -2171,8 +2205,9 @@ def check_rule11(data):
                 continue
             has_natural = sub['商品名'].astype(str).str.contains('自然解凍', na=False).any()
             if not has_natural:
-                # 代替え案はレシピ名で出す：自然解凍品を使っているメニュー
-                cand = _recipe_replacement(data, d, ok=lambda n: _recipe_has(data, n, '自然解凍'))
+                # 代替え案はレシピ名で出す：自然解凍品を使っているメニュー（副菜系の枠に限定）
+                cand = _recipe_replacement(data, d, ok=lambda n: _recipe_has(data, n, '自然解凍'),
+                                            position=('副菜1', '副菜2', 'サラダ'))
                 suggestion = f'副菜等を「{cand[:26]}」等、自然解凍品を使うメニューに変更' if cand \
                     else '副菜等を自然解凍品のメニューに変更'
                 viol.append({
@@ -2258,7 +2293,10 @@ def check_rule7(data):
         if not (lunch and dinner):
             continue
         # 代替え案はレシピ名で出す：大豆系を含まないメニュー
-        cand = _recipe_replacement(data, d, ok=lambda n: not is_soy(n), exclude=set(dinner))
+        # 違反している夜側の料理（dinner[0]）と同じ枠のレシピに絞る（ユーザー指定：
+        # ジャンル（メイン/サブ/副菜1/副菜2/サラダ）が違う代替案が出ないようにするため）
+        pos7 = _pos_on(data, d, '夜', dinner[0])
+        cand = _recipe_replacement(data, d, ok=lambda n: not is_soy(n), exclude=set(dinner), position=pos7)
         suggestion = f'夜の「{dinner[0][:16]}」を「{cand[:24]}」等、非大豆系に変更' if cand \
             else '夜の大豆系を非大豆系のメニューに変更'
         viol.append({
@@ -2388,7 +2426,9 @@ def check_rule17(data):
     また、赤パプリカ・かに風味蒲鉾ほぐし・花がんもは野菜マスタ未登録でも「赤」を満たすものとみなす
     （RED_SUPPLEMENT_KW_NO17。ユーザー確認済み）。
     「1食」＝昼は昼、夜は夜で別々に判定する（No.9と同じ考え方）。
-    マスタに登録の無い野菜は検出できない点に注意（見つかり次第マスタに追記する運用）。"""
+    マスタに登録の無い野菜は検出できない点に注意（見つかり次第マスタに追記する運用）。
+    No.11と同様、特定の1品を置き換えるルールではなく『不足色を補う1品を追加/差し替え』の
+    ため、代替案は副菜1/副菜2/サラダの枠に限定する（ユーザー指定）。"""
     if not data.veg_color_map:
         return pd.DataFrame()
     dr = data.date_range
@@ -2421,7 +2461,8 @@ def check_rule17(data):
                         for p in _recipe_products(data).get(n, ()):
                             cols |= veg_colors_for(p, data.veg_color_map)
                         return _c in cols
-                    cand = _recipe_replacement(data, d, ok=_has_color)
+                    cand = _recipe_replacement(data, d, ok=_has_color,
+                                                position=('副菜1', '副菜2', 'サラダ'))
                     if cand:
                         sugs.append(f'{c}:「{cand[:22]}」')
                 suggestion = ('不足色を補うメニュー候補 ' + ' / '.join(sugs)) if sugs \
@@ -2645,7 +2686,9 @@ def is_dashi(name):
 def check_rule20(data):
     """No.20: 1食につきだしの味付けを1品以上。
     調味料マスタ・実データ上「だし」を含む調味料は「☆☆やどかり弁当　和風だし」のみ確認できたため、
-    商品名に「だし/出汁」を含む商材が食事（昼/夜別）内に1品も無ければNGとする（キーワード判定・マスタに専用フラグ列は無い）。"""
+    商品名に「だし/出汁」を含む商材が食事（昼/夜別）内に1品も無ければNGとする（キーワード判定・マスタに専用フラグ列は無い）。
+    No.11/No.17と同様、特定の1品を置き換えるルールではなく『いずれか1品をだし味に差し替え』
+    のため、代替案は副菜1/副菜2/サラダの枠に限定する（ユーザー指定）。"""
     if not data.day_csv:
         return pd.DataFrame()
     viol = []
@@ -2665,7 +2708,7 @@ def check_rule20(data):
                 cand = _recipe_replacement(
                     data, d,
                     ok=lambda n: any(is_dashi(p) for p in _recipe_products(data).get(n, ())),
-                    exclude=today_recipes)
+                    exclude=today_recipes, position=('副菜1', '副菜2', 'サラダ'))
                 sug = f'いずれかを「{cand[:26]}」等、だしで味付けしたメニューに差し替え' if cand \
                     else 'いずれかの料理をだし（和風だし）で味付けしたメニューに差し替え'
                 viol.append({
