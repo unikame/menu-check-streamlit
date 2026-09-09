@@ -20,6 +20,11 @@
   fried_master_path : 食材データ.xlsx             → No.12「調理法（当日揚げ）」シート、
                                                     No.21「禁止食材・調味料該当」シート
   night_csv_paths   : {月: csv} 旧形式の夜食材CSV（day_csv_pathsがあれば不要）
+  history_csv_paths : [過去メニューCSV, ...]（任意）。基本は代替え案の候補選定にしか使わない
+      （商品名/レシピ名ベース）が、No.32の「隔月1回」「3カ月1回」周期チェックだけは例外で、
+      商品ID単位の履歴として実際の判定にも使う（商品名は変更されることがあるため。
+      ユーザー確認済み）。渡さなければNo.32の周期チェックは何も検出しない（判定不能として
+      スキップする、誤検出よりも検出漏れを優先する方針）。
 
 ■ 実装済みルール（マスタ照合ベース）
   No.1  同一商品ID（個数カウントの単体商材）をメイン/サブで1週間以内に再使用
@@ -34,7 +39,8 @@
   No.12 当日揚げが3品超（当日揚げレシピIDマスタ照合）
   No.14 栄養素の月平均（「N月栄養価」シート優先。夜はデータ未入手のため昼のみ）
   No.15 健康食材 週1回以上
-  No.17 1食で赤・黄・緑を使用（野菜マスタの色列・昼夜別）
+  No.17 1食で赤・黄・緑を使用（野菜マスタの色列・昼夜別。黄(卵焼き)は毎食入っている前提のため
+        常にクリア済みとして扱う。赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんもも野菜マスタ未登録でも加味）
   No.18 1食の重量下限（M=212g・容器18.0g込みの総重量で判定。カップ重量は考慮しない。
         Sは容器17.5gのみ判明・下限値未確定のため判定しない → BENTO_SIZE_SPEC）
   No.19 同じ調味料のみでの味付け禁止
@@ -47,13 +53,16 @@
   No.30 野菜の使用間隔（FDメニュールール（野菜）シート準拠・商品ID単位。
         メニュー名記載時は必要日数2倍、芋類/かぼちゃは昼夜連続OK）
   No.31 マッシュ系同日重複
+  No.32 商品枠クオータ（26年12月商品枠シート限定・商品ID単位）。
+        D列下限/E列上限は月内延べ使用回数で判定、「隔月1回」「3カ月1回」は
+        過去メニュー履歴（history_csv_paths・商品ID単位）と比較する周期チェック（参考実装・低重要度）
 
 ■ 未対応
   No.2  実装済みだがユーザー指示によりALL_RULESから除外中
   No.23 実装済みだがユーザー指示によりチェック対象外（ALL_RULESから除外中）
   No.13 盛付工程（工程データが無いためスキップ）
   No.16 固形2種まで（判定基準となるマスタが未確定）
-  No.32〜35, 37（未着手）
+  No.33〜35, 37（未着手）
 
 ■ NG時の代替え案
   違反行の「修正提案」列には、可能な場合『直近使われていない具体的な代替商材/レシピ名』を出す。
@@ -237,6 +246,57 @@ FD_WEEKDAY_NIGHT_QUOTA = [
     (3003053, '栗かぼちゃ旨煮', 3, '副菜'),
 ]
 
+# No.32用: 「26年12月商品枠シート」（商品ID・使用頻度(D列)・最大使用回数(E列)）。
+# (https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY/edit?gid=2037364563)
+# ユーザー確認済みスコープ：
+#   ・D列が「毎月◯回以上」の商品のみ、月内使用回数の下限としてmin_countに反映
+#   ・E列に具体的な回数（◯回）が入っている商品のみ、月内使用回数の上限としてmax_countに反映
+#   ・D列が「毎月」「毎月◯回」（「以上」の記載が無いもの）は対象外（下限/上限どちらとも断定できないため）
+#   ・「隔月1回」「3カ月1回」は下のPRODUCT_FRAME_DEC2026_PERIODICで別途、商品ID単位の
+#     過去メニュー履歴（history_csv_paths）と組み合わせて周期チェックする
+#   ・備考(F列)に「YD」を含む行のうち、12月商品枠に含まれるもの（＝隔月/3カ月周期の4品）は
+#     PRODUCT_FRAME_DEC2026_PERIODICで判定。「12月商品枠外」の2品（極厚ハムカツ、
+#     境港産紅ずわい蟹クリームコロッケ）は12月の枠そのものに含まれないため対象外のまま。
+# 各要素: (商品ID, 商材名, min_count(月内下限。Noneなら無し), max_count(月内上限。Noneなら無し))
+PRODUCT_FRAME_DEC2026_QUOTA = [
+    (3002409, 'ケイハン 三元豚ロｰストンカツ', 2, None),
+    (3001677, 'ピーマン肉詰めフライ', 2, None),
+    (3001155, 'チキン八幡巻', 2, None),
+    (3002318, '7品目具材の豆腐ハンバーグ', 2, 2),
+    (3001449, 'かにのふわふわ豆腐', 2, None),
+    (3001909, '生姜入り豆腐ステーキ', 2, None),
+    (3002155, '豆乳と野菜のふわふわ真丈', 3, None),
+    (3003053, '栗かぼちゃ旨煮', 4, None),
+    (1002199, '業務用水煮大豆', 2, None),
+    (1002259, 'カンタン白和えの素', 2, None),
+    (3002392, 'フライドチキン', None, 2),
+    (3002180, '自然解凍チキン', None, 2),
+    (3001556, '【自然解凍】豚肉甘辛和え', None, 2),
+    (3002415, '日本ミート販売 豚小間', None, 4),
+    (3000173, 'サバ塩焼き', None, 2),
+    (3002296, '合鴨スライス', None, 2),
+    (3000190, '冷凍厚揚げミニ', None, 2),
+    (3000153, 'ひとくち白身天ぷら', None, 2),
+    (3002309, 'アジ粉付き切身', None, 1),
+    (3003001, 'さわら粉付き切身', None, 1),
+    (3002362, '粉付アブラカレイ', None, 2),
+]
+
+# No.32用: 「26年12月商品枠シート」でD列が「隔月1回」「3カ月1回」の商品（商品ID単位の周期チェック）。
+# 「12月商品枠外」と注記されている2品（極厚ハムカツ、境港産紅ずわい蟹クリームコロッケ）は
+# 12月の枠そのものに含まれないため対象外（ユーザー確認済み）。
+# 判定には過去メニュー履歴（run_all_checksのhistory_csv_pathsで渡した過去メニューCSV）が必要。
+# 履歴が無い商品は「判定不能」として何も出さない（誤検出を避けるため）。
+# 備考に「YD使用翌月に使用可」等の在庫持ち越し例外があり、それは在庫データが無いと判定できない
+# ため、この周期チェックは重要度「低（参考実装）」として扱う（ユーザー確認済み）。
+# 各要素: (商品ID, 商材名, 最低でも空けるべき月数（隔月1回=2、3カ月1回=3）)
+PRODUCT_FRAME_DEC2026_PERIODIC = [
+    (3002070, 'ビーフ入りメンチカツ', 2),
+    (3002073, 'オマール海老のビスク風コロッケ', 3),
+    (3001497, 'ひとくち磯辺白身フライ', 2),
+    (3000016, '十勝産サックリ衣のポテトコロッケ', 2),
+]
+
 FISH_FD_ONLY = ['いわしの梅煮', 'マスの塩焼き', 'サーモン塩焼き', 'ぶりのみぞれ', 'さばの味噌煮',
                 'さわらの西京焼き', 'タラの香草焼き', 'あじみりん焼き', 'あじの塩焼き']
 # No.14用の栄養素基準（2026/9時点・ユーザー指定で昼夜共通に変更）。
@@ -245,7 +305,7 @@ NUTRI_BOUNDS = {'昼': {'kcal': (343, 465), 'salt_max': 3.0, 'protein_min': 12},
                 '夜': {'kcal': (343, 465), 'salt_max': 3.0, 'protein_min': 12}}
 # No.17: 1食につき赤・黄・緑を必ず使用（キーワード方式・暫定版。商材マスタの「色」列が整備され次第、
 # そちらを正とする判定に切り替える想定）
-RED_KW = ['人参', 'にんじん', '3色ピーマン', '3色パプリカ', '赤ピーマン', '赤パプリカ', 'レッドピーマン',
+RED_KW = ['人参', 'にんじん', '3色ピーマン', '3色パプリカ', '赤パプリカ', 'レッドピーマン',
           '紅芯大根', 'トマト', 'ミニトマト', '紅生姜', 'いちご']
 YELLOW_KW = ['3色ピーマン', '3色パプリカ', '黄パプリカ', '黄ピーマン', 'イエローピーマン', 'コーン', 'とうもろこし',
              'かぼちゃ', '卵', 'たまご', '玉子', 'たくあん', 'パイナップル', 'レモン']
@@ -422,7 +482,6 @@ class MenuData:
         self.history = None              # 過去メニューCSV由来の使用履歴（代替え案の候補選定専用）
         self.suggested = {}              # 今回の実行で提案済みの候補と回数（提案の分散用）
         self.base_year = datetime.date.today().year   # 食材CSVの名称欄（例:26年6月1日）から設定
-        self.rule_master = {}            # ワークブック「新メニュー構成ルール」シート由来のルール定義
         self._usage_hist = None          # 商品名(NFKC) -> 使用日リスト（キャッシュ、代替案提案用）
 
 
@@ -814,6 +873,7 @@ def _drop_history_months(history, exclude_months):
     return {
         'dish': kept_dish,
         'prod': _filt(history['prod']),
+        'prod_id': _filt(history.get('prod_id', {})),
         'recipe_products': {k: v for k, v in history['recipe_products'].items()
                             if k not in removed_names},
         'all_names': history['all_names'] - removed_names,
@@ -823,10 +883,13 @@ def _drop_history_months(history, exclude_months):
 
 
 def load_history(history_csv_paths, size='M'):
-    """過去メニューCSV（複数月分）を読み、代替え案の候補選定に使う履歴を返す。
-    判定（違反チェック）には一切使わず、『どのレシピ/商品を、いつ使ったか』だけを取り出す。
-    戻り値: dict(dish=..., prod=..., recipe_products=..., all_names=..., fried_names=...)"""
-    dish, prod, recipe_prods = {}, {}, {}
+    """過去メニューCSV（複数月分）を読み、代替え案の候補選定・周期チェックに使う履歴を返す。
+    判定（違反チェック）に使うのは商品ID単位の履歴（prod_id・No.32の周期チェック専用）のみで、
+    それ以外（dish/prod等）は代替え案の候補選定にしか使わない。
+    商品名は変更されることがあるため、商品IDが取れる場合は商品ID単位でも履歴を保持する
+    （ユーザー確認済み：商品名より商品IDの方が追跡として確実）。
+    戻り値: dict(dish=..., prod=..., prod_id=..., recipe_products=..., all_names=..., fried_names=...)"""
+    dish, prod, prod_id, recipe_prods = {}, {}, {}, {}
     all_names, fried_ids_by_name = set(), {}
     for path in history_csv_paths or []:
         df = pd.read_csv(path)
@@ -850,78 +913,18 @@ def load_history(history_csv_paths, size='M'):
             if cm.is_noise(pn) or '終売' in pn:
                 continue
             prod.setdefault(pn, set()).update(grp['_dt'].tolist())
+            if '商品ID' in grp.columns:
+                ids = pd.to_numeric(grp['商品ID'], errors='coerce').dropna().unique()
+                for pid in ids:
+                    prod_id.setdefault(int(pid), set()).update(grp['_dt'].tolist())
     return {
         'dish': {k: sorted(v) for k, v in dish.items()},
         'prod': {k: sorted(v) for k, v in prod.items()},
+        'prod_id': {k: sorted(v) for k, v in prod_id.items()},
         'recipe_products': recipe_prods,
         'all_names': all_names,
         'recipe_ids': fried_ids_by_name,
     }
-
-
-# ルールシート（「新メニュー構成ルール」）の数値列 → 判定で使うパラメータ名の対応。
-# シートに該当列があればその値を使い、無ければコード側の既定値を使う。
-#   間隔日数    : そのルールが要求する空き日数（No.1/4/10/15/22/25/26）
-#   上限        : 上限品数（No.12 当日揚げ）
-#   下限        : 下限の数値（No.18 1食の重量g）
-#   同曜日日数  : 同じ曜日で空ける日数（No.25）
-#   月最低回数  : 月あたりの最低採用回数（No.29）
-RULE_PARAM_COLUMNS = ['間隔日数', '上限', '下限', '同曜日日数', '月最低回数']
-
-
-def load_rule_master(xlsx_path, sheet_hint='ルール'):
-    """メニューワークブックの「新メニュー構成ルール」シートを読み、
-    {No: {'category':目的, 'text':ルール文言, 'params':{列名:数値}}} を返す。
-    ルールの正文をアプリ・レポートに表示し、実装状況の突き合わせと
-    閾値の外部管理に使う（ユーザー指定：ルールが変わったらワークブックを差し替える運用）。"""
-    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    sheet = next((s for s in wb.sheetnames if sheet_hint in s and '構成' in s), None)
-    if sheet is None:
-        sheet = next((s for s in wb.sheetnames if sheet_hint in s and '月' not in s), None)
-    if sheet is None:
-        return {}
-    ws = wb[sheet]
-    rows = list(ws.iter_rows(values_only=True))
-    # 「目的」を含む行を見出し行とみなし、列名を拾う（数値列を後から足せるようにするため）
-    header_i, headers = None, {}
-    for i, r in enumerate(rows[:10]):
-        if any(isinstance(c, str) and c.strip() == '目的' for c in r):
-            header_i = i
-            headers = {j: str(c).strip() for j, c in enumerate(r) if isinstance(c, str) and c.strip()}
-            break
-    if header_i is None:
-        header_i, headers = 1, {1: '目的', 2: '詳細'}
-    col_cat = next((j for j, h in headers.items() if h == '目的'), 1)
-    col_no = next((j for j, h in headers.items() if h in ('詳細', 'No', 'NO')), col_cat + 1)
-    col_txt = col_no + 1
-    param_cols = {j: h for j, h in headers.items() if h in RULE_PARAM_COLUMNS}
-
-    out, category = {}, ''
-    for r in rows[header_i + 1:]:
-        if not r or all(c is None for c in r):
-            continue
-        if len(r) > col_cat and isinstance(r[col_cat], str) and r[col_cat].strip():
-            category = r[col_cat].strip()
-        no = r[col_no] if len(r) > col_no else None
-        if not isinstance(no, (int, float)) or not (0 < no <= 99):
-            continue
-        text = str(r[col_txt]).strip() if len(r) > col_txt and r[col_txt] is not None else ''
-        params = {}
-        for j, h in param_cols.items():
-            v = r[j] if len(r) > j else None
-            if isinstance(v, (int, float)):
-                params[h] = float(v)
-        out[int(no)] = {'category': category, 'text': text, 'params': params}
-    return out
-
-
-def rule_param(data, no, key, default):
-    """ルールシートに数値が入っていればそれを使い、無ければ既定値を返す。"""
-    try:
-        v = data.rule_master[no]['params'][key]
-    except (AttributeError, KeyError, TypeError):
-        return default
-    return type(default)(v) if isinstance(default, int) else v
 
 
 def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
@@ -1004,16 +1007,6 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
         xl = pd.ExcelFile(xlsx_path)
         wb_raw = openpyxl.load_workbook(xlsx_path, data_only=True)
         sheet_names = xl.sheet_names
-        try:
-            data.rule_master = load_rule_master(xlsx_path)
-            if data.rule_master:
-                n_param = sum(1 for v in data.rule_master.values() if v['params'])
-                data.warnings.append(
-                    f'ルールシートを読み込みました（{len(data.rule_master)}項目'
-                    + (f'／うち数値指定 {n_param}項目' if n_param else '／数値列なし・既定値を使用')
-                    + '）')
-        except Exception as e:  # noqa: BLE001
-            data.warnings.append(f'ルールシートの読み込みに失敗しました（{e}）')
     else:
         xl = wb_raw = None
         sheet_names = []
@@ -1310,6 +1303,44 @@ def _usage_history(data):
     return data._usage_hist
 
 
+def _usage_history_by_id(data):
+    """商品ID(int)ごとに使用日(Timestamp)のソート済みリストを返す（キャッシュ有）。
+    _usage_history（商品名ベース）と同じ考え方だが、商品名は変更されることがあるため、
+    複数月にわたる周期チェック（No.32の「隔月1回」「3カ月1回」等）には商品IDで追跡する
+    （ユーザー確認済み）。day_csv/shoku・shoku_night由来の当期データに、過去メニュー履歴
+    （data.history['prod_id']・history_csv_pathsで渡した場合のみ）を統合する。"""
+    if getattr(data, '_usage_hist_id', None) is not None:
+        return data._usage_hist_id
+    md2date = {(ts.month, ts.day): ts for ts in (data.date_range if data.date_range is not None else [])}
+    hist = {}
+    sources = list(data.day_csv.values())
+    if not sources:
+        sources = [df for df in list(data.shoku.values()) + list(data.shoku_night.values())
+                   if df is not None]
+    for df in sources:
+        if df is None or '商品ID' not in df.columns:
+            continue
+        for _, r in df.iterrows():
+            pid = pd.to_numeric(r.get('商品ID'), errors='coerce')
+            if pd.isna(pid):
+                continue
+            md = r.get('md')
+            if not isinstance(md, tuple):
+                continue
+            dt = md2date.get(md)
+            if dt is None:
+                continue
+            # date_range側はdatetime.date、履歴側（history_csv_paths由来）はpd.Timestampのため、
+            # 同じ集合内で混在すると比較・ソート時にTypeErrorになる。pd.Timestampに統一する。
+            hist.setdefault(int(pid), set()).add(pd.Timestamp(dt))
+    # 過去メニュー履歴（history_csv_paths）があれば統合する。No.32の周期チェック専用。
+    if data.history and 'prod_id' in data.history:
+        for pid, dates in data.history['prod_id'].items():
+            hist.setdefault(pid, set()).update(pd.Timestamp(dt) for dt in dates)
+    data._usage_hist_id = {k: sorted(v) for k, v in hist.items()}
+    return data._usage_hist_id
+
+
 def _days_since_last_use(hist, name, before_date):
     """before_date時点で、その商品(name)が最後に使われたのが何日前か。未使用なら大きな値を返す。
     hist側はTimestamp、呼び出し側はdatetime.dateの場合があるため型を揃えて比較する。"""
@@ -1476,8 +1507,7 @@ def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=No
       指定した枠の候補が見つからない場合は、枠を問わず候補を探す（提案なしより優先）。
     いずれも『その日時点で最も長く使われていないレシピ』を選ぶ。
     ユーザー指定により、代替え案は原則すべて商材名ではなくレシピ名で出す。"""
-    return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude,
-                                position=position)[0]
+    return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude, position=position)[0]
 
 
 def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=None):
@@ -1496,7 +1526,7 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
         return None, False
     positions = _dish_positions(data) if position else {}
     cand_sets = [[n for n in base_cands if position in positions.get(n, ())]] if position else []
-    cand_sets.append(base_cands)   # フォールバック：枠を問わない全候補
+    cand_sets.append(base_cands)  # フォールバック：枠を問わない全候補
     for cands in cand_sets:
         if not cands:
             continue
@@ -1698,8 +1728,7 @@ def check_rule1(data):
         if pid in last_seen:
             prev_d, prev_slot, prev_pos, prev_recipe, prev_pname = last_seen[pid]
             gap = (d - prev_d).days
-            need = rule_param(data, 1, '間隔日数', 8)   # ルールシートで変更可
-            if 0 < gap < need:
+            if 0 < gap <= 7:
                 group = cm.group_from_name(pname)
                 # 代替え案はレシピ（メニュー）名で出す：同系統・同じ枠（メイン/サブ）で、
                 # その商材を使っていないレシピ（ユーザー指定：メインの違反にはメインの候補を出す）
@@ -1716,7 +1745,7 @@ def check_rule1(data):
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 1,
                     'ルール': '同一商品（単体商材）をメイン/サブで1週間空けず再使用',
                     '該当箇所': f'{slot}{pos}:{recipe[:20]}（商品:{pname[:22]}）← 前回 {prev_d.strftime("%-m/%-d")} {prev_slot}{prev_pos}:{prev_recipe[:18]}',
-                    '理由': f'同一商品ID（{int(pid)}）を{gap}日しか空けず再使用（要{need}日以上）',
+                    '理由': f'同一商品ID（{int(pid)}）を{gap}日しか空けず再使用（要8日以上）',
                     '修正提案': suggestion, '重要度': '高',
                 })
         last_seen[pid] = (d, slot, pos, recipe, pname)
@@ -1806,8 +1835,7 @@ def check_rule3_5(data):
                 continue
             pool = [n for n in dish_hist if cm.group_from_name(n) != gm and n not in ng_names]
             sub_pool = [n for n in pool if 'サブ' in dish_pos.get(n, ())]
-            cand = _pick_least_recent(sub_pool or pool, dish_hist, d,
-                                      exclude={nm_m, nm_s}, spread=data.suggested)
+            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v3.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 3,
@@ -1819,8 +1847,7 @@ def check_rule3_5(data):
             pool = [n for n in dish_hist
                     if cm.group_from_name(n) not in ('鶏肉系', '豚肉系', '牛肉系') and n not in ng_names]
             sub_pool = [n for n in pool if 'サブ' in dish_pos.get(n, ())]
-            cand = _pick_least_recent(sub_pool or pool, dish_hist, d,
-                                      exclude={nm_m, nm_s}, spread=data.suggested)
+            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v5.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 5,
@@ -1851,7 +1878,7 @@ def check_rule4_36(data):
             gap = (d - pd0).days
             # 同日内の複数サイズ登録（例：S用30g・M用50g）は重複とみなさない（ユーザー確認済み）。
             # gap==1（翌日）のみ「連日重複」としてNG。
-            if gap <= rule_param(data, 4, '間隔日数', 1):
+            if gap == 1:
                 ng_names = _ng_recipe_names(data)
                 candidates = [n2 for n2 in dish_hist if 'コロッケ' in n2 and
                               n2 not in ng_names and
@@ -1955,10 +1982,15 @@ def check_rule9(data):
     昼は昼同士、夜は夜同士で前日と比較する（日をまたいだ昼→夜比較はしない）。
     マスタに登録の無い野菜（色が未入力/未登録）は判定対象外。
     緑・黄・白はほぼ毎日どこかに使われる基礎色のため対象外とし（No.6/8と同じ方針）、
-    彩りとして目立つ赤・紫・茶などの重複のみを検出する。"""
+    彩りとして目立つ赤・紫・茶などの重複のみを検出する。
+    さらに、No.30のFDメニュールール（野菜）で『昼夜/夜昼使用可能・連続OK』と定義されている
+    間隔制約のほぼ無い商品（VEG_FLEXIBLE_IDS）は、商品ID一致で判定対象から除外する
+    （赤ピーマン/3色ピーマン等がFD野菜ルール上は連日使用OKなのにNo.9では色重複として
+    引っかかってしまう食い違いを解消するため。ユーザー確認済み）。"""
     if not data.veg_color_map:
         return pd.DataFrame()
     dr = data.date_range
+    flexible_ids = set(VEG_FLEXIBLE_IDS)
     viol = []
     for slot, shoku_dict in [('昼', data.shoku), ('夜', data.shoku_night)]:
         prev_date = None
@@ -1977,6 +2009,9 @@ def check_rule9(data):
                 if pd.isna(qty) or qty == 0 or cm.is_noise(prod):
                     continue
                 if any(k in _nfkc(prod) for k in COMMON_VEG_NAMES):
+                    continue
+                pid = pd.to_numeric(r.get('商品ID'), errors='coerce')
+                if pd.notna(pid) and int(pid) in flexible_ids:
                     continue
                 for c in veg_colors_for(prod, data.veg_color_map):
                     if c in COMMON_VEG_COLORS:
@@ -2006,7 +2041,7 @@ def check_rule9(data):
     return pd.DataFrame(viol)
 
 
-def check_rule10(data, min_gap_days=None):
+def check_rule10(data, min_gap_days=8):
     """No.10: 同一食材のみで構成したメニュー（副菜・サラダ）は、味付けを変えても
     1週間以上空けて使用する。day_csv（商品ID紐付けCSV）が必要（No.1と同じ仕組みを流用）。
     副菜1/副菜2/サラダの各レシピについて、基礎調味料を除いた食材が1品だけのものを
@@ -2014,7 +2049,6 @@ def check_rule10(data, min_gap_days=None):
     day_csv = data.day_csv
     if not day_csv or not data.rows:
         return pd.DataFrame()
-    min_gap_days = min_gap_days or rule_param(data, 10, '間隔日数', 8)
     entries = []
     seen_days = sorted(set((d, slot) for (d, wd, slot, pos, name) in data.rows))
     for d, slot in seen_days:
@@ -2204,16 +2238,15 @@ def check_rule12(data):
             sub = df[(df['md'] == (d.month, d.day)) & (~df['レシピ名'].astype(str).str.contains('備品', na=False))]
             recipe_ids = sub.dropna(subset=['レシピID'])[['レシピID', 'レシピ名']].drop_duplicates()
             fried = recipe_ids[recipe_ids['レシピID'].astype(int).isin(data.fried_recipe_ids)]
-            fried_max = rule_param(data, 12, '上限', 3)
-            if len(fried) > fried_max:
+            if len(fried) >= 4:
                 names = '/'.join(fried['レシピ名'].astype(str).str[:12].tolist())
                 nonfried_hist = _filtered_dish_hist(data, lambda n: n in _nonfried_dish_names(data))
                 cand = _pick_least_recent(nonfried_hist.keys(), nonfried_hist, d, spread=data.suggested)
                 suggestion = f'いずれか1品を「{cand[:18]}」等の非揚げ物に変更' if cand else '1品を煮/和え等に'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 12,
-                    'ルール': f'当日揚げ調理が{fried_max}品を超過', '該当箇所': f'[{slot}] {names}',
-                    '理由': f'当日揚げが{len(fried)}品（上限{fried_max}品）',
+                    'ルール': '当日揚げ調理が3品を超過', '該当箇所': f'[{slot}] {names}',
+                    '理由': f'当日揚げが{len(fried)}品（上限3品）',
                     '修正提案': suggestion, '重要度': '中',
                 })
     return pd.DataFrame(viol)
@@ -2286,8 +2319,7 @@ def check_rule14(data):
 
 def check_rule15(data):
     """No.15: 週に1回、健康食材を使用する"""
-    return _max_gap_check(data, is_health, rule_param(data, 15, '間隔日数', 7), 15,
-                          '健康食材の使用間隔が週1回を下回る')
+    return _max_gap_check(data, is_health, 7, 15, '健康食材の使用間隔が週1回を下回る')
 
 
 # No.17用：黄（卵焼き）は、メニュー名や食材データ上に一切現れない日でも毎食必ず入っている
@@ -2349,8 +2381,7 @@ def check_rule17(data):
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 17,
                     'ルール': '1食につき赤・黄・緑の食材を必ず使用（黄は卵焼き前提で常にクリア）',
                     '該当箇所': f'[{slot}]',
-                    '理由': f'{"".join(missing)}系の食材が0品（野菜マスタ照合。'
-                            '赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんもも加味）',
+                    '理由': f'{"".join(missing)}系の食材が0品（野菜マスタ照合。赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんもも加味）',
                     '修正提案': suggestion, '重要度': '中',
                 })
     return pd.DataFrame(viol)
@@ -2402,10 +2433,9 @@ def _recipe_weight_g(sub):
 #   ・フードカップ（仕切りカップ）の重量は考慮しない（ユーザー指定）。
 #   ・Sサイズは容器重量のみ判明。総重量の下限が未確定のため、判定は行わない
 #     （min_total_g に数値を入れれば、そのまま判定対象になる）。
-# 下限はルールシート No.18「S 161g / M 212g」に準拠（容器＋カップ重量を含む総重量）
 BENTO_SIZE_SPEC = {
     'M': {'min_total_g': 212, 'container_g': 18.0},
-    'S': {'min_total_g': 161, 'container_g': 17.5},
+    'S': {'min_total_g': None, 'container_g': 17.5},
 }
 BENTO_SIZE = 'M'   # 実データがどのサイズのものかを指定する
 
@@ -2454,7 +2484,7 @@ def check_rule18(data, size=None):
         return pd.DataFrame()
     size = size or BENTO_SIZE
     spec = BENTO_SIZE_SPEC.get(size, {})
-    min_total_g = rule_param(data, 18, '下限', spec.get('min_total_g'))
+    min_total_g = spec.get('min_total_g')
     container_g = spec.get('container_g', 0.0)
     if min_total_g is None:
         data.warnings.append(
@@ -2672,8 +2702,7 @@ def check_rule21(data):
 
 def check_rule22(data):
     """No.22: 魚メニューは3日に1回（昼夕併せて）"""
-    return _max_gap_check(data, is_fish, rule_param(data, 22, '間隔日数', 3), 22,
-                          '魚メニューの間隔が3日を超過')
+    return _max_gap_check(data, is_fish, 3, 22, '魚メニューの間隔が3日を超過')
 
 
 def check_rule23(data):
@@ -2723,7 +2752,7 @@ def check_rule25(data):
         d0, _ = kabocha_dates[i - 1]
         d1, n1 = kabocha_dates[i]
         gap = (d1 - d0).days
-        if gap > rule_param(data, 25, '間隔日数', 7):
+        if gap > 7:
             cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d1, spread=data.suggested)
             suggestion = f'間の週に「{cand[:18]}」等を追加' if cand else '間の週にかぼちゃメニューを追加'
             viol.append({
@@ -2738,15 +2767,14 @@ def check_rule25(data):
         if wd in by_weekday:
             pd0, pn0 = by_weekday[wd]
             gap = (d - pd0).days
-            same_wd = rule_param(data, 25, '同曜日日数', 28)
-            if gap <= same_wd:
+            if gap <= 28:
                 cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d, exclude={n}, spread=data.suggested)
                 suggestion = f'この曜日は「{cand[:18]}」等に変更、または間隔を空ける' if cand else '曜日をずらすか間隔を空ける'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[wd], 'No': 25,
                     'ルール': 'かぼちゃが同一曜日で4週間以内に再使用',
                     '該当箇所': f'前回{pd0.strftime("%-m/%-d")}:{pn0[:14]} → 今回{d.strftime("%-m/%-d")}:{n[:14]}',
-                    '理由': f'同一曜日で{gap}日しか空いていない（要{same_wd + 1}日以上）', '修正提案': suggestion, '重要度': '中',
+                    '理由': f'同一曜日で{gap}日しか空いていない（要29日以上）', '修正提案': suggestion, '重要度': '中',
                 })
         by_weekday[wd] = (d, n)
     return pd.DataFrame(viol)
@@ -2754,9 +2782,8 @@ def check_rule25(data):
 
 def check_rule26(data):
     """No.26: かにのふわふわは5日以上空けて使用"""
-    gap = rule_param(data, 26, '間隔日数', 5)
-    return _min_gap_check(data, lambda n: 'かに' in n and 'ふわふわ' in n, gap, 26,
-                           f'かにのふわふわが{gap}日以内に再使用', severity='低')
+    return _min_gap_check(data, lambda n: 'かに' in n and 'ふわふわ' in n, 5, 26,
+                           'かにのふわふわが5日以内に再使用', severity='低')
 
 
 def _veg_rows_slot(data, date, slot):
@@ -2941,15 +2968,14 @@ def check_rule29(data):
     viol = []
     for month in sorted(seen_months):
         for slot in ['昼', '夜']:
-            need = rule_param(data, 29, '月最低回数', 2)
             cnt = omakase_count.get((month, slot), 0)
-            if cnt < need:
+            if cnt < 2:
                 example = f'（例:「{omakase_names[0][:18]}」等）' if omakase_names else ''
                 viol.append({
                     '日付': f'{month}月(月次)', '曜日': '-', 'No': 29,
                     'ルール': 'おまかせメニューを昼・夜月2回以上採用',
                     '該当箇所': f'{month}月{slot}',
-                    '理由': f'おまかせメニューが{cnt}回のみ（月{need}回以上必要）',
+                    '理由': f'おまかせメニューが{cnt}回のみ（月2回以上必要）',
                     '修正提案': f'{slot}のおまかせ枠を追加する{example}', '重要度': '中',
                 })
     return pd.DataFrame(viol)
@@ -3000,6 +3026,84 @@ def check_rule31(data):
     return pd.DataFrame(viol)
 
 
+def check_rule32(data):
+    """No.32: 「26年12月商品枠シート」に基づく、商品ID単位の使用回数・周期チェック。
+    ①月内使用回数チェック（PRODUCT_FRAME_DEC2026_QUOTA・使用頻度(D列)/最大使用回数(E列)）：
+      ・min_countがある商品：月内の使用回数がそれ未満なら下限未達
+      ・max_countがある商品：月内の使用回数がそれを超えたら上限超過
+      昼夜どちらの使用も区別せず、月内の使用（昼/夜・商品ID一致）の延べ回数で判定する。
+    ②周期チェック（PRODUCT_FRAME_DEC2026_PERIODIC・「隔月1回」「3カ月1回」）：
+      商品ID単位の過去メニュー履歴（_usage_history_by_id・history_csv_pathsで渡した場合のみ）
+      と比較し、前回使用からの間隔が指定月数未満なら参考情報として検出する（低重要度）。
+      履歴が無い商品は判定不能として何も出さない。備考の「YD使用翌月に使用可」等の在庫持ち越し
+      例外は在庫データが無いと判定できないため誤検出の可能性がある（ユーザー確認済み・参考実装）。
+    このシートの内容は2026年12月のメニューにのみ適用する（ユーザー確認済み）ため、
+    date_range（対象期間）の中に2026年12月の日付が無い場合は何も判定しない。
+    他の月のデータが混在していても、2026年12月以外の日は集計・判定の対象外にする。"""
+    dr = data.date_range
+    dec_days = [d for d in dr if d.year == 2026 and d.month == 12]
+    if not dec_days:
+        return pd.DataFrame()
+    viol = []
+    for pid, name, min_count, max_count in PRODUCT_FRAME_DEC2026_QUOTA:
+        used = set()
+        for d in dec_days:
+            for slot, shoku_dict in (('昼', data.shoku), ('夜', data.shoku_night)):
+                shoku = shoku_dict.get(12)
+                if shoku is None:
+                    continue
+                md = (d.month, d.day)
+                sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
+                if not len(sub):
+                    continue
+                hit = (pd.to_numeric(sub['商品ID'], errors='coerce') == pid).any()
+                if hit:
+                    used.add((d, slot))
+        used_sorted = sorted(used)
+        cnt = len(used_sorted)
+        used_txt = '／'.join(f'{u.strftime("%-m/%-d")}({WD_JP[u.weekday()]}{s})' for u, s in used_sorted) or 'なし'
+        if min_count is not None and cnt < min_count:
+            viol.append({
+                '日付': '2026年12月(月次)', '曜日': '-', 'No': 32,
+                'ルール': f'商品枠クオータ未達：{name}',
+                '該当箇所': f'2026年12月 全体（使用: {used_txt}）',
+                '理由': f'月内使用が{cnt}回のみ（下限{min_count}回）',
+                '修正提案': f'「{name}」をあと{min_count - cnt}回追加する', '重要度': '中（商品枠シート準拠）',
+            })
+        if max_count is not None and cnt > max_count:
+            viol.append({
+                '日付': '2026年12月(月次)', '曜日': '-', 'No': 32,
+                'ルール': f'商品枠クオータ超過：{name}',
+                '該当箇所': f'2026年12月 全体（使用: {used_txt}）',
+                '理由': f'月内使用が{cnt}回（上限{max_count}回）',
+                '修正提案': f'「{name}」の使用を{cnt - max_count}回減らす', '重要度': '中（商品枠シート準拠）',
+            })
+    # ②「隔月1回」「3カ月1回」の周期チェック（商品ID単位・過去メニュー履歴が必要）。
+    hist_id = _usage_history_by_id(data)
+    for pid, name, gap_months in PRODUCT_FRAME_DEC2026_PERIODIC:
+        uses = hist_id.get(pid, [])
+        dec_uses = sorted(u for u in uses if u.year == 2026 and u.month == 12)
+        if not dec_uses:
+            continue  # 12月に使用が無ければ周期チェック対象外
+        first_dec = dec_uses[0]
+        prior = [u for u in uses if u < pd.Timestamp(first_dec.year, first_dec.month, 1)]
+        if not prior:
+            continue  # 12月より前の使用履歴が無い（＝過去メニューCSV未提供等）ため判定不能
+        last_prior = max(prior)
+        month_gap = (first_dec.year - last_prior.year) * 12 + (first_dec.month - last_prior.month)
+        if month_gap < gap_months:
+            viol.append({
+                '日付': '2026年12月(月次)', '曜日': '-', 'No': 32,
+                'ルール': f'商品枠クオータ：周期未達（{name}）',
+                '該当箇所': f'2026年12月{first_dec.strftime("%-d")}日 使用（前回使用: {last_prior.strftime("%Y/%-m")}月）',
+                '理由': f'「{gap_months}ヶ月に1回」に対して前回使用から{month_gap}ヶ月しか空いていない'
+                        '（在庫(YD)持ち越し例外は判定不可のため参考情報）',
+                '修正提案': '在庫状況を確認し、YD持ち越しでなければ使用日をずらす',
+                '重要度': '低（参考実装・過去メニュー履歴が必要）',
+            })
+    return pd.DataFrame(viol)
+
+
 ALL_RULES = [
     ('No.1 メイン/サブ商材1週間ルール（酷似商材含む）', check_rule1),
     # ('No.2 メイン/サブ見た目酷似1週間+月2回ルール', check_rule2),  # ユーザー指示によりいったん無効化（商品IDが異なる場合は検出しない方針）
@@ -3029,6 +3133,7 @@ ALL_RULES = [
     ('No.29 おまかせメニュー月2回以上', check_rule29),
     ('No.30 野菜使用間隔（FDメニュールール）', check_rule30),
     ('No.31 マッシュ系同日重複', check_rule31),
+    ('No.32 商品枠クオータ（26年12月商品枠シート）', check_rule32),
 ]
 
 
@@ -3074,8 +3179,6 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
         'total': len(combined),
         'by_rule': combined['No'].value_counts().sort_index().to_dict() if len(combined) else {},
         'warnings': data.warnings,
-        'rules': rule_status_table(data),
-        'rule_texts': {no: v.get('text', '') for no, v in data.rule_master.items()},
     }
     return combined, summary
 
@@ -3091,62 +3194,12 @@ RULE_NAME_JP = {
     22: '魚メニュー3日に1回', 23: '食べにくさチェック', 24: '白和えの分類',
     25: 'かぼちゃ週1回・同曜日4週間', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★平日夜クオータ',
     28: '本日の魚料理は平日の夜', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
-    31: 'マッシュ系同日重複', 36: 'コロッケとクリームコロッケ',
+    31: 'マッシュ系同日重複', 32: '商品枠クオータ（12月商品枠シート）', 36: 'コロッケとクリームコロッケ',
 }
 
 
-# 判定に使っている数値（ルールシートの列名 → 既定値）。ルール一覧の「適用中の数値」に出す。
-RULE_APPLIED_PARAMS = {
-    1: [('間隔日数', 8)], 4: [('間隔日数', 1)], 10: [('間隔日数', 8)], 12: [('上限', 3)],
-    15: [('間隔日数', 7)], 18: [('下限', 212)], 22: [('間隔日数', 3)],
-    25: [('間隔日数', 7), ('同曜日日数', 28)], 26: [('間隔日数', 5)], 29: [('月最低回数', 2)],
-}
-RULE_EXCLUDED = {2: 'ユーザー指示により対象外', 23: 'ユーザー指示により対象外'}
-
-
-def implemented_rule_numbers():
-    """ALL_RULES のラベルから、実装して動かしているルール番号を取り出す。"""
-    nos = set()
-    for label, _fn in ALL_RULES:
-        for m in re.finditer(r'No\.(\d+)(?:/(\d+))?', label):
-            nos.add(int(m.group(1)))
-            if m.group(2):
-                nos.add(int(m.group(2)))
-    nos |= {5, 36}   # No.3/5・No.4/36 は1つの関数で両方を判定している
-    return nos
-
-
-def rule_status_table(data):
-    """ルールシートの内容と実装状況を突き合わせた一覧を返す。
-    ルールが変わったらワークブックを差し替える運用のため、
-    『文言はあるが実装していない』項目がひと目で分かるようにする。"""
-    impl = implemented_rule_numbers()
-    rows = []
-    for no in sorted(set(data.rule_master) | impl | set(RULE_EXCLUDED)):
-        info = data.rule_master.get(no, {})
-        if no in RULE_EXCLUDED:
-            status = f'対象外（{RULE_EXCLUDED[no]}）'
-        elif no in impl:
-            status = '実装済み'
-        else:
-            status = '未実装'
-        applied = []
-        for key, default in RULE_APPLIED_PARAMS.get(no, []):
-            v = rule_param(data, no, key, default)
-            src = 'シート' if key in info.get('params', {}) else '既定'
-            applied.append(f'{key}={v:g}（{src}）')
-        rows.append({
-            'No': no,
-            '目的': info.get('category', ''),
-            'ルール': (info.get('text', '') or '').replace('\n', ' ')[:120],
-            '実装状況': status,
-            '適用中の数値': ' / '.join(applied),
-        })
-    return pd.DataFrame(rows)
-
-
-def write_report(combined, n_days, out_path, rules_df=None):
-    """違反候補リスト／サマリー／チェックフロー（＋ルール一覧）で出力する。
+def write_report(combined, n_days, out_path):
+    """違反候補リスト／サマリー／チェックフローの3シートで出力する。
     ・「曜日」ではなく「昼夜」列を出す（ユーザー指定）。
     ・重要度は使わない（列も色分けも無し）。並びは日付順のみ（ユーザー指定）。"""
     from openpyxl import Workbook
@@ -3246,26 +3299,4 @@ def write_report(combined, n_days, out_path, rules_df=None):
             ws3.cell(ws3.max_row, c).alignment = Alignment(vertical='top', wrap_text=True)
     ws3.column_dimensions['A'].width = 22
     ws3.column_dimensions['B'].width = 78
-    # ---- ルール一覧（ワークブックのルールシートを読み込めた場合のみ）----
-    if rules_df is not None and len(rules_df):
-        ws4 = wb.create_sheet('ルール一覧')
-        ws4['A1'] = 'メニュー構成ルールと実装状況'
-        ws4['A1'].font = SUB
-        ws4.append([])
-        cols4 = list(rules_df.columns)
-        ws4.append(cols4)
-        hdr(ws4, len(cols4), row=3)
-        for _, r in rules_df.iterrows():
-            ws4.append([r.get(c) for c in cols4])
-        fill_ng = PatternFill('solid', fgColor='FDF0E3')
-        for row in ws4.iter_rows(min_row=4, max_row=ws4.max_row):
-            status = str(row[3].value or '')
-            for cell in row:
-                cell.font = BODY
-                cell.border = BORD
-                cell.alignment = Alignment(vertical='top', wrap_text=True)
-                cell.fill = fill_ng if status.startswith(('未実装', '対象外')) else PatternFill()
-        ws4.freeze_panes = 'A4'
-        for col, w in zip('ABCDE', [5, 14, 76, 22, 30]):
-            ws4.column_dimensions[col].width = w
     wb.save(out_path)
