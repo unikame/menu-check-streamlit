@@ -475,8 +475,10 @@ class MenuData:
         self.date_range = None
         self.ai_client = None            # Anthropic clientが設定されていればAI酷似判定を使う（予備・現状未使用）
         self.day_csv = {}                # {(month, '昼'/'夜'): DataFrame}　'md'列付き。No.1(商品ID単位)判定用
-        self.nutrition_shoku = {}        # month -> DataFrame（カロリー等の列を持つ「N月使用食材」シートがあれば。No.14専用）
-        self.nutrition_daily = {}        # month -> DataFrame(date,kcal,protein,salt)。「N月栄養価」シート由来。No.14専用（優先使用）
+        self.nutrition_shoku = {}        # month -> DataFrame（カロリー等の列を持つ「N月使用食材」シートがあれば。No.14専用。
+                                          # 2026/9〜：たんぱく質/食塩相当量のみ使用。エネルギーは_monthly_avg_kcal_new参照）
+        self.nutrition_daily = {}        # month -> DataFrame(date,kcal,protein,salt)。「N月栄養価」シート由来。No.14専用（優先使用）。
+                                          # 2026/9〜：たんぱく質/食塩相当量のみ使用。エネルギーは_monthly_avg_kcal_new参照
         self.veg_color_map = []          # [(正規化名, {色,...}), ...] 野菜マスタ由来。No.9専用
         self.seasoning_ids = set()       # 調味料.csv由来の商品ID集合。No.8専用（キーワードでなく実データで判定）
         self.fried_recipe_ids = set()    # 食材データ.xlsx「調理法（当日揚げ）」由来のレシピID集合。No.12専用
@@ -2339,14 +2341,45 @@ def check_rule12(data):
     return pd.DataFrame(viol)
 
 
+def _monthly_avg_kcal_new(data):
+    """No.14「エネルギー」用の月平均カロリー計算（2026/9・ユーザー指定の新方式）。
+    旧方式（N月栄養価/N月使用食材シート優先、無ければ食材CSVから集計）は完全に廃止し、
+    エネルギーはこの方式のみで計算する（ユーザー確認済み）。
+    ・対象は食材CSV（day_csv）。昼夜は分けず、月内の全レシピ行（昼＋夜）をまとめて扱う
+      （ユーザー確認済み：昼夜を分けず1つの月平均として扱う。NUTRI_BOUNDSの昼夜の基準値が
+      同一のため、この扱いで問題ない）。
+    ・名称欄（B列）に「【M】」を含む行だけを対象にする。
+    ・その中の「カロリー」列（S列）の合計を、「お弁当ID」列（A列）のユニーク数で割ったものを
+      その月の平均エネルギー(kcal)とする（＝合計カロリー ÷ お弁当の件数）。
+    戻り値: {month: avg_kcal}。必要な列が無い/対象行が無い月は結果に含めない。"""
+    by_month = {}
+    for (month, _slot), df in data.day_csv.items():
+        by_month.setdefault(month, []).append(df)
+    out = {}
+    for month, dfs in by_month.items():
+        df = pd.concat(dfs, ignore_index=True, sort=False)
+        if not all(c in df.columns for c in ('名称', 'カロリー', 'お弁当ID')):
+            continue
+        sub = df[df['名称'].astype(str).str.contains('【M】', na=False)]
+        if not len(sub):
+            continue
+        s_sum = pd.to_numeric(sub['カロリー'], errors='coerce').sum()
+        id_count = sub['お弁当ID'].nunique()
+        if id_count:
+            out[month] = s_sum / id_count
+    return out
+
+
 def check_rule14(data):
-    """No.14: 75歳以上向け栄養素基準（月平均・75歳基準、昼夜それぞれの基準値で判定）。
-    優先的に nutrition_daily（「N月栄養価」シート・1日1行で集計済み。ユーザー指定）を使う。
-    無い月のみ nutrition_shoku（「N月使用食材」シート・食材単位で合算）にフォールバックする。
-    夜は現状、栄養価データが無いためスキップされる（data.warningsに記録）。"""
+    """No.14: 75歳以上向け栄養素基準（月平均・75歳基準）。
+    ・エネルギー(kcal)：_monthly_avg_kcal_new（2026/9・ユーザー指定の新方式）で判定する。
+      昼夜を分けず月1つの平均値のため、NUTRI_BOUNDSの昼夜共通の基準値と比較する。
+    ・たんぱく質／食塩相当量：従来通り。優先的に nutrition_daily（「N月栄養価」シート・
+      1日1行で集計済み。ユーザー指定）を使い、無い月のみ nutrition_shoku（「N月使用食材」
+      シート・食材単位で合算）にフォールバックする（昼のみ。夜はデータが無くスキップ）。"""
     viol = []
     slot_label = '昼'
-    bounds = NUTRI_BOUNDS[slot_label]
+    bounds = NUTRI_BOUNDS[slot_label]  # 昼夜共通の基準値のため代表して使う
     # 具体的な代替メニュー候補（食材データ.xlsxのレシピ別栄養価から高カロリー/高たんぱく/低塩を抽出）
     hi_kcal = _nutrition_candidates(data, 'カロリー', ascending=False)
     lo_kcal = _nutrition_candidates(data, 'カロリー', ascending=True)
@@ -2355,17 +2388,24 @@ def check_rule14(data):
 
     def _sug(names, verb):
         return f'{verb}（候補: {" / ".join(n[:16] for n in names)}）' if names else verb
-    for month, df in data.nutrition_daily.items():
-        avg = df[['kcal', 'protein', 'salt']].mean()
+
+    # ① エネルギー（新方式：B列に「【M】」を含む行のカロリー合計 ÷ お弁当ID数。昼夜合算・ユーザー確認済み）
+    for month, avg_kcal in _monthly_avg_kcal_new(data).items():
         label = f'{month}月(月次)'
-        if avg['kcal'] < bounds['kcal'][0] or avg['kcal'] > bounds['kcal'][1]:
-            low = avg['kcal'] < bounds['kcal'][0]
+        if avg_kcal < bounds['kcal'][0] or avg_kcal > bounds['kcal'][1]:
+            low = avg_kcal < bounds['kcal'][0]
             pos = '下限未達' if low else '上限超過'
             sug = _sug(hi_kcal, '高カロリーのメニューに差し替え/追加') if low \
                 else _sug(lo_kcal, '低カロリーのメニューに差し替え')
-            viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': f'エネルギー月平均が{pos}',
-                         '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["kcal"]:.0f}kcal（基準{bounds["kcal"][0]}-{bounds["kcal"][1]}kcal）',
+            viol.append({'日付': label, '曜日': '昼夜', 'No': 14, 'ルール': f'エネルギー月平均が{pos}',
+                         '該当箇所': f'{label}・月平均（新方式：名称に【M】を含む行のカロリー合計÷お弁当ID数）',
+                         '理由': f'{avg_kcal:.0f}kcal（基準{bounds["kcal"][0]}-{bounds["kcal"][1]}kcal）',
                          '修正提案': sug, '重要度': '高'})
+
+    # ② たんぱく質・食塩相当量（従来通り。昼のみ）
+    for month, df in data.nutrition_daily.items():
+        avg = df[['protein', 'salt']].mean()
+        label = f'{month}月(月次)'
         if avg['salt'] > bounds['salt_max']:
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': '食塩相当量の月平均が上限超過',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["salt"]:.2f}g（上限{bounds["salt_max"]}g）',
@@ -2377,22 +2417,14 @@ def check_rule14(data):
     for month, shoku in data.nutrition_shoku.items():
         if month in data.nutrition_daily:
             continue  # 栄養価シートが優先。使用食材シートは無い月のみのフォールバック
-        if not all(c in shoku.columns for c in ['カロリー', 'たんぱく質', '食塩相当量']):
+        if not all(c in shoku.columns for c in ['たんぱく質', '食塩相当量']):
             continue
         sub = shoku[shoku['isDX']]
-        daily = sub.groupby('md')[['カロリー', 'たんぱく質', '食塩相当量']].sum().reset_index()
+        daily = sub.groupby('md')[['たんぱく質', '食塩相当量']].sum().reset_index()
         if not len(daily):
             continue
-        avg = daily[['カロリー', 'たんぱく質', '食塩相当量']].mean()
+        avg = daily[['たんぱく質', '食塩相当量']].mean()
         label = f'{month}月(月次)'
-        if avg['カロリー'] < bounds['kcal'][0] or avg['カロリー'] > bounds['kcal'][1]:
-            low = avg['カロリー'] < bounds['kcal'][0]
-            pos = '下限未達' if low else '上限超過'
-            sug = _sug(hi_kcal, '高カロリーのメニューに差し替え/追加') if low \
-                else _sug(lo_kcal, '低カロリーのメニューに差し替え')
-            viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': f'エネルギー月平均が{pos}',
-                         '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["カロリー"]:.0f}kcal（基準{bounds["kcal"][0]}-{bounds["kcal"][1]}kcal）',
-                         '修正提案': sug, '重要度': '高'})
         if avg['食塩相当量'] > bounds['salt_max']:
             viol.append({'日付': label, '曜日': slot_label, 'No': 14, 'ルール': '食塩相当量の月平均が上限超過',
                          '該当箇所': f'{label}{slot_label}・月平均', '理由': f'{avg["食塩相当量"]:.2f}g（上限{bounds["salt_max"]}g）',
