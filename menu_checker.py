@@ -2143,7 +2143,10 @@ def check_rule10(data, min_gap_days=8):
     """No.10: 同一食材のみで構成したメニュー（副菜・サラダ）は、味付けを変えても
     1週間以上空けて使用する。day_csv（商品ID紐付けCSV）が必要（No.1と同じ仕組みを流用）。
     副菜1/副菜2/サラダの各レシピについて、基礎調味料を除いた食材が1品だけのものを
-    『単一食材メニュー』とみなし、その食材の使用間隔を見る（味付けが変わっていても対象）。"""
+    『単一食材メニュー』とみなし、その食材の使用間隔を見る（味付けが変わっていても対象）。
+    代替え案は、まず違反した枠（副菜1/副菜2/サラダのいずれか）で使われた実績のある
+    単一食材メニューに絞って探し、見つからなければ枠を問わずフォールバックする
+    （ユーザー指定：サラダの違反に副菜の候補、またはその逆が出るのを防ぐため）。"""
     day_csv = data.day_csv
     if not day_csv or not data.rows:
         return pd.DataFrame()
@@ -2174,9 +2177,11 @@ def check_rule10(data, min_gap_days=8):
     # key(単一食材) -> [(date, recipe), ...]  代替案候補（他の単一食材メニュー）選定に使う
     key_dates = {}
     key_recipe = {}
+    key_pos = {}  # key -> その単一食材メニューが使われた枠（副菜1/副菜2/サラダ）の集合
     for d, slot, pos, recipe, key, prod in entries:
         key_dates.setdefault(key, []).append(d)
         key_recipe.setdefault(key, recipe)
+        key_pos.setdefault(key, set()).add(pos)
     last_seen = {}
     viol = []
     for d, slot, pos, recipe, key, prod in entries:
@@ -2184,15 +2189,25 @@ def check_rule10(data, min_gap_days=8):
             prev_d, prev_slot, prev_pos, prev_recipe, prev_prod = last_seen[key]
             gap = (d - prev_d).days
             if 0 < gap < min_gap_days:
-                best_key, best_gap = None, -1
                 ng_names = _ng_recipe_names(data)
-                for k2, dates2 in key_dates.items():
-                    if k2 == key or key_recipe.get(k2) in ng_names:
-                        continue
-                    past = [dt for dt in dates2 if dt < d]
-                    g2 = (d - past[-1]).days if past else 10 ** 6
-                    if g2 > best_gap:
-                        best_key, best_gap = k2, g2
+
+                def _best_candidate(restrict_pos):
+                    best_key, best_gap = None, -1
+                    for k2, dates2 in key_dates.items():
+                        if k2 == key or key_recipe.get(k2) in ng_names:
+                            continue
+                        if restrict_pos and pos not in key_pos.get(k2, set()):
+                            continue
+                        past = [dt for dt in dates2 if dt < d]
+                        g2 = (d - past[-1]).days if past else 10 ** 6
+                        if g2 > best_gap:
+                            best_key, best_gap = k2, g2
+                    return best_key
+
+                # まず違反した枠（例：サラダの違反ならサラダ）で使われた実績のある候補に絞って探し、
+                # 見つからなければ枠を問わずフォールバックする（ユーザー指定：
+                # 違反した料理と違う枠の代替案が出ないようにするため。他ルールと同じ方針）。
+                best_key = _best_candidate(restrict_pos=True) or _best_candidate(restrict_pos=False)
                 suggestion = f'別の単一食材メニュー「{key_recipe[best_key][:18]}」に変更を検討' if best_key else '該当日か次回使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 10,
