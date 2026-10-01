@@ -1456,6 +1456,18 @@ def _dish_positions(data):
     return out
 
 
+def _date_key(d):
+    """日付比較用に datetime.date へ正規化する。
+    data.rows内の日付は datetime.date（_parse_lunch_dinner_sheet/rows_from_day_csv参照）だが、
+    各check_ruleNがループに使うdata.date_range（pd.date_range由来）はpandas.Timestampであり、
+    datetime.date と pandas.Timestamp は見た目が同じ日付でも == が常にFalseになる
+    （Pythonの日付比較の仕様。ハッシュも異なるため辞書キーとして一致しない）。
+    これにより_pos_onの照合が常にNoneを返し、位置（枠）を絞った代替え案の指定が
+    常にフォールバック（枠を問わない）に落ちてしまっていた（実データで確認済みの不具合）。
+    呼び出し側の型に関わらずここで統一してから比較する。"""
+    return d.date() if hasattr(d, 'date') else d
+
+
 def _pos_on(data, d, slot, name):
     """指定した日付・時間帯（昼/夜）における、そのレシピ名の枠（メイン/サブ/副菜1/副菜2/サラダ）を返す。
     _dish_positions（全期間の集計）とは異なり、その日その回に実際に使われた枠だけをdata.rowsから
@@ -1463,15 +1475,15 @@ def _pos_on(data, d, slot, name):
     ユーザー指定：違反した料理と違うジャンルの代替案が出るのを防ぐ）。見つからなければNone。
     data.rows内のレシピ名は_nfkcで正規化済み（rows_from_day_csv参照）だが、呼び出し側から
     渡されるnameは正規化前（生の文字列。例：全角スペースや全角カッコを含む）のことがあるため、
-    ここで_nfkcしてから引き比べる。"""
+    ここで_nfkcしてから引き比べる。日付も_date_keyで型を揃えてから引き比べる（上記参照）。"""
     if name is None:
         return None
     if getattr(data, '_dish_pos_by_day', None) is None:
         m = {}
         for (dd, _wd, ss, pos, nm) in data.rows:
-            m[(dd, ss, nm)] = pos
+            m[(_date_key(dd), ss, nm)] = pos
         data._dish_pos_by_day = m
-    return data._dish_pos_by_day.get((d, slot, _nfkc(str(name))))
+    return data._dish_pos_by_day.get((_date_key(d), slot, _nfkc(str(name))))
 
 
 def _recipe_products(data):
@@ -1674,12 +1686,15 @@ def _flexible_veg_names(data):
     return data._flex_veg
 
 
-def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=()):
+def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), position=None):
     """No.21用：禁止食材・調味料に該当したメニューの代替え案を『レシピ（メニュー）名』で返す。
     ユーザー指定により、調味料（タレ/ソース/〜の素）が禁止対象の場合も、調味料の差し替えでは
     なくレシピごと差し替える案を出す。
     候補は「禁止対象（商品名・禁止ワード）を含まないレシピ」で、同系統(cm.group_from_name)を
-    優先し、その日時点で最も長く使われていないものを選ぶ。"""
+    優先し、その日時点で最も長く使われていないものを選ぶ。
+    position: 違反した当日・その枠（メイン/サブ/副菜1/副菜2/サラダ）を渡すと、同じ枠で
+    使われた実績のあるレシピに候補を絞る（ユーザー指定：副菜の違反にサブ/メインの候補、
+    あるいはその逆が出てしまうのを防ぐ。見つからなければ枠を問わずフォールバックする）。"""
     words = [w for w in (list(ng_words) or NG_WORDS)]
 
     def _safe(n):
@@ -1693,7 +1708,8 @@ def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=()):
 
     base = recipe_name or prod_name or ''
     group = cm.group_from_name(base)
-    cand, same_group = _recipe_replacement2(data, date, ok=_safe, group=group, exclude={base})
+    cand, same_group = _recipe_replacement2(data, date, ok=_safe, group=group, exclude={base},
+                                             position=position)
     if cand and same_group:
         return f'同系統（{group}）の「{cand[:26]}」に差し替え'
     if cand:
@@ -2684,7 +2700,12 @@ def check_rule18(data, size=None):
                     unknown.append(str(recipe))
                     continue
                 food += w
-                weights.append((w, str(recipe)))
+                # 増量候補はメイン/サブ（唐揚げ・ハンバーグ等の固形メニュー）を避け、
+                # 副菜1/副菜2/サラダの枠で使われた実績があるレシピに限定する
+                # （ユーザー指定：重量調整はメイン/サブの差し替えではなく副菜・サラダ側で行いたい）。
+                pos = _pos_on(data, d, slot, recipe)
+                if pos in ('副菜1', '副菜2', 'サラダ'):
+                    weights.append((w, str(recipe)))
             # 備品レシピ内の食材（厚焼玉子・つぼ漬け等）も1食の重量に含める（ユーザー確認済み）
             bihin_g, bihin_detail = _bihin_food_g(sub_all)
             food += bihin_g
@@ -2828,7 +2849,8 @@ def check_rule21(data):
                         '該当箇所': f'[{slot}] {str(recipe)[:22]} → {"/".join(prods)[:30]}',
                         '理由': '「禁止食材・調味料該当」シート登録商品を使用',
                         '修正提案': _ng_replacement(data, prods[0] if prods else None, d,
-                                                    recipe_name=str(recipe)),
+                                                    recipe_name=str(recipe),
+                                                    position=_pos_on(data, d, slot, recipe)),
                         '重要度': '高',
                     })
         return pd.DataFrame(viol)
@@ -2864,7 +2886,8 @@ def check_rule21(data):
                     except ValueError:
                         vdate = None
                 sug = _ng_replacement(data, matched_prods[0] if matched_prods else None, vdate,
-                                       recipe_name=str(recipe), ng_words=matched_words) \
+                                       recipe_name=str(recipe), ng_words=matched_words,
+                                       position=_pos_on(data, vdate, label, recipe)) \
                     if vdate is not None else '代替食材/調味料に変更'
                 viol.append({
                     '日付': f'{m}/{d}', '曜日': label, 'No': 21, 'ルール': '禁止食材・調味料の使用（キーワード判定・参考）',
