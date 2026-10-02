@@ -56,13 +56,15 @@
   No.32 商品枠クオータ（26年12月商品枠シート限定・商品ID単位）。
         D列下限/E列上限は月内延べ使用回数で判定、「隔月1回」「3カ月1回」は
         過去メニュー履歴（history_csv_paths・商品ID単位）と比較する周期チェック（参考実装・低重要度）
+  No.37 1食内（昼/夜別）で大豆・豆腐系（SOY_KW）のレシピが複数使用（2026/10・ユーザー報告で追加。
+        No.6は食材単位の重複しか見ないため、系統が同じ大豆・豆腐系の重複は検出できなかった）
 
 ■ 未対応
   No.2  実装済みだがユーザー指示によりALL_RULESから除外中
   No.23 実装済みだがユーザー指示によりチェック対象外（ALL_RULESから除外中）
   No.13 盛付工程（工程データが無いためスキップ）
   No.16 固形2種まで（判定基準となるマスタが未確定）
-  No.33〜35, 37（未着手）
+  No.33〜35（未着手）
 
 ■ NG時の代替え案
   違反行の「修正提案」列には、可能な場合『直近使われていない具体的な代替商材/レシピ名』を出す。
@@ -1564,7 +1566,59 @@ def _ng_recipe_names(data):
     return out
 
 
-def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=None):
+def _recipe_core_products(data, name):
+    """レシピ名 -> 基礎調味料を除いた『実質的な』商品名の集合（キャッシュ有）。
+    差し替え候補が既存の他レシピと食材で重複していないかの判定に使う（ユーザー報告：
+    代替案候補が別のルール（No.6等）の新しい違反を作ってしまうケースがあった。2026/10）。
+    注：No.6（同一食材の複数レシピ重複）の違反判定自体はis_base_veg（ねぎ・パプリカ等の
+    下ごしらえ済みの基礎野菜）も除外するが、ユーザー報告の実例（赤パプリカの食材被り）は
+    is_base_vegに含まれる食材での重複だったため、ここでは除外しない（is_base_seasoningのみ
+    除外）。候補が見つからなければ重複を許容してフォールバックする仕組みのため、
+    ねぎ等の頻出食材で候補が狭まりすぎても提案なしにはならない。"""
+    cache = getattr(data, '_recipe_core_prods', None)
+    if cache is None:
+        cache = {}
+        data._recipe_core_prods = cache
+    if name not in cache:
+        cache[name] = {p for p in _recipe_products(data).get(name, ())
+                        if not is_base_seasoning(p)}
+    return cache[name]
+
+
+def _recipe_is_soy(data, name):
+    """レシピ名（またはそのレシピで使う商品名のいずれか）がSOY_KW（大豆・豆腐系）に
+    該当するか。レシピ名自体がSOY_KWに一致しなくても、使っている商品がSOY_KWに
+    該当する場合（例：豆乳と野菜のふわふわ真丈 等）も大豆・豆腐系とみなす。"""
+    if is_soy(name):
+        return True
+    return any(is_soy(p) for p in _recipe_products(data).get(name, ()))
+
+
+def _conflicts_with_others(data, cand, others):
+    """差し替え候補(cand)を、othersに含まれる他のレシピ（同じ食事内に既にある）と
+    一緒に使うと、新しい違反を生まないかを判定する（ユーザー報告・2026/10）。
+    ・No.6スタイル：実質的な食材（基礎調味料・基礎野菜を除く）が重複する
+    ・大豆・豆腐系同士の重複（No.37。group_from_nameには豆腐系という分類が無いため、
+      SOY_KWキーワードで判定する）
+    いずれかに当たればTrue（＝この候補は使わない方がよい）。"""
+    if not others:
+        return False
+    cand_core = _recipe_core_products(data, cand)
+    cand_soy = _recipe_is_soy(data, cand)
+    for other in others:
+        # cand自身がothers（同じ食事の他レシピ）に含まれている＝その候補は既にこの食事で
+        # 使われている、という意味なので、同一レシピの重複として明確にNG扱いにする
+        # （自分自身との比較だからスキップ、ではない。見た目は同じ名前なので食材は確実に重複する）。
+        if other == cand:
+            return True
+        if cand_core and cand_core & _recipe_core_products(data, other):
+            return True
+        if cand_soy and _recipe_is_soy(data, other):
+            return True
+    return False
+
+
+def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=None, avoid_with=None):
     """レシピ（メニュー）単位の代替え案を1つ返す。候補が無ければ None。
     ・ok    : そのレシピ名を候補にしてよいか判定する関数（Noneなら全て可）
     ・group : 同系統（cm.group_from_name）を優先したい場合に指定
@@ -1576,17 +1630,24 @@ def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=No
       『不足分を補う/いずれかを差し替える』形のルールでは、メイン/サブではなく副菜1/副菜2/
       サラダ等の複数枠を許容範囲として渡す）。
       指定した枠の候補が見つからない場合は、枠を問わず候補を探す（提案なしより優先）。
+    ・avoid_with: 同じ食事（昼/夜）に既にある他のレシピ名の集合を渡すと、それらと食材が
+      重複する候補・大豆豆腐系同士になる候補はまず避けて探す（_conflicts_with_others）。
+      見つからなければ、重複を許容してでも候補を探す（提案なしより優先。フォールバック）。
     いずれも『その日時点で最も長く使われていないレシピ』を選ぶ。
     ユーザー指定により、代替え案は原則すべて商材名ではなくレシピ名で出す。"""
-    return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude, position=position)[0]
+    return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude,
+                                 position=position, avoid_with=avoid_with)[0]
 
 
-def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=None):
+def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=None, avoid_with=None):
     """_recipe_replacement の (レシピ名, 同系統で見つかったか) を返す版。
     「同系統（◯◯）の…」という文言を出してよいかを呼び出し側が判断できるようにするため。
     主原料グループ '他' は寄せ集めのため、同系統扱いにはしない。
     position指定時は、まずその枠（複数指定時はいずれか）で使われた実績があるレシピに絞って
-    候補を探し、見つからなければ枠を問わず候補を探す（フォールバック）。"""
+    候補を探し、見つからなければ枠を問わず候補を探す（フォールバック）。
+    avoid_with指定時は、その中でも「同じ食事の他レシピと食材/大豆豆腐系が重複しない」候補を
+    優先し、見つからなければ重複を許容してでも候補を探す（フォールバック。ユーザー報告：
+    代替案候補自体が別ルールの新しい違反を作ってしまうのを防ぐため。2026/10）。"""
     hist = _dish_usage_history(data)
     if not hist:
         return None, False
@@ -1602,17 +1663,28 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
     # ここで_nfkcしてから引き比べないと、全角文字を含むレシピ名でほぼ一致しなくなる。
     cand_sets = [[n for n in base_cands if positions.get(_nfkc(n), set()) & allowed_pos]] if position else []
     cand_sets.append(base_cands)  # フォールバック：枠を問わない全候補
-    for cands in cand_sets:
-        if not cands:
-            continue
+
+    def _try(cands):
         if group and group != '他':
             same = [n for n in cands if cm.group_from_name(n) == group]
             pick = _pick_least_recent(same, hist, date, spread=data.suggested)
             if pick:
                 return pick, True
         pick = _pick_least_recent(cands, hist, date, spread=data.suggested)
+        return (pick, False) if pick else (None, False)
+
+    for cands in cand_sets:
+        if not cands:
+            continue
+        if avoid_with:
+            safe = [n for n in cands if not _conflicts_with_others(data, n, avoid_with)]
+            if safe:
+                pick, same = _try(safe)
+                if pick:
+                    return pick, same
+        pick, same = _try(cands)
         if pick:
-            return pick, False
+            return pick, same
     return None, False
 
 
@@ -1686,7 +1758,7 @@ def _flexible_veg_names(data):
     return data._flex_veg
 
 
-def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), position=None):
+def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), position=None, avoid_with=None):
     """No.21用：禁止食材・調味料に該当したメニューの代替え案を『レシピ（メニュー）名』で返す。
     ユーザー指定により、調味料（タレ/ソース/〜の素）が禁止対象の場合も、調味料の差し替えでは
     なくレシピごと差し替える案を出す。
@@ -1694,7 +1766,10 @@ def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), positi
     優先し、その日時点で最も長く使われていないものを選ぶ。
     position: 違反した当日・その枠（メイン/サブ/副菜1/副菜2/サラダ）を渡すと、同じ枠で
     使われた実績のあるレシピに候補を絞る（ユーザー指定：副菜の違反にサブ/メインの候補、
-    あるいはその逆が出てしまうのを防ぐ。見つからなければ枠を問わずフォールバックする）。"""
+    あるいはその逆が出てしまうのを防ぐ。見つからなければ枠を問わずフォールバックする）。
+    avoid_with: 同じ食事（昼/夜）に既にある他のレシピ名の集合を渡すと、それらと食材/
+    大豆豆腐系が重複する候補をまず避けて探す（ユーザー報告：差し替え候補自体が同じ食事内の
+    他レシピと食材被り・大豆系重複という新しい違反を作ってしまうケースがあった。2026/10）。"""
     words = [w for w in (list(ng_words) or NG_WORDS)]
 
     def _safe(n):
@@ -1709,7 +1784,7 @@ def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), positi
     base = recipe_name or prod_name or ''
     group = cm.group_from_name(base)
     cand, same_group = _recipe_replacement2(data, date, ok=_safe, group=group, exclude={base},
-                                             position=position)
+                                             position=position, avoid_with=avoid_with)
     if cand and same_group:
         return f'同系統（{group}）の「{cand[:26]}」に差し替え'
     if cand:
@@ -2190,13 +2265,18 @@ def check_rule10(data, min_gap_days=8):
             gap = (d - prev_d).days
             if 0 < gap < min_gap_days:
                 ng_names = _ng_recipe_names(data)
+                # 候補が、同じ食事（昼/夜）の他のレシピと食材被り・大豆豆腐系重複という
+                # 新しい違反を作ってしまわないよう、他レシピの集合を渡す（ユーザー報告・2026/10）
+                others = raw_dish_names_slot(data, d, slot) - {recipe}
 
-                def _best_candidate(restrict_pos):
+                def _best_candidate(restrict_pos, restrict_dup):
                     best_key, best_gap = None, -1
                     for k2, dates2 in key_dates.items():
                         if k2 == key or key_recipe.get(k2) in ng_names:
                             continue
                         if restrict_pos and pos not in key_pos.get(k2, set()):
+                            continue
+                        if restrict_dup and _conflicts_with_others(data, key_recipe.get(k2), others):
                             continue
                         past = [dt for dt in dates2 if dt < d]
                         g2 = (d - past[-1]).days if past else 10 ** 6
@@ -2204,10 +2284,13 @@ def check_rule10(data, min_gap_days=8):
                             best_key, best_gap = k2, g2
                     return best_key
 
-                # まず違反した枠（例：サラダの違反ならサラダ）で使われた実績のある候補に絞って探し、
-                # 見つからなければ枠を問わずフォールバックする（ユーザー指定：
-                # 違反した料理と違う枠の代替案が出ないようにするため。他ルールと同じ方針）。
-                best_key = _best_candidate(restrict_pos=True) or _best_candidate(restrict_pos=False)
+                # まず違反した枠（例：サラダの違反ならサラダ）で使われた実績があり、かつ同じ食事の
+                # 他レシピと食材被り・大豆豆腐系重複もしない候補に絞って探し、見つからなければ
+                # 枠の制約→重複の制約の順に緩めてフォールバックする（ユーザー指定・2026/10）。
+                best_key = (_best_candidate(restrict_pos=True, restrict_dup=True)
+                            or _best_candidate(restrict_pos=True, restrict_dup=False)
+                            or _best_candidate(restrict_pos=False, restrict_dup=True)
+                            or _best_candidate(restrict_pos=False, restrict_dup=False))
                 suggestion = f'別の単一食材メニュー「{key_recipe[best_key][:18]}」に変更を検討' if best_key else '該当日か次回使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 10,
@@ -2359,6 +2442,44 @@ def raw_dish_names_slot(data, date, slot):
         if rn and '備品' not in rn:
             names.add(rn)
     return names
+
+
+def check_rule37(data):
+    """No.37: 1食内（昼/夜は別々）で大豆・豆腐系（SOY_KW）のレシピが複数使用される。
+    No.6は食材（商品名）単位の重複しか見ないため、商品は違うが系統が同じ大豆・豆腐系の
+    レシピが同じ食事で重複しても検出できなかった（ユーザー報告：
+    「豆乳と野菜の真丈」がある日に、差し替え候補として「花形豆腐の煮物」が出てしまった
+    等。2026/10）。cm.group_from_nameには豆腐系という分類が無いため、SOY_KW
+    （豆腐/がんも/おから/卯の花/豆乳/高野豆腐/厚揚げ/油揚げ/生揚げ/湯葉/大豆/納豆）を
+    レシピ名・使用商品名のいずれかに含むレシピを大豆・豆腐系とみなす（_recipe_is_soy）。
+    同じ食事に2品以上あれば違反とし、最後の1品を差し替え対象として提案する。
+    代替え案は、違反レシピと同じ枠の実績があり、かつ他の大豆・豆腐系レシピとも
+    重複しない候補に絞って探す（他ルールと同じフォールバック方針）。"""
+    dr = data.date_range
+    viol = []
+    for d in dr:
+        for slot in ('昼', '夜'):
+            names = raw_dish_names_slot(data, d, slot)
+            soy_names = sorted(n for n in names if _recipe_is_soy(data, n))
+            if len(soy_names) < 2:
+                continue
+            victim = soy_names[-1]
+            # avoid_withは大豆系の他レシピだけでなく、その日の食事に既にある全レシピを渡す
+            # （候補として、既にその食事にある別の料理をそのまま出してしまわないようにするため）
+            others = names - {victim}
+            pos = _pos_on(data, d, slot, victim)
+            cand = _recipe_replacement(
+                data, d, ok=lambda n: not _recipe_is_soy(data, n),
+                position=pos, avoid_with=others)
+            suggestion = f'「{victim[:18]}」を「{cand[:22]}」等、大豆・豆腐系以外のメニューに変更' if cand \
+                else 'いずれかを大豆・豆腐系以外のメニューに変更'
+            viol.append({
+                '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 37,
+                'ルール': '1食内で大豆・豆腐系のレシピが複数使用',
+                '該当箇所': f'[{slot}] ' + ' / '.join(n[:20] for n in soy_names),
+                '理由': f'大豆・豆腐系（SOY_KW）が{len(soy_names)}レシピで重複', '修正提案': suggestion, '重要度': '中',
+            })
+    return pd.DataFrame(viol)
 
 
 def check_rule7(data):
@@ -2858,6 +2979,9 @@ def check_rule21(data):
                 hit = sub[ids_num.isin(data.ng_product_ids)]
                 for recipe, grp in hit.groupby('レシピ名', sort=False):
                     prods = list(dict.fromkeys(grp['商品名'].astype(str).tolist()))[:3]
+                    # 差し替え候補が、同じ食事（昼/夜）の他のレシピと食材被り・大豆豆腐系重複という
+                    # 新しい違反を作ってしまわないよう、他レシピの集合を渡す（ユーザー報告・2026/10）
+                    others = raw_dish_names_slot(data, d, slot) - {str(recipe)}
                     viol.append({
                         '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 21,
                         'ルール': '禁止食材・調味料の使用（禁止食材マスタ照合）',
@@ -2865,7 +2989,8 @@ def check_rule21(data):
                         '理由': '「禁止食材・調味料該当」シート登録商品を使用',
                         '修正提案': _ng_replacement(data, prods[0] if prods else None, d,
                                                     recipe_name=str(recipe),
-                                                    position=_pos_on(data, d, slot, recipe)),
+                                                    position=_pos_on(data, d, slot, recipe),
+                                                    avoid_with=others),
                         '重要度': '高',
                     })
         return pd.DataFrame(viol)
@@ -2900,9 +3025,11 @@ def check_rule21(data):
                         vdate = pd.Timestamp(year=base_year, month=int(m), day=int(d))
                     except ValueError:
                         vdate = None
+                others = (raw_dish_names_slot(data, vdate, label) - {str(recipe)}) if vdate is not None else set()
                 sug = _ng_replacement(data, matched_prods[0] if matched_prods else None, vdate,
                                        recipe_name=str(recipe), ng_words=matched_words,
-                                       position=_pos_on(data, vdate, label, recipe)) \
+                                       position=_pos_on(data, vdate, label, recipe),
+                                       avoid_with=others) \
                     if vdate is not None else '代替食材/調味料に変更'
                 viol.append({
                     '日付': f'{m}/{d}', '曜日': label, 'No': 21, 'ルール': '禁止食材・調味料の使用（キーワード判定・参考）',
@@ -3347,6 +3474,7 @@ ALL_RULES = [
     ('No.30 野菜使用間隔（FDメニュールール）', check_rule30),
     ('No.31 マッシュ系同日重複', check_rule31),
     ('No.32 商品枠クオータ（26年12月商品枠シート）', check_rule32),
+    ('No.37 1食内で大豆・豆腐系レシピが複数使用', check_rule37),
 ]
 
 
@@ -3408,6 +3536,7 @@ RULE_NAME_JP = {
     25: 'かぼちゃ週1回・同曜日4週間', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★平日夜クオータ',
     28: '本日の魚料理は平日の夜', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
     31: 'マッシュ系同日重複', 32: '商品枠クオータ（12月商品枠シート）', 36: 'コロッケとクリームコロッケ',
+    37: '1食内で大豆・豆腐系レシピが複数使用',
 }
 
 
