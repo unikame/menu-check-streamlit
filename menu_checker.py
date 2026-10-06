@@ -34,7 +34,8 @@
   No.7  大豆系は半日空ける（同じ日の昼と夜の両方に大豆系＝約6時間でNG。
         夜→翌日昼は対象外。同じ食事内の複数使用はNo.7では見ず、No.37で別途違反にする）
   No.9  野菜マスタの「色」が同じものの2日連続（昼夜別・基礎色/定番食材は除外）
-  No.10 単一食材のみの副菜/サラダを1週間空けず再使用
+  No.10 単一食材のみの副菜/サラダを1週間空けず再使用（ポテサラ・マカサラは例外：同じ週に同じ方が2回／
+        月全体の並びが交互になっていなければ違反。週をまたいで確認）
   No.11 自然解凍品が1食に0品
   No.12 当日揚げが3品超（当日揚げレシピIDマスタ照合）
   No.14 栄養素の月平均（「N月栄養価」シート優先。夜はデータ未入手のため昼のみ）
@@ -2321,6 +2322,55 @@ def check_rule9(data):
     return pd.DataFrame(viol)
 
 
+# No.10の例外：ポテトサラダ・マカロニサラダは『8日空ける』ではなく、別ルールで判定する
+# （ユーザー確認済み・2026/10。担当者回答：1週間で1セット（ポテサラ・マカサラ）はOK）。
+#   ①同じ週（月〜日）の中で同じ方が2回出たら違反
+#   ②月全体を日付順（同日は昼→夜）に並べて、ポテサラ→マカサラ→ポテサラ→…と交互になっていなければ違反
+#     （交互かどうかは週をまたいで確認する。最初の1回はどちらからでもよい）
+# 商品IDで判定する（商品名は変わることがあるため）。
+PM_SALAD_IDS = {2001583: 'ポテトサラダ', 2001584: 'マカロニサラダ'}
+
+
+def _check_potato_macaroni_alternation(pm_entries):
+    """pm_entries: [(date, slot, pos, recipe, prod, kind), ...]（kindは'ポテトサラダ'/'マカロニサラダ'）。
+    戻り値：違反行(dict)のリスト。"""
+    pos_idx = {p: i for i, p in enumerate(POS_ORDER_5)}
+    seq = sorted(pm_entries, key=lambda x: (x[0], x[1] != '昼', pos_idx.get(x[2], 9)))
+    out = []
+    week_seen = {}   # (週の月曜, kind) -> 直近のentry
+    prev = None
+    last_of_kind = {}
+    for ent in seq:
+        d, slot, pos, recipe, prod, kind = ent
+        monday = d - datetime.timedelta(days=d.weekday())
+        reasons = []
+        if prev is not None and prev[5] == kind:
+            reasons.append(f'前回（{prev[0].strftime("%-m/%-d")}{prev[1]}）も{kind}で、ポテサラ・マカサラが交互になっていない')
+        wk = (monday, kind)
+        if wk in week_seen:
+            w = week_seen[wk]
+            reasons.append(f'同じ週（{monday.strftime("%-m/%-d")}〜）の中で{kind}が2回目（前回{w[0].strftime("%-m/%-d")}{w[1]}）')
+        if reasons:
+            other = 'マカロニサラダ' if kind == 'ポテトサラダ' else 'ポテトサラダ'
+            other_recipe = last_of_kind.get(other)
+            if prev is not None and prev[5] == kind:
+                sug = (f'交互になるよう「{other_recipe[:18]}」に変更、または前後の並びを入れ替える'
+                       if other_recipe else f'交互になるよう{other}に変更、または前後の並びを入れ替える')
+            else:
+                sug = '同じ週の2回目のため、翌週に移す、または別のサラダに変更'
+            ref = prev if prev is not None else ent
+            out.append({
+                '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 10,
+                'ルール': 'ポテトサラダ・マカロニサラダが交互になっていない／同じ週に同じ方が重複',
+                '該当箇所': f'{slot}{pos}:{recipe[:18]}（食材:{prod[:16]}）← 前回 {ref[0].strftime("%-m/%-d")} {ref[1]}{ref[2]}:{ref[3][:16]}',
+                '理由': '／'.join(reasons), '修正提案': sug, '重要度': '低',
+            })
+        week_seen[wk] = ent
+        prev = ent
+        last_of_kind[kind] = recipe
+    return out
+
+
 def check_rule10(data, min_gap_days=8):
     """No.10: 同一食材のみで構成したメニュー（副菜・サラダ）は、味付けを変えても
     1週間以上空けて使用する。day_csv（商品ID紐付けCSV）が必要（No.1と同じ仕組みを流用）。
@@ -2333,6 +2383,7 @@ def check_rule10(data, min_gap_days=8):
     if not day_csv or not data.rows:
         return pd.DataFrame()
     entries = []
+    pm_entries = []   # ポテサラ・マカサラ（8日ルールの対象外・別ルールで判定）
     seen_days = sorted(set((d, slot) for (d, wd, slot, pos, name) in data.rows))
     for d, slot in seen_days:
         df = day_csv.get((d.month, slot))
@@ -2353,6 +2404,11 @@ def check_rule10(data, min_gap_days=8):
                 prods.append(prod)
             uniq = list(dict.fromkeys(prods))
             if len(uniq) == 1:
+                pid_s = pd.to_numeric(sub[sub['商品名'].astype(str) == uniq[0]]['商品ID'], errors='coerce').dropna()
+                pm_kind = next((PM_SALAD_IDS[int(x)] for x in pid_s if int(x) in PM_SALAD_IDS), None)
+                if pm_kind is not None:
+                    pm_entries.append((d, slot, pos_label, recipe, uniq[0], pm_kind))
+                    continue
                 key = cm.norm_recipe(uniq[0]) or uniq[0]
                 entries.append((d, slot, pos_label, recipe, key, uniq[0]))
     entries.sort(key=lambda x: x[0])
@@ -2411,6 +2467,7 @@ def check_rule10(data, min_gap_days=8):
                     '理由': f'{gap}日しか空けず再使用（要{min_gap_days}日以上）', '修正提案': suggestion, '重要度': '低',
                 })
         last_seen[key] = (d, slot, pos, recipe, prod)
+    viol.extend(_check_potato_macaroni_alternation(pm_entries))
     return pd.DataFrame(viol)
 
 
