@@ -2229,9 +2229,14 @@ def check_rule8(data):
                     frecipe = str(hit['レシピ名'].iloc[0])
                     srecipe = str(sr['レシピ名'])
                     # 代替え案はレシピ名で出す：その素材（kw）を含まない別メニュー
+                    # 差し替え対象（調味料を使っている側のレシピ）と同じ枠で使われた実績があるメニューに
+                    # 絞り、同じ食事の他レシピとの食材被り・固形3種も避ける（ユーザー指定・2026/10）
                     cand = _recipe_replacement(
                         data, d, ok=lambda n: not _recipe_has(data, n, kw),
-                        exclude={frecipe, srecipe})
+                        exclude={frecipe, srecipe},
+                        position=_pos_on(data, d, slot, srecipe),
+                        avoid_with=raw_dish_names_slot(data, d, slot) - {srecipe},
+                        meal=(slot, srecipe))
                     suggestion = f'「{srecipe[:16]}」を「{cand[:24]}」等、{kw}を含まないメニューに差し替え' if cand \
                         else f'どちらかを{kw}を含まないメニューに変更'
                     viol.append({
