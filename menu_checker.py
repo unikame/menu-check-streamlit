@@ -1252,7 +1252,7 @@ def _min_gap_check(data, match_fn, min_gap, rule_no, rule_name, severity='中'):
         gap = (d1 - d0).days
         if gap <= min_gap:
             pool = _filtered_dish_hist(data, match_fn)
-            cand = _pick_least_recent(pool.keys(), pool, d1, exclude={h1[0]}, spread=data.suggested)
+            cand = _pick_least_recent(pool.keys(), pool, d1, exclude={h1[0]}, spread=data.suggested, data=data)
             suggestion = f'代わりに「{cand[:20]}」等に変更' if cand else '使用日をずらす'
             viol.append({
                 '日付': d1.strftime('%-m/%-d'), '曜日': WD_JP[d1.weekday()], 'No': rule_no, 'ルール': rule_name,
@@ -1392,15 +1392,50 @@ def _days_since_last_use(hist, name, before_date):
     return (bd - uses[-1]).days
 
 
-def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None):
+def _day_recipe_names(data, date):
+    """その日（昼・夜の両方）に実際に使われているレシピ名の集合（生の表記とNFKC正規化後の両方。
+    キャッシュ有）。代替え案の候補から『同じ日の別の食事に既に入っているレシピ』を外すために使う。
+    データ源は、使用食材シート由来（raw_dish_names）・食材CSV（day_csv）・data.rows の全て。"""
+    if date is None:
+        return set()
+    cache = getattr(data, '_day_names_cache', None)
+    if cache is None:
+        cache = {}
+        data._day_names_cache = cache
+    key = (date.month, date.day)
+    if key in cache:
+        return cache[key]
+    names = set(raw_dish_names(data, date))
+    for slot in ('昼', '夜'):
+        df = data.day_csv.get((date.month, slot))
+        if df is None:
+            continue
+        sub = df[(df['md'] == key) & (~df['レシピ名'].astype(str).str.contains('備品', na=False))]
+        names |= set(sub['レシピ名'].astype(str))
+    dk = _date_key(date)
+    for (dd, _wd, _ss, _pos, nm) in data.rows:
+        if _date_key(dd) == dk:
+            names.add(nm)
+    names |= {_nfkc(n) for n in names}
+    cache[key] = names
+    return names
+
+
+def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None, data=None):
     """candidates（商品名/レシピ名のiterable）の中から、before_date時点で最も長く
     使われていない（＝直近未使用の）ものを選んで返す。excludeに含まれるものは除外。
     spread に Counter を渡すと『今回の実行で既に提案した回数』が少ないものを優先し、
     同じ候補が何度も提案されるのを防ぐ（提案の分散）。選んだ候補は自動でカウントする。
-    優先順位：提案済み回数の少なさ → 直近未使用の長さ。"""
+    優先順位：提案済み回数の少なさ → 直近未使用の長さ。
+    data を渡すと、before_date と同じ日（昼・夜どちらも）に既に使われているレシピは
+    候補から必ず外す（ユーザー報告・2026/10：同日の別の食事に既に入っているレシピと
+    同じものを代替え案に出してしまう問題の対策）。"""
     best, best_key = None, None
+    today = _day_recipe_names(data, before_date) if data is not None else ()
     for c in candidates:
         if c in exclude:
+            continue
+        if today and (c in today or _nfkc(c) in today):
             continue
         gap = _days_since_last_use(hist, c, before_date)
         key = ((spread.get(c, 0) if spread is not None else 0), -gap)
@@ -1652,8 +1687,11 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
     if not hist:
         return None, False
     # 禁止食材を使っているレシピは、どのルールの代替え案にも出さない
-    ex = set(exclude) | _ng_recipe_names(data)
-    base_cands = [n for n in hist if n not in ex and (ok is None or ok(n))]
+    # 同じ日（昼・夜どちらも）に既に使われているレシピも、どのルールの代替え案にも出さない
+    # （ユーザー報告・2026/10：同日の別の食事に既に同じレシピが入っていた）
+    today = _day_recipe_names(data, date)
+    ex = set(exclude) | _ng_recipe_names(data) | today
+    base_cands = [n for n in hist if n not in ex and _nfkc(n) not in today and (ok is None or ok(n))]
     if not base_cands:
         return None, False
     positions = _dish_positions(data) if position else {}
@@ -2002,7 +2040,7 @@ def check_rule3_5(data):
                 continue
             pool = [n for n in dish_hist if cm.group_from_name(n) != gm and n not in ng_names]
             sub_pool = [n for n in pool if 'サブ' in dish_pos.get(n, ())]
-            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
+            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested, data=data)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v3.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 3,
@@ -2014,7 +2052,7 @@ def check_rule3_5(data):
             pool = [n for n in dish_hist
                     if cm.group_from_name(n) not in ('鶏肉系', '豚肉系', '牛肉系') and n not in ng_names]
             sub_pool = [n for n in pool if 'サブ' in dish_pos.get(n, ())]
-            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested)
+            cand = _pick_least_recent(sub_pool or pool, dish_hist, d, exclude={nm_m, nm_s}, spread=data.suggested, data=data)
             suggestion = f'サブを「{cand[:18]}」等、別系統に変更' if cand else 'メインかサブの系統を変える'
             v5.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 5,
@@ -2050,7 +2088,7 @@ def check_rule4_36(data):
                 candidates = [n2 for n2 in dish_hist if 'コロッケ' in n2 and
                               n2 not in ng_names and
                               (('クリーム' in n2) == (cat == 'クリーム'))]
-                cand = _pick_least_recent(candidates, dish_hist, d, exclude={n}, spread=data.suggested)
+                cand = _pick_least_recent(candidates, dish_hist, d, exclude={n}, spread=data.suggested, data=data)
                 suggestion = f'別のコロッケ「{cand[:20]}」に変更を検討' if cand else '使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 4,
@@ -2268,11 +2306,14 @@ def check_rule10(data, min_gap_days=8):
                 # 候補が、同じ食事（昼/夜）の他のレシピと食材被り・大豆豆腐系重複という
                 # 新しい違反を作ってしまわないよう、他レシピの集合を渡す（ユーザー報告・2026/10）
                 others = raw_dish_names_slot(data, d, slot) - {recipe}
+                # 同じ日（昼・夜どちらも）に既に使われているレシピは候補から必ず外す（ユーザー報告・2026/10）
+                today_names = _day_recipe_names(data, d)
 
                 def _best_candidate(restrict_pos, restrict_dup):
                     best_key, best_gap = None, -1
                     for k2, dates2 in key_dates.items():
-                        if k2 == key or key_recipe.get(k2) in ng_names:
+                        kr = key_recipe.get(k2)
+                        if k2 == key or kr in ng_names or kr in today_names or _nfkc(kr) in today_names:
                             continue
                         if restrict_pos and pos not in key_pos.get(k2, set()):
                             continue
@@ -2533,7 +2574,7 @@ def check_rule12(data):
             if len(fried) >= 4:
                 names = '/'.join(fried['レシピ名'].astype(str).str[:12].tolist())
                 nonfried_hist = _filtered_dish_hist(data, lambda n: n in _nonfried_dish_names(data))
-                cand = _pick_least_recent(nonfried_hist.keys(), nonfried_hist, d, spread=data.suggested)
+                cand = _pick_least_recent(nonfried_hist.keys(), nonfried_hist, d, spread=data.suggested, data=data)
                 suggestion = f'いずれか1品を「{cand[:18]}」等の非揚げ物に変更' if cand else '1品を煮/和え等に'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 12,
@@ -3065,7 +3106,7 @@ def check_rule23(data):
                     seen.add(key)
                     safe_hist = _filtered_dish_hist(
                         data, lambda nm: not any(k in nm for k in EAT_NG))
-                    cand = _pick_least_recent(safe_hist.keys(), safe_hist, d, spread=data.suggested)
+                    cand = _pick_least_recent(safe_hist.keys(), safe_hist, d, spread=data.suggested, data=data)
                     sug = f'「{cand[:20]}」等、食べにくさ該当の無いメニューに差し替え（最終判断は商品開発部）' \
                         if cand else '商品開発部のたべやすさ基準で再確認'
                     viol.append({
@@ -3108,7 +3149,7 @@ def check_rule25(data):
             pd0, pn0 = by_weekday[wd]
             gap = (d - pd0).days
             if gap <= 28:
-                cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d, exclude={n}, spread=data.suggested)
+                cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d, exclude={n}, spread=data.suggested, data=data)
                 suggestion = f'この曜日は「{cand[:18]}」等に変更、または間隔を空ける' if cand else '曜日をずらすか間隔を空ける'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[wd], 'No': 25,
@@ -3363,7 +3404,7 @@ def check_rule31(data):
         mash = sorted(n for n in names if 'マッシュ' in n)
         if len(mash) >= 2:
             nomash_hist = _filtered_dish_hist(data, lambda nm: 'マッシュ' not in nm)
-            cand = _pick_least_recent(nomash_hist.keys(), nomash_hist, d, spread=data.suggested)
+            cand = _pick_least_recent(nomash_hist.keys(), nomash_hist, d, spread=data.suggested, data=data)
             sug = f'一方を「{cand[:20]}」等に差し替え、またはメニュー名から「マッシュ」を外す' \
                 if cand else '一方を別の調理法名に'
             viol.append({
