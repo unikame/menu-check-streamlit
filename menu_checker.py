@@ -48,7 +48,7 @@
   No.21 禁止食材・調味料（禁止食材マスタ照合／無ければキーワード判定）
   No.22 魚メニュー3日に1回  No.24 白和えの分類
   No.25 かぼちゃ週1回・同曜日4週間  No.26 かにのふわふわ5日以上
-  No.27 FD専用魚商材の平日縛り＋★商材の平日夜クオータ（FDメニュールール準拠）
+  No.27 FD専用魚商材の平日縛り＋★商材の月内使用回数クオータ（FDメニュールール準拠。平日/土日祝・昼/夜すべて数え、同日の昼夜は2回）
   No.28 本日の魚料理は平日夜  No.29 おまかせ月2回以上
   No.30 野菜の使用間隔（FDメニュールール（野菜）シート準拠・商品ID単位。
         メニュー名記載時は必要日数2倍、芋類/かぼちゃは昼夜連続OK）
@@ -240,7 +240,7 @@ VEG_TIER_MASTER = [
 # No.27用: 「FDメニュールール」シート（★マーク商品のうち備考欄に「平日夜に◯回は入れる」という
 # 明示クオータがある商品のみ・ユーザー確認済みスコープ）。
 # (https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY/edit?gid=1597935310)
-# 各要素: (商品ID or None, 名寄せキーワード, 月内の平日夜 最低使用回数, 枠)
+# 各要素: (商品ID or None, 名寄せキーワード, 月内の最低使用回数（平日/土日祝・昼/夜すべて数える。同日の昼夜は2回）, 枠)
 FD_WEEKDAY_NIGHT_QUOTA = [
     (3002318, '7品目具材の豆腐ハンバーグ', 2, 'サブ'),
     (3001677, 'ピーマン肉詰めフライ', 1, 'メイン'),
@@ -3227,46 +3227,55 @@ def check_rule27(data):
                         })
     # ★マーク商品の「平日夜に◯回は入れる」月内最低回数チェック（月単位の集計）。
     # 夜の食材データが無い月は、使用回数が常に0となり全★商材が誤検出になるためスキップする。
+    # 昼・夜どちらも対象（ユーザー確認済み・2026/10：平日/土日祝、昼/夜を問わず月内の使用を
+    # すべて数える。同じ日に昼と夜の両方で使えば2回と数える）。
+    # 昼夜どちらのデータも無い月は使用回数が常に0となり誤検出になるためスキップする。
+    # 片方だけ無い月は、ある方だけで数えるため判定はするが、その旨を注記する。
     quota_months = []
     for mth in data.months:
+        sl = data.shoku.get(mth)
         sn = data.shoku_night.get(mth)
-        if sn is None or not len(sn):
+        has_l = sl is not None and len(sl) > 0
+        has_n = sn is not None and len(sn) > 0
+        if not has_l and not has_n:
             data.warnings.append(
-                f'{mth}月：夜の食材データが無いため、No.27の★商材「平日夜クオータ」判定をスキップしました'
-                '（夜のCSVを読み込むと判定できます）')
-        else:
-            quota_months.append(mth)
+                f'{mth}月：昼夜どちらの食材データも無いため、No.27の★商材クオータ判定をスキップしました')
+            continue
+        quota_months.append(mth)
+        if has_l != has_n:
+            data.warnings.append(
+                f'{mth}月：{"夜" if has_l else "昼"}の食材データが無いため、No.27の★商材クオータは'
+                f'{"昼" if has_l else "夜"}のみの使用回数で判定しています（不足分は誤検出の可能性があります）')
     for pid, kw, min_count, waku in FD_WEEKDAY_NIGHT_QUOTA:
         by_month = {}
         for d in dr:
-            if d.weekday() >= 5:
-                continue  # 平日のみ対象
             month = d.month
-            shoku = data.shoku_night.get(month)
-            if shoku is None:
-                continue
             md = (d.month, d.day)
-            sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
-            if not len(sub):
-                continue
-            if pid is not None:
-                hit = (pd.to_numeric(sub['商品ID'], errors='coerce') == pid).any()
-            else:
-                hit = sub['商品名'].astype(str).str.contains(kw, na=False).any() or \
-                    sub['レシピ名'].astype(str).str.contains(kw, na=False).any()
-            if hit:
-                by_month.setdefault(month, set()).add(d)
+            for slot_label, shoku in (('昼', data.shoku.get(month)), ('夜', data.shoku_night.get(month))):
+                if shoku is None:
+                    continue
+                sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
+                if not len(sub):
+                    continue
+                if pid is not None:
+                    hit = (pd.to_numeric(sub['商品ID'], errors='coerce') == pid).any()
+                else:
+                    hit = sub['商品名'].astype(str).str.contains(kw, na=False).any() or \
+                        sub['レシピ名'].astype(str).str.contains(kw, na=False).any()
+                if hit:
+                    # 同じ日の昼と夜は別々に1回ずつ数える（(日付, 昼夜)を1回分とする）
+                    by_month.setdefault(month, set()).add((d, slot_label))
         for month in quota_months:
-            used = sorted(by_month.get(month, set()))
+            used = sorted(by_month.get(month, set()), key=lambda x: (x[0], x[1] != '昼'))
             cnt = len(used)
             if cnt < min_count:
-                used_txt = '／'.join(f'{u.strftime("%-m/%-d")}({WD_JP[u.weekday()]})' for u in used) or 'なし'
+                used_txt = '／'.join(f'{u.strftime("%-m/%-d")}({WD_JP[u.weekday()]}){sl}' for u, sl in used) or 'なし'
                 viol.append({
-                    '日付': f'{month}月(月次)', '曜日': '夜', 'No': 27,
-                    'ルール': f'★商材の平日夜クオータ未達：{waku}「{kw}」',
-                    '該当箇所': f'{month}月の平日夜 全体（使用日: {used_txt}）',
-                    '理由': f'平日夜の使用が{cnt}回のみ（月{min_count}回以上必要）※日単位ではなく月単位の集計',
-                    '修正提案': f'平日夜の枠に「{kw}」をあと{min_count - cnt}回追加する', '重要度': '中（FDメニュールール準拠）',
+                    '日付': f'{month}月(月次)', '曜日': '昼夜', 'No': 27,
+                    'ルール': f'★商材の月内使用回数クオータ未達：{waku}「{kw}」',
+                    '該当箇所': f'{month}月 全体（平日・土日祝、昼・夜すべて対象。使用: {used_txt}）',
+                    '理由': f'月内の使用が{cnt}回のみ（月{min_count}回以上必要。昼と夜は別々に数える）※日単位ではなく月単位の集計',
+                    '修正提案': f'月内のいずれかの昼または夜の枠に「{kw}」をあと{min_count - cnt}回追加する', '重要度': '中（FDメニュールール準拠）',
                 })
     return pd.DataFrame(viol)
 
@@ -3533,7 +3542,7 @@ RULE_NAME_JP = {
     16: '固形は2種まで', 17: '赤・黄・緑を使用（黄は常にクリア）', 18: '1食の重量下限',
     19: '同じ調味料のみの味付け禁止', 20: 'だし味付け1品以上', 21: '禁止食材・調味料',
     22: '魚メニュー3日に1回', 23: '食べにくさチェック', 24: '白和えの分類',
-    25: 'かぼちゃ週1回・同曜日4週間', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★平日夜クオータ',
+    25: 'かぼちゃ週1回・同曜日4週間', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★月内使用回数クオータ',
     28: '本日の魚料理は平日の夜', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
     31: 'マッシュ系同日重複', 32: '商品枠クオータ（12月商品枠シート）', 36: 'コロッケとクリームコロッケ',
     37: '1食内で大豆・豆腐系レシピが複数使用',
