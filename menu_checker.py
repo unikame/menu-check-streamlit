@@ -240,10 +240,11 @@ VEG_TIER_MASTER = [
 # No.27用: 「FDメニュールール」シート（★マーク商品のうち備考欄に「平日夜に◯回は入れる」という
 # 明示クオータがある商品のみ・ユーザー確認済みスコープ）。
 # (https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY/edit?gid=1597935310)
+# 商品IDは1つの整数のほか、同じ商品で複数のIDが使われている場合はタプルで複数指定できる（_pid_set参照）。
 # 各要素: (商品ID or None, 名寄せキーワード, 月内の最低使用回数（平日/土日祝・昼/夜すべて数える。同日の昼夜は2回）, 枠)
 FD_WEEKDAY_NIGHT_QUOTA = [
     (3002318, '7品目具材の豆腐ハンバーグ', 2, 'サブ'),
-    (3001677, 'ピーマン肉詰めフライ', 1, 'メイン'),
+    ((3001677, 3000183), 'ピーマン肉詰めフライ', 1, 'メイン'),  # 3000183=DKピーマン肉詰めフライ(大京食品)。12月CSVで実際に使われているID
     (3002409, '三元豚ロｰストンカツ', 2, 'メイン'),
     (3001155, 'チキン八幡巻', 2, 'メイン'),
     (None, '魚弁当', 1, 'サブ'),
@@ -267,7 +268,7 @@ FD_WEEKDAY_NIGHT_QUOTA = [
 # 各要素: (商品ID, 商材名, min_count(月内下限。Noneなら無し), max_count(月内上限。Noneなら無し))
 PRODUCT_FRAME_DEC2026_QUOTA = [
     (3002409, 'ケイハン 三元豚ロｰストンカツ', 2, None),
-    (3001677, 'ピーマン肉詰めフライ', 2, None),
+    ((3001677, 3000183), 'ピーマン肉詰めフライ', 2, None),  # 3000183=DKピーマン肉詰めフライ(大京食品)。12月CSVで実際に使われているID
     (3001155, 'チキン八幡巻', 2, None),
     (3002318, '7品目具材の豆腐ハンバーグ', 2, 2),
     (3001449, 'かにのふわふわ豆腐', 2, None),
@@ -1491,6 +1492,15 @@ def _dish_positions(data):
         out.setdefault(name, set()).add(pos)
     data._dish_pos = out
     return out
+
+
+def _pid_set(pid):
+    """商品ID（整数、または同一商品の複数IDを並べたタプル/リスト/集合）を整数の集合にする。
+    ユーザー報告・2026/10：ピーマン肉詰めフライは登録ID(3001677)と実際に使われているID(3000183)が
+    異なり、使用回数が0回と誤判定されていたため、1商品に複数のIDを登録できるようにした。"""
+    if isinstance(pid, (tuple, list, set, frozenset)):
+        return set(pid)
+    return {pid}
 
 
 def _date_key(d):
@@ -3313,7 +3323,7 @@ def check_rule27(data):
                 if not len(sub):
                     continue
                 if pid is not None:
-                    hit = (pd.to_numeric(sub['商品ID'], errors='coerce') == pid).any()
+                    hit = pd.to_numeric(sub['商品ID'], errors='coerce').isin(_pid_set(pid)).any()
                 else:
                     hit = sub['商品名'].astype(str).str.contains(kw, na=False).any() or \
                         sub['レシピ名'].astype(str).str.contains(kw, na=False).any()
@@ -3460,7 +3470,7 @@ def check_rule32(data):
                 sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
                 if not len(sub):
                     continue
-                hit = (pd.to_numeric(sub['商品ID'], errors='coerce') == pid).any()
+                hit = pd.to_numeric(sub['商品ID'], errors='coerce').isin(_pid_set(pid)).any()
                 if hit:
                     used.add((d, slot))
         used_sorted = sorted(used)
