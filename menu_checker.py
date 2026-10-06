@@ -1424,6 +1424,23 @@ def _day_recipe_names(data, date):
     return names
 
 
+CURRY_KW = 'カレー'   # 同日（昼夜またぎ・全枠）でカレーが被る候補を代替え案に出さない（ユーザー確認済み・2026/10）
+
+
+def _curry_blocked(data, date, cand, removed=()):
+    """candを代替え案に出すと、同じ日（昼・夜どちらも・全枠）にカレー系（レシピ名に「カレー」）が
+    2つになってしまうか。removed＝その差し替えで抜ける（差し替え対象の）レシピ名は数えない。
+    ユーザー確認済み（2026/10）：被りの範囲は昼夜またぎ、対象はとりあえず「カレー」だけ、枠は全部、
+    代替え案で避けるだけ（元のメニューの被りは違反にしない）。"""
+    if CURRY_KW not in _nfkc(cand):
+        return False
+    rm = set()
+    for r in removed:
+        rm.add(str(r))
+        rm.add(_nfkc(str(r)))
+    return any(CURRY_KW in n and n not in rm for n in _day_recipe_names(data, date))
+
+
 def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None, data=None):
     """candidates（商品名/レシピ名のiterable）の中から、before_date時点で最も長く
     使われていない（＝直近未使用の）ものを選んで返す。excludeに含まれるものは除外。
@@ -1439,6 +1456,8 @@ def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None, d
         if c in exclude:
             continue
         if today and (c in today or _nfkc(c) in today):
+            continue
+        if data is not None and _curry_blocked(data, before_date, c, exclude):
             continue
         gap = _days_since_last_use(hist, c, before_date)
         key = ((spread.get(c, 0) if spread is not None else 0), -gap)
@@ -1761,6 +1780,9 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
     if meal is not None:
         _ms, _mr = meal
         base_cands = [n for n in base_cands if not _would_exceed_solid(data, n, date, _ms, _mr)]
+    # 同じ日（昼夜またぎ）にカレーが被る候補は出さない（差し替えで抜けるレシピは数えない）
+    _removed = {meal[1]} if meal is not None else set()
+    base_cands = [n for n in base_cands if not _curry_blocked(data, date, n, _removed)]
     if not base_cands:
         return None, False
     positions = _dish_positions(data) if position else {}
@@ -2450,6 +2472,8 @@ def check_rule10(data, min_gap_days=8):
                         if restrict_dup and _conflicts_with_others(data, key_recipe.get(k2), others):
                             continue
                         if _would_exceed_solid(data, kr, d, slot, recipe):
+                            continue
+                        if _curry_blocked(data, d, kr, {recipe}):
                             continue
                         past = [dt for dt in dates2 if dt < d]
                         g2 = (d - past[-1]).days if past else 10 ** 6
