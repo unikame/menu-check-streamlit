@@ -39,6 +39,8 @@
   No.12 当日揚げが3品超（当日揚げレシピIDマスタ照合）
   No.14 栄養素の月平均（「N月栄養価」シート優先。夜はデータ未入手のため昼のみ）
   No.15 健康食材 週1回以上
+  No.16 メイン・サブメイン・副菜1のうち固形（食材CSVでそのレシピの先頭行のユニット名が「個」「切」）は
+        同じ食事内で2種まで（2026/10・定義はユーザー確認済み。違反時は副菜1を固形でないメニューに差し替える提案）
   No.17 1食で赤・黄・緑を使用（野菜マスタの色列・昼夜別。黄(卵焼き)は毎食入っている前提のため
         常にクリア済みとして扱う。赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんもも野菜マスタ未登録でも加味）
   No.18 1食の重量下限（M=212g・容器18.0g込みの総重量で判定。カップ重量は考慮しない。
@@ -63,7 +65,6 @@
   No.2  実装済みだがユーザー指示によりALL_RULESから除外中
   No.23 実装済みだがユーザー指示によりチェック対象外（ALL_RULESから除外中）
   No.13 盛付工程（工程データが無いためスキップ）
-  No.16 固形2種まで（判定基準となるマスタが未確定）
   No.33〜35（未着手）
 
 ■ NG時の代替え案
@@ -1663,7 +1664,59 @@ def _conflicts_with_others(data, cand, others):
     return False
 
 
-def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=None, avoid_with=None):
+SOLID_UNITS = {'個', '切'}   # No.16：先頭行のユニット名がこれなら『固形』（ユーザー確認済み・2026/10）
+SOLID_FRAME_POS = ('メイン', 'サブ', '副菜1')   # No.16の対象3枠（同じ食事内のみ。日またぎは見ない）
+SOLID_MAX = 2
+
+
+def _is_solid_unit(unit):
+    return _nfkc(str(unit).strip()) in SOLID_UNITS
+
+
+def _recipe_solid_map(data):
+    """レシピ名 -> 固形か（キャッシュ有）。食材CSV上でそのレシピの一番上の行のユニット名が
+    『個』『切』なら固形（No.16・ユーザー確認済み）。CSVに出てこないレシピ（過去メニュー履歴のみ）は含まれない
+    （＝固形かどうか不明。候補選びでは不明なものを固形とはみなさない）。"""
+    if getattr(data, '_solid_map', None) is not None:
+        return data._solid_map
+    out = {}
+    for df in data.day_csv.values():
+        if 'レシピ名' not in df.columns or 'ユニット名' not in df.columns:
+            continue
+        sub = df[~df['レシピ名'].astype(str).str.contains('備品', na=False)]
+        firsts = sub.drop_duplicates(subset='レシピ名', keep='first')
+        for rn, unit in zip(firsts['レシピ名'].astype(str), firsts['ユニット名']):
+            out.setdefault(rn, _is_solid_unit(unit))
+    data._solid_map = out
+    return out
+
+
+def _meal_solid_frame(data, d, slot):
+    """その食事のメイン/サブ/副菜1の [(枠, レシピ名, 固形か), ...]（No.16用）。"""
+    order = _day_recipe_order(data.day_csv, d.month, d.day, slot)
+    smap = _recipe_solid_map(data)
+    return [(pos, rn, smap.get(rn, False)) for pos, rn in zip(SOLID_FRAME_POS, order)]
+
+
+def _would_exceed_solid(data, cand, d, slot, replaced):
+    """replaced（その食事の中で差し替え対象になるレシピ）をcandに替えると、メイン/サブ/副菜1の
+    固形が3種になってしまうか（No.16・ユーザー指定：代替案がこのルールに反しないようにする）。
+    replacedが3枠の外（副菜2・サラダ等）なら、3枠の固形数は変わらないのでFalse。"""
+    if not slot or replaced is None or not data.day_csv:
+        return False
+    smap = _recipe_solid_map(data)
+    if not (smap.get(cand) or smap.get(str(cand))):
+        return False
+    frame = _meal_solid_frame(data, d, slot)
+    rk = _nfkc(str(replaced))
+    if not any(_nfkc(rn) == rk or _slot_key(rn) == _slot_key(replaced) for _p, rn, _s in frame):
+        return False
+    others_solid = sum(1 for _p, rn, sol in frame
+                       if sol and not (_nfkc(rn) == rk or _slot_key(rn) == _slot_key(replaced)))
+    return others_solid >= SOLID_MAX
+
+
+def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=None, avoid_with=None, meal=None):
     """レシピ（メニュー）単位の代替え案を1つ返す。候補が無ければ None。
     ・ok    : そのレシピ名を候補にしてよいか判定する関数（Noneなら全て可）
     ・group : 同系統（cm.group_from_name）を優先したい場合に指定
@@ -1675,16 +1728,18 @@ def _recipe_replacement(data, date, ok=None, group=None, exclude=(), position=No
       『不足分を補う/いずれかを差し替える』形のルールでは、メイン/サブではなく副菜1/副菜2/
       サラダ等の複数枠を許容範囲として渡す）。
       指定した枠の候補が見つからない場合は、枠を問わず候補を探す（提案なしより優先）。
+    ・meal: (slot('昼'/'夜'), 差し替え対象のレシピ名) を渡すと、その差し替えで同じ食事のメイン/サブ/副菜1の
+      固形（個・切）が3種になる候補を必ず除外する（No.16・ユーザー指定・2026/10）。
     ・avoid_with: 同じ食事（昼/夜）に既にある他のレシピ名の集合を渡すと、それらと食材が
       重複する候補・大豆豆腐系同士になる候補はまず避けて探す（_conflicts_with_others）。
       見つからなければ、重複を許容してでも候補を探す（提案なしより優先。フォールバック）。
     いずれも『その日時点で最も長く使われていないレシピ』を選ぶ。
     ユーザー指定により、代替え案は原則すべて商材名ではなくレシピ名で出す。"""
     return _recipe_replacement2(data, date, ok=ok, group=group, exclude=exclude,
-                                 position=position, avoid_with=avoid_with)[0]
+                                 position=position, avoid_with=avoid_with, meal=meal)[0]
 
 
-def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=None, avoid_with=None):
+def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=None, avoid_with=None, meal=None):
     """_recipe_replacement の (レシピ名, 同系統で見つかったか) を返す版。
     「同系統（◯◯）の…」という文言を出してよいかを呼び出し側が判断できるようにするため。
     主原料グループ '他' は寄せ集めのため、同系統扱いにはしない。
@@ -1702,6 +1757,9 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
     today = _day_recipe_names(data, date)
     ex = set(exclude) | _ng_recipe_names(data) | today
     base_cands = [n for n in hist if n not in ex and _nfkc(n) not in today and (ok is None or ok(n))]
+    if meal is not None:
+        _ms, _mr = meal
+        base_cands = [n for n in base_cands if not _would_exceed_solid(data, n, date, _ms, _mr)]
     if not base_cands:
         return None, False
     positions = _dish_positions(data) if position else {}
@@ -1806,7 +1864,7 @@ def _flexible_veg_names(data):
     return data._flex_veg
 
 
-def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), position=None, avoid_with=None):
+def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), position=None, avoid_with=None, meal=None):
     """No.21用：禁止食材・調味料に該当したメニューの代替え案を『レシピ（メニュー）名』で返す。
     ユーザー指定により、調味料（タレ/ソース/〜の素）が禁止対象の場合も、調味料の差し替えでは
     なくレシピごと差し替える案を出す。
@@ -1832,7 +1890,7 @@ def _ng_replacement(data, prod_name, date, recipe_name=None, ng_words=(), positi
     base = recipe_name or prod_name or ''
     group = cm.group_from_name(base)
     cand, same_group = _recipe_replacement2(data, date, ok=_safe, group=group, exclude={base},
-                                             position=position, avoid_with=avoid_with)
+                                             position=position, avoid_with=avoid_with, meal=meal)
     if cand and same_group:
         return f'同系統（{group}）の「{cand[:26]}」に差し替え'
     if cand:
@@ -1949,7 +2007,7 @@ def check_rule1(data):
                 # その商材を使っていないレシピ（ユーザー指定：メインの違反にはメインの候補を出す）
                 cand, same_group = _recipe_replacement2(
                     data, d, ok=lambda n: pname not in _recipe_products(data).get(n, ()),
-                    group=group, exclude={recipe, prev_recipe}, position=pos)
+                    group=group, exclude={recipe, prev_recipe}, position=pos, meal=(slot, recipe))
                 if cand and same_group:
                     suggestion = f'同系統（{group}）の「{cand[:26]}」に変更を検討'
                 elif cand:
@@ -2248,7 +2306,8 @@ def check_rule9(data):
                             cols |= veg_colors_for(p, data.veg_color_map)
                         return bool(cols) and _c not in cols
                     pos9 = _pos_on(data, d, slot, today_recipe.get(c))
-                    cand = _recipe_replacement(data, d, ok=_no_color, position=pos9)
+                    cand = _recipe_replacement(data, d, ok=_no_color, position=pos9,
+                                               meal=(slot, today_recipe.get(c)))
                     suggestion = f'「{cand[:26]}」等、{c}以外の色の野菜メニューに変更を検討' if cand \
                         else f'{c}以外の色の野菜メニューに変更'
                     viol.append({
@@ -2328,6 +2387,8 @@ def check_rule10(data, min_gap_days=8):
                         if restrict_pos and pos not in key_pos.get(k2, set()):
                             continue
                         if restrict_dup and _conflicts_with_others(data, key_recipe.get(k2), others):
+                            continue
+                        if _would_exceed_solid(data, kr, d, slot, recipe):
                             continue
                         past = [dt for dt in dates2 if dt < d]
                         g2 = (d - past[-1]).days if past else 10 ** 6
@@ -2521,7 +2582,7 @@ def check_rule37(data):
             pos = _pos_on(data, d, slot, victim)
             cand = _recipe_replacement(
                 data, d, ok=lambda n: not _recipe_is_soy(data, n),
-                position=pos, avoid_with=others)
+                position=pos, avoid_with=others, meal=(slot, victim))
             suggestion = f'「{victim[:18]}」を「{cand[:22]}」等、大豆・豆腐系以外のメニューに変更' if cand \
                 else 'いずれかを大豆・豆腐系以外のメニューに変更'
             viol.append({
@@ -2552,7 +2613,8 @@ def check_rule7(data):
         # 違反している夜側の料理（dinner[0]）と同じ枠のレシピに絞る（ユーザー指定：
         # ジャンル（メイン/サブ/副菜1/副菜2/サラダ）が違う代替案が出ないようにするため）
         pos7 = _pos_on(data, d, '夜', dinner[0])
-        cand = _recipe_replacement(data, d, ok=lambda n: not is_soy(n), exclude=set(dinner), position=pos7)
+        cand = _recipe_replacement(data, d, ok=lambda n: not is_soy(n), exclude=set(dinner), position=pos7,
+                                   meal=('夜', dinner[0]))
         suggestion = f'夜の「{dinner[0][:16]}」を「{cand[:24]}」等、非大豆系に変更' if cand \
             else '夜の大豆系を非大豆系のメニューに変更'
         viol.append({
@@ -2693,6 +2755,47 @@ def check_rule14(data):
 def check_rule15(data):
     """No.15: 週に1回、健康食材を使用する"""
     return _max_gap_check(data, is_health, 7, 15, '健康食材の使用間隔が週1回を下回る')
+
+
+def check_rule16(data):
+    """No.16: メイン・サブメイン・副菜1のうち、固形は2種まで（同じ食事内のみ。昼/夜は別々）。
+    固形の定義（ユーザー確認済み・2026/10）：食材CSVで、その枠のレシピ（レシピID）の一番上の行の
+    ユニット名が「個」または「切」のもの（SOLID_UNITS）。メイン/サブ/副菜1の3枠すべてが固形（3種）の
+    食事を違反とする。日をまたいだ連続は見ない。
+    代替え案は、副菜1を『固形でない（ユニット名が個/切でない）メニュー』に差し替える提案にする
+    （ユーザー指定：メイン/サブは主菜のため動かさず、副菜1を替える）。
+    食材CSV（day_csv）が必要。"""
+    if not data.day_csv:
+        return pd.DataFrame()
+    smap = _recipe_solid_map(data)
+    viol = []
+    for d in data.date_range:
+        for slot in ('昼', '夜'):
+            if data.day_csv.get((d.month, slot)) is None:
+                continue
+            frame = _meal_solid_frame(data, d, slot)
+            if len(frame) < len(SOLID_FRAME_POS):
+                continue
+            solid_n = sum(1 for _p, _r, sol in frame if sol)
+            if solid_n <= SOLID_MAX:
+                continue
+            fukusai1 = next(rn for p, rn, _s in frame if p == '副菜1')
+            others = {rn for _p, rn, _s in frame if rn != fukusai1} | raw_dish_names_slot(data, d, slot)
+            others.discard(fukusai1)
+            cand = _recipe_replacement(
+                data, d, ok=lambda n: n in smap and not smap[n],
+                exclude={fukusai1}, position='副菜1', avoid_with=others, meal=(slot, fukusai1))
+            suggestion = f'副菜1「{fukusai1[:16]}」を「{cand[:22]}」等、固形でない（個/切でない）メニューに変更' if cand \
+                else '副菜1を固形でない（個/切でない）メニューに変更'
+            detail = ' / '.join(f'{p}:{rn[:14]}' for p, rn, _s in frame)
+            viol.append({
+                '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 16,
+                'ルール': '固形（個・切）はメイン・サブメイン・副菜1で2種まで',
+                '該当箇所': f'[{slot}] {detail}',
+                '理由': f'メイン・サブメイン・副菜1の{solid_n}枠すべてが固形（上限{SOLID_MAX}種）',
+                '修正提案': suggestion, '重要度': '中',
+            })
+    return pd.DataFrame(viol)
 
 
 # No.17用：黄（卵焼き）は、メニュー名や食材データ上に一切現れない日でも毎食必ず入っている
@@ -3041,7 +3144,7 @@ def check_rule21(data):
                         '修正提案': _ng_replacement(data, prods[0] if prods else None, d,
                                                     recipe_name=str(recipe),
                                                     position=_pos_on(data, d, slot, recipe),
-                                                    avoid_with=others),
+                                                    avoid_with=others, meal=(slot, str(recipe))),
                         '重要度': '高',
                     })
         return pd.DataFrame(viol)
@@ -3080,7 +3183,7 @@ def check_rule21(data):
                 sug = _ng_replacement(data, matched_prods[0] if matched_prods else None, vdate,
                                        recipe_name=str(recipe), ng_words=matched_words,
                                        position=_pos_on(data, vdate, label, recipe),
-                                       avoid_with=others) \
+                                       avoid_with=others, meal=(label, str(recipe))) \
                     if vdate is not None else '代替食材/調味料に変更'
                 viol.append({
                     '日付': f'{m}/{d}', '曜日': label, 'No': 21, 'ルール': '禁止食材・調味料の使用（キーワード判定・参考）',
@@ -3172,7 +3275,8 @@ def check_rule25(data):
                 cand = _recipe_replacement(
                     data, d,
                     ok=lambda c: not any(_recipe_has(data, c, kw) for kw in ('かぼちゃ', '南瓜')),
-                    exclude={n}, position=vpos, avoid_with=vothers)
+                    exclude={n}, position=vpos, avoid_with=vothers,
+                    meal=(vslot, n) if vslot is not None else None)
                 suggestion = f'この曜日は、かぼちゃを使わない「{cand[:18]}」等に変更、または間隔を空ける' if cand \
                     else '曜日をずらすか間隔を空ける'
                 viol.append({
@@ -3532,6 +3636,7 @@ ALL_RULES = [
     ('No.12 揚げ物3品まで', check_rule12),
     ('No.14 栄養素基準（月平均）', check_rule14),
     ('No.15 健康食材 週1回以上', check_rule15),
+    ('No.16 固形（個・切）はメイン・サブメイン・副菜1で2種まで', check_rule16),
     ('No.17 1食で赤・黄・緑を使用（黄は常にクリア扱い）', check_rule17),
     ('No.18 1食の重量下限（M=212g）', check_rule18),
     ('No.19 同じ調味料のみでの味付け禁止', check_rule19),
@@ -3604,7 +3709,7 @@ RULE_NAME_JP = {
     7: '大豆系は半日空ける', 8: '食材と調味料の中身被り', 9: '同じ色の野菜が2日連続',
     10: '単一食材メニュー1週間', 11: '自然解凍1品', 12: '当日揚げ3品まで',
     13: '盛付工数3工程まで', 14: '栄養素基準（月平均）', 15: '健康食材 週1回以上',
-    16: '固形は2種まで', 17: '赤・黄・緑を使用（黄は常にクリア）', 18: '1食の重量下限',
+    16: '固形は2種まで（メイン・サブメイン・副菜1）', 17: '赤・黄・緑を使用（黄は常にクリア）', 18: '1食の重量下限',
     19: '同じ調味料のみの味付け禁止', 20: 'だし味付け1品以上', 21: '禁止食材・調味料',
     22: '魚メニュー3日に1回', 23: '食べにくさチェック', 24: '白和えの分類',
     25: 'かぼちゃ週1回・同曜日4週間', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★月内使用回数クオータ',
