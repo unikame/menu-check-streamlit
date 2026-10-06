@@ -3149,8 +3149,22 @@ def check_rule25(data):
             pd0, pn0 = by_weekday[wd]
             gap = (d - pd0).days
             if gap <= 28:
-                cand = _pick_least_recent(kabocha_hist.keys(), kabocha_hist, d, exclude={n}, spread=data.suggested, data=data)
-                suggestion = f'この曜日は「{cand[:18]}」等に変更、または間隔を空ける' if cand else '曜日をずらすか間隔を空ける'
+                # 違反を解消する提案なので、代替えは『かぼちゃを使わないメニュー』から選ぶ
+                # （ユーザー報告・2026/10：代替案にもかぼちゃが入っていた。以前は「かぼちゃが週1回を
+                # 下回る」側と同じかぼちゃメニュー一覧から選んでいた）。違反した料理と同じ枠で使われた
+                # 実績があるものを優先し、同じ食事の他レシピと食材被りしないものを優先する。
+                vslot = next((sl for sl in ('昼', '夜') if n in raw_dish_names_slot(data, d, sl)), None)
+                if vslot is not None:
+                    vpos = _pos_on(data, d, vslot, n)
+                    vothers = raw_dish_names_slot(data, d, vslot) - {n}
+                else:
+                    vpos, vothers = None, None
+                cand = _recipe_replacement(
+                    data, d,
+                    ok=lambda c: not any(_recipe_has(data, c, kw) for kw in ('かぼちゃ', '南瓜')),
+                    exclude={n}, position=vpos, avoid_with=vothers)
+                suggestion = f'この曜日は、かぼちゃを使わない「{cand[:18]}」等に変更、または間隔を空ける' if cand \
+                    else '曜日をずらすか間隔を空ける'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[wd], 'No': 25,
                     'ルール': 'かぼちゃが同一曜日で4週間以内に再使用',
