@@ -480,6 +480,7 @@ class MenuData:
         self.date_range = None
         self.ai_client = None            # Anthropic clientが設定されていればAI酷似判定を使う（予備・現状未使用）
         self.day_csv = {}                # {(month, '昼'/'夜'): DataFrame}　'md'列付き。No.1(商品ID単位)判定用
+        self.premium_meals = set()       # {(月, 日, '昼'/'夜')} 名称に「プレミアム」を含む食事（プレミアム日）
         self.nutrition_shoku = {}        # month -> DataFrame（カロリー等の列を持つ「N月使用食材」シートがあれば。No.14専用。
                                           # 2026/9〜：たんぱく質/食塩相当量のみ使用。エネルギーは_monthly_avg_kcal_new参照）
         self.nutrition_daily = {}        # month -> DataFrame(date,kcal,protein,salt)。「N月栄養価」シート由来。No.14専用（優先使用）。
@@ -1015,6 +1016,16 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
     for key, path in items:
         try:
             df = _read_day_csv(path)
+            # 名称が「☆プレミアム）高齢者 S・M 26年11月24日(火)の夜【M】」のようにプレミアム表記の食事は
+            # プレミアム日として覚えておく（11月以降のメニューから名称で判別できる）
+            try:
+                _prem = df[df['名称'].astype(str).str.contains('プレミアム', na=False)]
+                for _nm, _md in zip(_prem['名称'], _prem['md']):
+                    _sl = _parse_slot(_nm)
+                    if isinstance(_md, tuple) and _sl:
+                        data.premium_meals.add((int(_md[0]), int(_md[1]), _sl))
+            except Exception:
+                pass
             parts = _split_day_csv(df, size)
             if not parts and isinstance(key, tuple):
                 # 名称から昼夜を判定できない旧形式は、指定されたキーをそのまま使う
@@ -3983,6 +3994,36 @@ ALL_RULES = [
 ]
 
 
+# 昼プレミアム日は、もち系デザート以外は差し替え無し（担当者判断・2026/10）。
+# 違反行は残したまま、修正提案を「差し替えなし」の一言にする（もち系デザートが対象の行だけは通常どおり）。
+PREMIUM_LUNCH_NOTE = '昼プレミアム日のため差し替えなし（もち系デザート以外）'
+MOCHI_DESSERT_KW = ('もち', '餅', '大福', '団子', 'だんご')
+
+
+def _apply_premium_lunch_note(combined, data):
+    prem = getattr(data, 'premium_meals', None)
+    if not prem or not len(combined):
+        return combined
+
+    def _fix(row):
+        sug = row['修正提案']
+        if row.get('昼夜') != '昼':
+            return sug
+        m = re.match(r'^(\d{1,2})/(\d{1,2})$', str(row['日付']))
+        if not m or (int(m.group(1)), int(m.group(2)), '昼') not in prem:
+            return sug
+        # 別の日の料理を差し替える提案（No.30「12/20(日)夜の『…』を…」）は、その日の話なのでそのまま
+        if re.match(r'^\d{1,2}/\d{1,2}\([月火水木金土日]\)[昼夜]の', str(sug)):
+            return sug
+        # もち系デザートが対象の違反は通常どおり提案する
+        if any(k in str(row['該当箇所']) for k in MOCHI_DESSERT_KW):
+            return sug
+        return PREMIUM_LUNCH_NOTE
+    out = combined.copy()
+    out['修正提案'] = out.apply(_fix, axis=1)
+    return out
+
+
 def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                     seasoning_csv_path=None, fried_master_path=None, ai_client=None,
                     history_csv_paths=None, size='M'):
@@ -4008,6 +4049,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
         combined['No'] = combined['No'].astype(int)
         # 「曜日」を「昼夜」に置き換え、日付順（同日内は No 順）に並べる（ユーザー指定）
         combined['昼夜'] = combined.apply(_derive_slot, axis=1)
+        combined = _apply_premium_lunch_note(combined, data)
         combined['_k'] = combined['日付'].map(_date_sort_key)
         slot_order = {'昼': 0, '昼夜': 1, '夜': 2, '-': 3}
         combined['_s'] = combined['昼夜'].map(lambda x: slot_order.get(x, 9))
