@@ -1435,6 +1435,177 @@ def _day_recipe_names(data, date):
     return names
 
 
+NEAR_DAYS_WINDOW = 3   # 代替え案に「前後3日以内に既に入っているレシピ」を出さない（担当者指定・2026/10）
+NEAR_FALLBACK_NOTE = f'（※他に提案できる候補が無く、前後{NEAR_DAYS_WINDOW}日以内に同じメニューが入っているものを提案しています）'
+
+
+def _note_near_fallback(data, date, name, veg_conflict=None):
+    """他に候補が無くて、(a)前後NEAR_DAYS_WINDOW日以内に既に入っているレシピ、または
+    (b)前後の日のメニュー名と同じ野菜名が被るレシピを提案した場合に記録する。
+    最終的に run_all_checks の後処理（_apply_near_fallback_note）で修正提案の末尾に注記を付ける。
+    veg_conflict: (b)の野菜名リスト。Noneなら(a)として記録する。"""
+    if data is None or date is None or not name:
+        return
+    store = getattr(data, '_near_fallback', None)
+    if store is None:
+        store = {}
+        data._near_fallback = store
+    ts = pd.Timestamp(date)
+    kind = 'near' if veg_conflict is None else ('veg:' + '/'.join(veg_conflict))
+    for nm in (name, _nfkc(name)):
+        store.setdefault(nm, {}).setdefault(kind, set()).add((ts.month, ts.day))
+
+
+def _note_candidate_fallback(data, date, name, near=(), removed=()):
+    """候補 name が『前後の日と近い』または『前後の日のメニュー名と野菜名が被る』場合に注記用の記録をする。"""
+    if data is None or date is None or name is None:
+        return
+    if near and (name in near or _nfkc(name) in near):
+        _note_near_fallback(data, date, name)
+    vc = _veg_name_conflict(data, date, name, removed)
+    if vc:
+        _note_near_fallback(data, date, name, veg_conflict=vc)
+
+
+def _apply_near_fallback_note(combined, data):
+    """修正提案が『前後3日以内に同じメニューが入っているものしか出せなかった』『前後の日のメニュー名と
+    野菜名が被るものしか出せなかった』場合に、その旨を末尾に付ける。
+    記録（data._near_fallback）の (レシピ名, 月日) が、行の日付または修正提案文中の M/D と一致し、
+    かつ修正提案文にそのレシピ名が含まれる行だけが対象（担当者指定・2026/10）。"""
+    store = getattr(data, '_near_fallback', None)
+    if not store or combined is None or not len(combined):
+        return combined
+
+    def _fix(row):
+        sug = row.get('修正提案')
+        if not isinstance(sug, str) or not sug or '※他に提案できる候補が無く' in sug:
+            return sug
+        mds = set()
+        for m, d in re.findall(r'(\d{1,2})/(\d{1,2})', str(row.get('日付', '')) + ' ' + sug):
+            mds.add((int(m), int(d)))
+        sug_n = _nfkc(sug)
+        notes = []
+        for name, kinds in store.items():
+            if not (name in sug or name in sug_n):
+                continue
+            for kind, dates in kinds.items():
+                if not (dates & mds):
+                    continue
+                if kind == 'near':
+                    n = f'前後{NEAR_DAYS_WINDOW}日以内に同じメニューが入っているものを提案しています'
+                else:
+                    n = f'前後の日のメニュー名と同じ野菜名（{kind[4:]}）が被るものを提案しています'
+                if n not in notes:
+                    notes.append(n)
+        if not notes:
+            return sug
+        return sug + '（※他に提案できる候補が無く、' + '／'.join(notes) + '）'
+    combined = combined.copy()
+    combined['修正提案'] = combined.apply(_fix, axis=1)
+    return combined
+
+
+def _near_day_recipe_names(data, date, window=NEAR_DAYS_WINDOW):
+    """date の前後 window 日以内（当日は除く）に、メニュー表で既に使われているレシピ名の集合。
+    代替え案に出したレシピが、数日後（前）に同じものが入っていて間隔が近すぎる問題の対策
+    （担当者指摘・2026/10：1/11夜の代替案「かぼちゃの煮物」が2日後の1/13夜に入っていた）。
+    _day_recipe_names を前後の日付で束ねるだけで、検出ルール（No.30等）の判定には影響しない。"""
+    if date is None or not window:
+        return set()
+    out = set()
+    base = pd.Timestamp(date)
+    for k in range(1, int(window) + 1):
+        for sign in (-1, 1):
+            out |= _day_recipe_names(data, base + pd.Timedelta(days=sign * k))
+    return out
+
+
+# メニュー名に出てくる野菜名（表記ゆれは正規名にまとめる）。代替え案が、前後の日のメニュー名と
+# 同じ野菜名で被る（例：1/2昼「青菜とコーンのバター醤油」→1/3夜「キャベツとコーンの和風クリーミーサラダ」）
+# のを避けるために使う（担当者指摘・2026/10）。検出ルールには影響しない。
+NAME_VEG_PATTERNS = [
+    ('コーン', r'(?<!ス)(?:ヤング)?コーン|とうもろこし'),
+    ('人参', r'人参|にんじん|ニンジン|キャロット'),
+    ('ほうれん草', r'ほうれん草|ほうれんそう|ホウレン草|ホウレンソウ'),
+    ('小松菜', r'小松菜|こまつな'),
+    ('青菜', r'青菜'),
+    ('チンゲン菜', r'チンゲン菜|ちんげん菜|チンゲンサイ|青梗菜'),
+    ('キャベツ', r'キャベツ|きゃべつ'),
+    ('白菜', r'白菜'),
+    ('ブロッコリー', r'ブロッコリー'),
+    ('カリフラワー', r'カリフラワー|花野菜'),
+    ('大根', r'大根|だいこん'),
+    ('かぶ', r'蕪|(?<![ぁ-んァ-ン])かぶ(?![ぁ-んァ-ン])|(?<![ぁ-んァ-ン])カブ(?![ぁ-んァ-ン])'),
+    ('ごぼう', r'ごぼう|ゴボウ|牛蒡'),
+    ('れんこん', r'れんこん|レンコン|蓮根'),
+    ('ピーマン', r'ピーマン'),
+    ('パプリカ', r'パプリカ'),
+    ('なす', r'(?<![ァ-ン])ナス(?![ァ-ン])|茄子|(?<![ぁ-ん])なす(?=[のとやをが・、 ]|$)'),
+    ('かぼちゃ', r'かぼちゃ|カボチャ|南瓜'),
+    ('じゃがいも', r'じゃがいも|ジャガイモ|じゃが芋|男爵いも|男爵芋'),
+    ('さつま芋', r'さつま芋|さつまいも|サツマイモ|薩摩芋'),
+    ('里芋', r'里芋|さといも|サトイモ'),
+    ('玉ねぎ', r'玉ねぎ|たまねぎ|玉葱|オニオン'),
+    ('ねぎ', r'(?<![玉])ねぎ|(?<![玉])ネギ|長ねぎ|白ねぎ'),
+    ('ニラ', r'(?<![ァ-ン])ニラ|(?<![ぁ-ん])にら(?=[のとやをが・、 ]|$)'),
+    ('もやし', r'もやし|モヤシ'),
+    ('水菜', r'水菜'),
+    ('きのこ', r'きのこ|キノコ'),
+    ('しいたけ', r'しいたけ|シイタケ|椎茸'),
+    ('えのき', r'えのき|エノキ'),
+    ('しめじ', r'しめじ|シメジ'),
+    ('舞茸', r'舞茸|まいたけ|マイタケ'),
+    ('インゲン', r'インゲン|いんげん|隠元'),
+    ('オクラ', r'オクラ'),
+    ('アスパラ', r'アスパラ'),
+    ('ズッキーニ', r'ズッキーニ'),
+    ('きゅうり', r'きゅうり|キュウリ|胡瓜'),
+    ('トマト', r'トマト'),
+    ('セロリ', r'セロリ'),
+    ('枝豆', r'枝豆|えだまめ'),
+    ('竹の子', r'竹の子|たけのこ|筍'),
+    ('ゴーヤ', r'ゴーヤ|にがうり'),
+    ('山芋', r'山芋|長芋|やまいも|ながいも'),
+    ('春菊', r'春菊'),
+    ('大葉', r'大葉|しそ|シソ|紫蘇'),
+    ('しょうが', r'生姜|しょうが|ショウガ'),
+]
+_NAME_VEG_RE = [(c, re.compile(pt)) for c, pt in NAME_VEG_PATTERNS]
+VEG_NAME_CONFLICT_DAYS = 1   # 『連日』＝当日のもう一方の食事＋前日＋翌日（担当者指定・2026/10）
+
+
+def _name_veg_set(name):
+    """レシピ名に含まれる野菜名（正規名）の集合。"""
+    n = _nfkc(str(name))
+    return {c for c, rx in _NAME_VEG_RE if rx.search(n)}
+
+
+def _near_veg_name_set(data, date, removed=()):
+    """date の前日・当日（昼夜とも）・翌日のメニュー名に含まれる野菜名の集合と、その元のレシピ名の対応。
+    removed（差し替えで抜けるレシピ）は数えない。"""
+    out = {}
+    if date is None:
+        return out
+    base = pd.Timestamp(date)
+    rem = {str(r) for r in removed} | {_nfkc(str(r)) for r in removed}
+    for k in range(-VEG_NAME_CONFLICT_DAYS, VEG_NAME_CONFLICT_DAYS + 1):
+        for nm in _day_recipe_names(data, base + pd.Timedelta(days=k)):
+            if nm in rem:
+                continue
+            for v in _name_veg_set(nm):
+                out.setdefault(v, nm)
+    return out
+
+
+def _veg_name_conflict(data, date, cand, removed=()):
+    """候補レシピ名が、前後の日のメニュー名と同じ野菜名で被るなら、その野菜名のリストを返す（無ければ空）。"""
+    vs = _name_veg_set(cand)
+    if not vs:
+        return []
+    near = _near_veg_name_set(data, date, removed)
+    return sorted(v for v in vs if v in near)
+
+
 CURRY_KW = 'カレー'   # 同日（昼夜またぎ・全枠）でカレーが被る候補を代替え案に出さない（ユーザー確認済み・2026/10）
 
 
@@ -1482,17 +1653,31 @@ def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None, d
     同じものを代替え案に出してしまう問題の対策）。"""
     best, best_key = None, None
     today = _day_recipe_names(data, before_date) if data is not None else ()
-    for c in candidates:
-        if c in exclude or _is_discontinued(c):
-            continue
-        if today and (c in today or _nfkc(c) in today):
-            continue
-        if data is not None and _curry_blocked(data, before_date, c, exclude):
-            continue
-        gap = _days_since_last_use(hist, c, before_date)
-        key = ((spread.get(c, 0) if spread is not None else 0), -gap)
-        if best_key is None or key < best_key:
-            best, best_key = c, key
+    # 前後3日以内に同じレシピが既にあるもの／前後の日のメニュー名と野菜名が被るものは後回し
+    # （担当者指摘・2026/10）。他に候補が無いときだけ許容する（その場合は提案文に注記が付く）。
+    near = _near_day_recipe_names(data, before_date) if data is not None else ()
+    candidates = list(candidates)
+    veg_near = _near_veg_name_set(data, before_date, exclude) if data is not None else {}
+    passes = ((False, False), (False, True), (True, True)) if (near or veg_near) else ((True, True),)
+    for allow_near, allow_veg in passes:
+        for c in candidates:
+            if c in exclude or _is_discontinued(c):
+                continue
+            if today and (c in today or _nfkc(c) in today):
+                continue
+            if not allow_near and near and (c in near or _nfkc(c) in near):
+                continue
+            if not allow_veg and veg_near and any(v in veg_near for v in _name_veg_set(c)):
+                continue
+            if data is not None and _curry_blocked(data, before_date, c, exclude):
+                continue
+            gap = _days_since_last_use(hist, c, before_date)
+            key = ((spread.get(c, 0) if spread is not None else 0), -gap)
+            if best_key is None or key < best_key:
+                best, best_key = c, key
+        if best is not None:
+            _note_candidate_fallback(data, before_date, best, near, exclude)
+            break
     if best is not None and spread is not None:
         spread[best] = spread.get(best, 0) + 1
     return best
@@ -1816,6 +2001,22 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
     base_cands = [n for n in base_cands if not _curry_blocked(data, date, n, _removed)]
     if not base_cands:
         return None, False
+    # 前後3日以内に同じレシピが既に入っているものは外す（担当者指摘・2026/10）。全部外れてしまう場合のみ許容。
+    _near = _near_day_recipe_names(data, date)
+    _removed_names = set(exclude) | ({meal[1]} if meal is not None else set())
+    _veg_near = _near_veg_name_set(data, date, _removed_names)
+    if _near or _veg_near:
+        def _is_near(n):
+            return bool(_near) and (n in _near or _nfkc(n) in _near)
+
+        def _is_vegc(n):
+            return bool(_veg_near) and any(v in _veg_near for v in _name_veg_set(n))
+        _clean = [n for n in base_cands if not _is_near(n) and not _is_vegc(n)]
+        _far = [n for n in base_cands if not _is_near(n)]
+        if _clean:
+            base_cands = _clean
+        elif _far:
+            base_cands = _far
     positions = _dish_positions(data) if position else {}
     allowed_pos = ({position} if isinstance(position, str) else set(position)) if position else set()
     # positions（_dish_positions）はdata.rows由来で_nfkc正規化済みのレシピ名がキーだが、
@@ -1829,8 +2030,11 @@ def _recipe_replacement2(data, date, ok=None, group=None, exclude=(), position=N
             same = [n for n in cands if cm.group_from_name(n) == group]
             pick = _pick_least_recent(same, hist, date, spread=data.suggested)
             if pick:
+                _note_candidate_fallback(data, date, pick, _near, _removed_names)
                 return pick, True
         pick = _pick_least_recent(cands, hist, date, spread=data.suggested)
+        if pick:
+            _note_candidate_fallback(data, date, pick, _near, _removed_names)
         return (pick, False) if pick else (None, False)
 
     for cands in cand_sets:
@@ -4048,6 +4252,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
         # 「曜日」を「昼夜」に置き換え、日付順（同日内は No 順）に並べる（ユーザー指定）
         combined['昼夜'] = combined.apply(_derive_slot, axis=1)
         combined = _apply_premium_lunch_note(combined, data)
+        combined = _apply_near_fallback_note(combined, data)
         combined['_k'] = combined['日付'].map(_date_sort_key)
         slot_order = {'昼': 0, '昼夜': 1, '夜': 2, '-': 3}
         combined['_s'] = combined['昼夜'].map(lambda x: slot_order.get(x, 9))
