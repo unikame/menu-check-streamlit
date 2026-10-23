@@ -3377,9 +3377,10 @@ def check_rule20(data):
 # No.21で昼だけ免除する商品ID（1000697=☆☆うま辛醤タレ（コチジャン）200g。昼はレシピのコメントどおり
 # 調味ダレの量で調整するため、エラー対象外。夜は従来どおり判定する）
 NG_EXEMPT_LUNCH_PRODUCT_IDS = {1000697}
-# 平日昼のメイン/サブ/副菜1だけ免除する商品ID（3001801=カットヤングコーン 500g。商材変更で対応する運用）
+# 平日昼だけ使用可の商品ID（3001801=カットヤングコーン 500g。使用不可商材から外れ、使用ルールは
+# 平日昼=可／平日夜=不可／土日祝終日=不可。担当者判断・2026/10）。枠（メイン〜サラダ・贅沢）は問わない。
+# 禁止食材マスタのシートには残したまま、ここで曜日・昼夜条件を判定する。
 NG_EXEMPT_WEEKDAY_LUNCH_MAIN_IDS = {3001801}
-NG_EXEMPT_POSITIONS = ('メイン', 'サブ', '副菜1')
 
 
 def check_rule21(data):
@@ -3388,8 +3389,8 @@ def check_rule21(data):
     day_csv/ng_product_idsが無い場合のみ、従来のキーワード判定(NG_WORDS)にフォールバックする。
     ただし昼は、コチジャン（商品ID 1000697）と、食材行に「調味ダレ」メモ（コメント.1列）が付いた商品
     （麻婆豆腐の素など）を、調味ダレの量で調整する運用のため対象外にする。夜は従来どおり判定する。
-    さらに平日（月〜金・祝日扱いを除く）昼のメイン/サブ/副菜1のヤングコーン（商品ID 3001801）も対象外
-    （商材変更でもともと入っている商材を増量する運用）。副菜2・サラダ・夜・土日祝は従来どおり判定する。"""
+    さらにヤングコーン（商品ID 3001801）は平日（月〜金・祝日扱いを除く）の昼のみ使用可（全枠）。
+    平日夜・土日祝（終日）は従来どおり違反として判定する。"""
     if data.day_csv and data.ng_product_ids:
         viol = []
         dr = data.date_range
@@ -3412,12 +3413,9 @@ def check_rule21(data):
                         ng_mask &= ~sub['コメント.1'].astype(str).str.contains('調味ダレ', na=False)
                 hit = sub[ng_mask]
                 if slot == '昼' and _is_workday(d) and len(hit):
-                    # 平日昼のメイン/サブメイン/副菜1のヤングコーンは、商材変更（もともと入っている
-                    # 商材を増量）で対応するためエラー対象外（担当者判断・2026/10）
-                    def _corn_exempt(r, _d=d):
-                        return (pd.to_numeric(r['商品ID'], errors='coerce') in NG_EXEMPT_WEEKDAY_LUNCH_MAIN_IDS
-                                and _pos_on(data, _d, '昼', str(r['レシピ名'])) in NG_EXEMPT_POSITIONS)
-                    hit = hit[~hit.apply(_corn_exempt, axis=1)]
+                    # ヤングコーンは使用不可商材から外れ、平日昼のみ使用可（全枠）。平日夜・土日祝は不可のまま
+                    # （担当者判断・2026/10）
+                    hit = hit[~pd.to_numeric(hit['商品ID'], errors='coerce').isin(NG_EXEMPT_WEEKDAY_LUNCH_MAIN_IDS)]
                 for recipe, grp in hit.groupby('レシピ名', sort=False):
                     prods = list(dict.fromkeys(grp['商品名'].astype(str).tolist()))[:3]
                     # 差し替え候補が、同じ食事（昼/夜）の他のレシピと食材被り・大豆豆腐系重複という
