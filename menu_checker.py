@@ -1266,8 +1266,20 @@ def _min_gap_check(data, match_fn, min_gap, rule_no, rule_name, severity='中'):
         gap = (d1 - d0).days
         if gap <= min_gap:
             pool = _filtered_dish_hist(data, match_fn)
-            cand = _pick_least_recent(pool.keys(), pool, d1, exclude={h1[0]}, spread=data.suggested, data=data)
-            suggestion = f'代わりに「{cand[:20]}」等に変更' if cand else '使用日をずらす'
+            # 平日昼と土日祝（＋平日夜）で近い場合は、平日昼を動かさず前回側を差し替える（担当者判断・2026/10）
+            sl1 = [sl for sl in ('昼', '夜') if any(match_fn(n) for n in raw_dish_names_slot(data, d1, sl))]
+            sl0 = [sl for sl in ('昼', '夜') if any(match_fn(n) for n in raw_dish_names_slot(data, d0, sl))]
+            swap = _wd_lunch_swap_slot(d1, sl1, d0, sl0)
+            if swap:
+                h0 = sorted(n for n in raw_dish_names_slot(data, d0, swap) if match_fn(n))
+                r0 = h0[0] if h0 else dates_with[i - 1][1][0]
+                cand = _pick_least_recent(pool.keys(), pool, d0, exclude={r0, h1[0]}, spread=data.suggested, data=data)
+                tgt = f'{d0.strftime("%-m/%-d")}({WD_JP[d0.weekday()]}){swap}'
+                suggestion = (f'{tgt}の「{r0[:18]}」を「{cand[:20]}」等に変更（平日昼は変更しない）' if cand
+                              else f'{tgt}の使用日をずらす（平日昼は変更しない）')
+            else:
+                cand = _pick_least_recent(pool.keys(), pool, d1, exclude={h1[0]}, spread=data.suggested, data=data)
+                suggestion = f'代わりに「{cand[:20]}」等に変更' if cand else '使用日をずらす'
             viol.append({
                 '日付': d1.strftime('%-m/%-d'), '曜日': WD_JP[d1.weekday()], 'No': rule_no, 'ルール': rule_name,
                 '該当箇所': f'前回{d0.strftime("%-m/%-d")} → 今回{d1.strftime("%-m/%-d")}:{h1[0][:16]}',
@@ -1633,13 +1645,29 @@ DISCONTINUED_RECIPE_KW = (
 
 # 代替え案の候補にしない枠タイトル（担当者判断・2026/10：代替品に「店主おすすめの1品」は入れてはいけない）。
 # 枠タイトルのレシピは中身が店舗ごとに変わる枠なので、特定の1品として提案できない。
-NO_SUGGEST_FRAME_TITLES = ('店主おすすめの1品',)
+# 「お楽しみの1品」「お楽しみの揚げ物」も同様（担当者判断・2026/10：修正提案は、お楽しみ系以外のメニューにする）。
+# 「おまかせの副菜」等のおまかせ系は担当者確認中のため、まだ除外していない。
+# 注：No.29（おまかせ月2回以上）の『追加例』はこの除外とは別に、お楽しみ系の名前をそのまま例示する。
+NO_SUGGEST_FRAME_TITLES = ('店主おすすめの1品', 'お楽しみの1品', 'お楽しみの揚げ物')
+
+
+# 混ぜご飯系のレシピ（担当者判断・2026/10：混ぜご飯はプレミアム日の1回のみ＝チラシ表紙のプレミアムメニュー。
+# 通常の代替え案には絶対に出さない）。レシピ名（☆・※より前の本体名）にこれらを含む、または「〜ご飯」で終わるもの。
+MIXED_RICE_KW = ('寿司', 'すし', 'ちらし', '混ぜご飯', 'まぜご飯', '炊き込み', 'ピラフ', 'チャーハン', 'おこわ')
+
+
+def _is_mixed_rice(name):
+    """混ぜご飯系のレシピ名か（例：鮭ちらし寿司／ツナとひじきの混ぜご飯／明太高菜ご飯）。"""
+    n = _nfkc(name)
+    base = re.split(r'[☆※（(]', n, maxsplit=1)[0].strip()
+    return any(k in base for k in MIXED_RICE_KW) or base.endswith('ご飯')
 
 
 def _is_discontinued(name):
-    """代替え案の候補から外すレシピか（終売レシピ＋提案してはいけない枠タイトル）"""
+    """代替え案の候補から外すレシピか（終売レシピ＋提案してはいけない枠タイトル＋混ぜご飯系）"""
     n = _nfkc(name)
-    return any(k in n for k in DISCONTINUED_RECIPE_KW) or any(n.startswith(_nfkc(t)) for t in NO_SUGGEST_FRAME_TITLES)
+    return (any(k in n for k in DISCONTINUED_RECIPE_KW) or any(n.startswith(_nfkc(t)) for t in NO_SUGGEST_FRAME_TITLES)
+            or _is_mixed_rice(n))
 
 
 def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None, data=None):
@@ -2089,7 +2117,7 @@ def _nutrition_candidates(data, column, ascending=False, top=3):
         nm = nm.strip()
         if not nm or nm in names or nm in ng:
             continue
-        if any(w in nm for w in NG_WORDS):
+        if any(w in nm for w in NG_WORDS) or _is_mixed_rice(nm):
             continue
         names.append(nm)
         if len(names) >= top:
@@ -2155,6 +2183,24 @@ def _is_holiday_like(d):
 def _is_workday(d):
     """平日（月〜金で、祝日扱いでもない日）かどうか。平日/休日を分けるルールはこれで判定する。"""
     return pd.Timestamp(d).weekday() < 5 and not _is_holiday_like(d)
+
+
+def _is_wd_lunch(d, slot):
+    """平日（祝日扱いを除く）の昼かどうか。"""
+    return slot == '昼' and _is_workday(d)
+
+
+def _wd_lunch_swap_slot(d_later, slots_later, d_earlier, slots_earlier):
+    """『同じ商材/メニューの再使用が近い』系のルール共通の差し替え対象の選び方（担当者判断・2026/10）：
+    平日昼と、土日祝・平日夜で同じものの使用が近い場合は、平日昼は変更せず土日祝（＋平日夜）の方を
+    修正提案にする。後ろが平日昼だけで、前に平日昼以外（土日祝の昼夜・平日夜）の使用がある場合に、
+    前側の（平日昼でない）時間帯 '昼'/'夜' を返す。それ以外は None（従来どおり後ろ側を提案）。"""
+    if not slots_later or not all(_is_wd_lunch(d_later, s) for s in slots_later):
+        return None
+    for sl in slots_earlier or ():
+        if not _is_wd_lunch(d_earlier, sl):
+            return sl
+    return None
 
 
 def _day_kind_label(d):
@@ -2328,17 +2374,33 @@ def check_rule1(data):
             gap = (d - prev_d).days
             if 0 < gap <= 7:
                 group = cm.group_from_name(pname)
-                # 代替え案はレシピ（メニュー）名で出す：同系統・同じ枠（メイン/サブ）で、
-                # その商材を使っていないレシピ（ユーザー指定：メインの違反にはメインの候補を出す）
-                cand, same_group = _recipe_replacement2(
-                    data, d, ok=lambda n: pname not in _recipe_products(data).get(n, ()),
-                    group=group, exclude={recipe, prev_recipe}, position=pos, meal=(slot, recipe))
-                if cand and same_group:
-                    suggestion = f'同系統（{group}）の「{cand[:26]}」に変更を検討'
-                elif cand:
-                    suggestion = f'「{cand[:26]}」等、{pname[:14]}を使わないメニューに変更'
+                # 担当者判断（2026/10）：平日昼と土日祝（＋平日夜）で同一商材の使用が近い場合、
+                # 平日昼は変更せず、土日祝（＋平日夜）の方（＝前回側）を修正提案にする。
+                swap = _wd_lunch_swap_slot(d, [slot], prev_d, [prev_slot])
+                if swap:
+                    cand, same_group = _recipe_replacement2(
+                        data, prev_d, ok=lambda n: pname not in _recipe_products(data).get(n, ()),
+                        group=group, exclude={recipe, prev_recipe}, position=prev_pos,
+                        meal=(prev_slot, prev_recipe))
+                    tgt = f'{prev_d.strftime("%-m/%-d")}({WD_JP[prev_d.weekday()]}){prev_slot}'
+                    if cand and same_group:
+                        suggestion = f'{tgt}の「{prev_recipe[:18]}」を同系統（{group}）の「{cand[:26]}」に変更を検討（平日昼は変更しない）'
+                    elif cand:
+                        suggestion = f'{tgt}の「{prev_recipe[:18]}」を「{cand[:26]}」等、{pname[:14]}を使わないメニューに変更（平日昼は変更しない）'
+                    else:
+                        suggestion = f'{tgt}の使用日をずらす（平日昼は変更しない）'
                 else:
-                    suggestion = '該当日か次回使用日をずらす'
+                    # 代替え案はレシピ（メニュー）名で出す：同系統・同じ枠（メイン/サブ）で、
+                    # その商材を使っていないレシピ（ユーザー指定：メインの違反にはメインの候補を出す）
+                    cand, same_group = _recipe_replacement2(
+                        data, d, ok=lambda n: pname not in _recipe_products(data).get(n, ()),
+                        group=group, exclude={recipe, prev_recipe}, position=pos, meal=(slot, recipe))
+                    if cand and same_group:
+                        suggestion = f'同系統（{group}）の「{cand[:26]}」に変更を検討'
+                    elif cand:
+                        suggestion = f'「{cand[:26]}」等、{pname[:14]}を使わないメニューに変更'
+                    else:
+                        suggestion = '該当日か次回使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 1,
                     'ルール': '同一商品（単体商材）をメイン/サブで1週間空けず再使用',
@@ -2383,12 +2445,18 @@ def check_rule2(data, max_per_month=2, min_gap_days=8):
             prev_d, prev_slot, prev_pos, prev_name = last_seen[group]
             gap = (d - prev_d).days
             if 0 < gap < min_gap_days:
+                # 平日昼と土日祝（＋平日夜）で近い場合は、平日昼を動かさず前回側を提案する（担当者判断・2026/10）
+                if _wd_lunch_swap_slot(d, [slot], prev_d, [prev_slot]):
+                    sug2 = (f'{prev_d.strftime("%-m/%-d")}({WD_JP[prev_d.weekday()]}){prev_slot}の'
+                            f'「{prev_name[:18]}」の使用日をずらす（平日昼は変更しない）')
+                else:
+                    sug2 = '該当日か次回使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 2,
                     'ルール': 'メイン/サブで見た目が同じ商材を1週間空けず再使用',
                     '該当箇所': f'{slot}{pos}:{name[:20]}（見た目グループ:{group}）← 前回 {prev_d.strftime("%-m/%-d")} {prev_slot}{prev_pos}:{prev_name[:16]}',
                     '理由': f'{gap}日しか空けず再使用（要{min_gap_days}日以上）',
-                    '修正提案': '該当日か次回使用日をずらす', '重要度': '高',
+                    '修正提案': sug2, '重要度': '高',
                 })
         last_seen[group] = (d, slot, pos, name)
         # 2) 月2回まで
@@ -2481,8 +2549,18 @@ def check_rule4_36(data):
                 candidates = [n2 for n2 in dish_hist if 'コロッケ' in n2 and
                               n2 not in ng_names and
                               (('クリーム' in n2) == (cat == 'クリーム'))]
-                cand = _pick_least_recent(candidates, dish_hist, d, exclude={n}, spread=data.suggested, data=data)
-                suggestion = f'別のコロッケ「{cand[:20]}」に変更を検討' if cand else '使用日をずらす'
+                # 平日昼と土日祝（＋平日夜）で近い場合は、平日昼を動かさず前回側を差し替える（担当者判断・2026/10）
+                sl1 = [sl for sl in ('昼', '夜') if n in raw_dish_names_slot(data, d, sl)]
+                sl0 = [sl for sl in ('昼', '夜') if pn0 in raw_dish_names_slot(data, pd0, sl)]
+                swap = _wd_lunch_swap_slot(d, sl1, pd0, sl0)
+                if swap:
+                    cand = _pick_least_recent(candidates, dish_hist, pd0, exclude={n, pn0}, spread=data.suggested, data=data)
+                    tgt = f'{pd0.strftime("%-m/%-d")}({WD_JP[pd0.weekday()]}){swap}'
+                    suggestion = (f'{tgt}の「{pn0[:16]}」を別のコロッケ「{cand[:20]}」に変更を検討（平日昼は変更しない）'
+                                  if cand else f'{tgt}の使用日をずらす（平日昼は変更しない）')
+                else:
+                    cand = _pick_least_recent(candidates, dish_hist, d, exclude={n}, spread=data.suggested, data=data)
+                    suggestion = f'別のコロッケ「{cand[:20]}」に変更を検討' if cand else '使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 4,
                     'ルール': f'コロッケ({cat})が連日重複',
@@ -2717,9 +2795,20 @@ def _check_potato_macaroni_alternation(pm_entries):
         if reasons:
             other = 'マカロニサラダ' if kind == 'ポテトサラダ' else 'ポテトサラダ'
             other_recipe = last_of_kind.get(other)
+            # 平日昼と土日祝（＋平日夜）で近い場合は、平日昼を動かさず前回側を修正提案にする（担当者判断・2026/10）
             if prev is not None and prev[5] == kind:
-                sug = (f'交互になるよう「{other_recipe[:18]}」に変更、または前後の並びを入れ替える'
-                       if other_recipe else f'交互になるよう{other}に変更、または前後の並びを入れ替える')
+                if _wd_lunch_swap_slot(d, [slot], prev[0], [prev[1]]):
+                    tgt = f'{prev[0].strftime("%-m/%-d")}({WD_JP[prev[0].weekday()]}){prev[1]}'
+                    sug = (f'{tgt}の「{prev[3][:18]}」を交互になるよう「{other_recipe[:18]}」に変更、または前後の並びを入れ替える（平日昼は変更しない）'
+                           if other_recipe else
+                           f'{tgt}の「{prev[3][:18]}」を交互になるよう{other}に変更、または前後の並びを入れ替える（平日昼は変更しない）')
+                else:
+                    sug = (f'交互になるよう「{other_recipe[:18]}」に変更、または前後の並びを入れ替える'
+                           if other_recipe else f'交互になるよう{other}に変更、または前後の並びを入れ替える')
+            elif wk in week_seen and _wd_lunch_swap_slot(d, [slot], week_seen[wk][0], [week_seen[wk][1]]):
+                w = week_seen[wk]
+                tgt = f'{w[0].strftime("%-m/%-d")}({WD_JP[w[0].weekday()]}){w[1]}'
+                sug = f'同じ週の2回目のため、{tgt}の「{w[3][:18]}」を翌週に移す、または別のサラダに変更（平日昼は変更しない）'
             else:
                 sug = '同じ週の2回目のため、翌週に移す、または別のサラダに変更'
             ref = prev if prev is not None else ent
@@ -2792,11 +2881,17 @@ def check_rule10(data, min_gap_days=8):
             gap = (d - prev_d).days
             if 0 < gap < min_gap_days:
                 ng_names = _ng_recipe_names(data)
+                # 平日昼と土日祝（＋平日夜）で近い場合は、平日昼を動かさず前回側を差し替える（担当者判断・2026/10）
+                _swap10 = bool(_wd_lunch_swap_slot(d, [slot], prev_d, [prev_slot]))
+                if _swap10:
+                    t_d, t_slot, t_pos, t_recipe = prev_d, prev_slot, prev_pos, prev_recipe
+                else:
+                    t_d, t_slot, t_pos, t_recipe = d, slot, pos, recipe
                 # 候補が、同じ食事（昼/夜）の他のレシピと食材被り・大豆豆腐系重複という
                 # 新しい違反を作ってしまわないよう、他レシピの集合を渡す（ユーザー報告・2026/10）
-                others = raw_dish_names_slot(data, d, slot) - {recipe}
+                others = raw_dish_names_slot(data, t_d, t_slot) - {t_recipe}
                 # 同じ日（昼・夜どちらも）に既に使われているレシピは候補から必ず外す（ユーザー報告・2026/10）
-                today_names = _day_recipe_names(data, d)
+                today_names = _day_recipe_names(data, t_d)
 
                 def _best_candidate(restrict_pos, restrict_dup):
                     best_key, best_gap = None, -1
@@ -2804,16 +2899,16 @@ def check_rule10(data, min_gap_days=8):
                         kr = key_recipe.get(k2)
                         if k2 == key or kr in ng_names or kr in today_names or _nfkc(kr) in today_names:
                             continue
-                        if restrict_pos and pos not in key_pos.get(k2, set()):
+                        if restrict_pos and t_pos not in key_pos.get(k2, set()):
                             continue
                         if restrict_dup and _conflicts_with_others(data, key_recipe.get(k2), others):
                             continue
-                        if _would_exceed_solid(data, kr, d, slot, recipe):
+                        if _would_exceed_solid(data, kr, t_d, t_slot, t_recipe):
                             continue
-                        if _curry_blocked(data, d, kr, {recipe}):
+                        if _curry_blocked(data, t_d, kr, {t_recipe}):
                             continue
-                        past = [dt for dt in dates2 if dt < d]
-                        g2 = (d - past[-1]).days if past else 10 ** 6
+                        past = [dt for dt in dates2 if dt < t_d]
+                        g2 = (t_d - past[-1]).days if past else 10 ** 6
                         if g2 > best_gap:
                             best_key, best_gap = k2, g2
                     return best_key
@@ -2825,7 +2920,12 @@ def check_rule10(data, min_gap_days=8):
                             or _best_candidate(restrict_pos=True, restrict_dup=False)
                             or _best_candidate(restrict_pos=False, restrict_dup=True)
                             or _best_candidate(restrict_pos=False, restrict_dup=False))
-                suggestion = f'別の単一食材メニュー「{key_recipe[best_key][:18]}」に変更を検討' if best_key else '該当日か次回使用日をずらす'
+                if _swap10:
+                    _tgt10 = f'{prev_d.strftime("%-m/%-d")}({WD_JP[prev_d.weekday()]}){prev_slot}'
+                    suggestion = (f'{_tgt10}の「{prev_recipe[:16]}」を別の単一食材メニュー「{key_recipe[best_key][:18]}」に変更を検討（平日昼は変更しない）'
+                                  if best_key else f'{_tgt10}の使用日をずらす（平日昼は変更しない）')
+                else:
+                    suggestion = f'別の単一食材メニュー「{key_recipe[best_key][:18]}」に変更を検討' if best_key else '該当日か次回使用日をずらす'
                 viol.append({
                     '日付': d.strftime('%-m/%-d'), '曜日': WD_JP[d.weekday()], 'No': 10,
                     'ルール': '単一食材のみの副菜/サラダを1週間空けず再使用',
@@ -3198,6 +3298,11 @@ def check_rule15(data):
     return _max_gap_check(data, is_health, 7, 15, '健康食材の使用間隔が週1回を下回る')
 
 
+# No.16：平日昼で、この名前を含むメニュー（おまかせメニュー）が メイン/サブ/副菜1 に入っている時は、
+# そちらの中身で調整する修正提案にする（担当者判断・2026/10）
+OMAKASE_MENU_KW_NO16 = ('お楽しみの1品', 'お楽しみの揚げ物', 'おまかせ', '店主おすすめの1品')
+
+
 def check_rule16(data):
     """No.16: メイン・サブメイン・副菜1のうち、固形は2種まで（同じ食事内のみ。昼/夜は別々）。
     固形の定義（ユーザー確認済み・2026/10）：食材CSVで、その枠のレシピ（レシピID）の一番上の行の
@@ -3221,13 +3326,23 @@ def check_rule16(data):
             if solid_n <= SOLID_MAX:
                 continue
             fukusai1 = next(rn for p, rn, _s in frame if p == '副菜1')
-            others = {rn for _p, rn, _s in frame if rn != fukusai1} | raw_dish_names_slot(data, d, slot)
-            others.discard(fukusai1)
-            cand = _recipe_replacement(
-                data, d, ok=lambda n: n in smap and not smap[n],
-                exclude={fukusai1}, position='副菜1', avoid_with=others, meal=(slot, fukusai1))
-            suggestion = f'副菜1「{fukusai1[:16]}」を「{cand[:22]}」等、固形でない（個/切でない）メニューに変更' if cand \
-                else '副菜1を固形でない（個/切でない）メニューに変更'
+            # 平日昼で、メイン/サブ/副菜1におまかせメニュー（お楽しみの1品・おまかせの副菜・店主おすすめの1品）が
+            # 入っている場合は、そのおまかせメニューの中身で調整する提案にする（担当者判断・2026/10）
+            omakase = None
+            if _is_wd_lunch(d, slot):
+                omakase = next(((p, rn) for p, rn, _s in frame
+                                if any(k in rn for k in OMAKASE_MENU_KW_NO16)), None)
+            if omakase:
+                suggestion = (f'{omakase[0]}「{omakase[1][:20]}」の中身を固形でない（個/切でない）ものに変更'
+                              '（平日昼はおまかせメニューで調整）')
+            else:
+                others = {rn for _p, rn, _s in frame if rn != fukusai1} | raw_dish_names_slot(data, d, slot)
+                others.discard(fukusai1)
+                cand = _recipe_replacement(
+                    data, d, ok=lambda n: n in smap and not smap[n],
+                    exclude={fukusai1}, position='副菜1', avoid_with=others, meal=(slot, fukusai1))
+                suggestion = f'副菜1「{fukusai1[:16]}」を「{cand[:22]}」等、固形でない（個/切でない）メニューに変更' if cand \
+                    else '副菜1を固形でない（個/切でない）メニューに変更'
             detail = ' / '.join(f'{p}:{rn[:14]}' for p, rn, _s in frame)
             viol.append({
                 '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 16,
@@ -3245,9 +3360,11 @@ def check_rule16(data):
 # 加えて、以下の商品名は野菜マスタに「赤」として登録されていない場合でも、
 # 見た目上赤を補っているため「赤」を満たすものとみなす（ユーザー確認済み）。
 RED_SUPPLEMENT_KW_NO17 = ['赤パプリカ', 'かに風味蒲鉾ほぐし', '花がんも']
-# 商品IDで赤とみなす商品（2000007=七味もやし1.2k(固形850g)。人参入りのため。担当者指摘・2026/10）。
-# 名前（七味もやし）ではなくIDで判定するのは、別の七味もやし商品に人参が入っているとは限らないため。
-RED_SUPPLEMENT_IDS_NO17 = {2000007}
+# 商品IDで赤とみなす商品（担当者指摘・2026/10）。
+#   2000007=七味もやし1.2k(固形850g)。人参入りのため。
+#   3001449=☆☆【自然解凍】かにのふわふわ豆腐 25g×20個。やや薄めの赤の色味がついているため。
+# 名前ではなくIDで判定するのは、別の同名・類似商品に同じ色味があるとは限らないため。
+RED_SUPPLEMENT_IDS_NO17 = {2000007, 3001449}
 
 
 def check_rule17(data):
@@ -3257,7 +3374,7 @@ def check_rule17(data):
     野菜マスタに黄として登録されていなくても常にクリア済みとして扱う。
     そのため実際に「不足」として引っかかるのは実質赤・緑のみになる。
     また、赤パプリカ・かに風味蒲鉾ほぐし・花がんもは野菜マスタ未登録でも「赤」を満たすものとみなす
-    七味もやし（商品ID 2000007・人参入り）も同様に赤とみなす（RED_SUPPLEMENT_IDS_NO17。名前ではなくIDで判定。ユーザー確認済み）。
+    七味もやし（商品ID 2000007・人参入り）、かにのふわふわ豆腐（商品ID 3001449・やや薄めの赤）も同様に赤とみなす（RED_SUPPLEMENT_IDS_NO17。名前ではなくIDで判定。ユーザー確認済み）。
     「1食」＝昼は昼、夜は夜で別々に判定する（No.9と同じ考え方）。
     マスタに登録の無い野菜は検出できない点に注意（見つかり次第マスタに追記する運用）。
     No.11と同様、特定の1品を置き換えるルールではなく『不足色を補う1品を追加/差し替え』の
@@ -3306,7 +3423,7 @@ def check_rule17(data):
                     '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 17,
                     'ルール': '1食につき赤・黄・緑の食材を必ず使用（黄は卵焼き前提で常にクリア）',
                     '該当箇所': f'[{slot}]',
-                    '理由': f'{"".join(missing)}系の食材が0品（野菜マスタ照合。赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんも/七味もやし(ID2000007)も加味）',
+                    '理由': f'{"".join(missing)}系の食材が0品（野菜マスタ照合。赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんも/七味もやし(ID2000007)/かにのふわふわ豆腐(ID3001449)も加味）',
                     '修正提案': suggestion, '重要度': '中',
                 })
     return pd.DataFrame(viol)
@@ -3767,6 +3884,16 @@ def _veg_rows_slot(data, date, slot):
     return sub[['商品ID', '商品名', 'レシピ名']]
 
 
+def _menu_display_name(recipe_name):
+    """レシピ名から、お客様に見えるメニュー名部分を返す。☆・※以降の社内用の注記（例：「黒酢の酢鶏☆れんこん」
+    の「☆れんこん」、「…☆高齢者」）は除く。ただし枠タイトル（お楽しみの1品・本日の魚料理など）で始まる
+    名前は、☆以降が実際の料理名のためそのまま返す。"""
+    n = str(recipe_name)
+    if any(n.startswith(t) for t in FRAME_TITLES):
+        return n
+    return re.split(r'[☆※]', n, maxsplit=1)[0]
+
+
 def check_rule30(data):
     """No.30: 野菜使用の間隔（FDメニュールール（野菜）シート基準）。
     https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY (gid=1671677088)
@@ -3796,8 +3923,11 @@ def check_rule30(data):
                         lambda x, _k=keys: any(k in _nfkc(x) for k in _k))]
                 if not len(hit):
                     continue
+                # 「メニュー名に食材名が記載されている」判定は、☆・※以降の社内用の注記（例：黒酢の酢鶏☆れんこん）を
+                # 除いた表示用のメニュー名で見る（担当者判断・2026/10）。枠タイトル（お楽しみの1品☆…等）は
+                # ☆以降が実際の料理名のため、そのまま全体で見る。
                 is_named = hit['レシピ名'].astype(str).apply(
-                    lambda rn: any(k in rn for k in name_kws)).any()
+                    lambda rn: any(k in _menu_display_name(rn) for k in name_kws)).any()
                 slot_dt = pd.Timestamp(d) + pd.Timedelta(days=(0 if slot == '昼' else 0.5))
                 occurrences.append((slot_dt, d, slot, is_named, str(hit['商品名'].iloc[0]),
                                     str(hit['レシピ名'].iloc[0])))
