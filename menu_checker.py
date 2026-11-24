@@ -314,6 +314,151 @@ PRODUCT_FRAME_DEC2026_PERIODIC = [
     (3000016, '十勝産サックリ衣のポテトコロッケ', 2),
 ]
 
+# ============================================================================
+# 商品枠シート（月ごとのタブ「YY年M月商品枠」）の読み込み（2026/11・毎月のコード修正をなくすため）
+#   No.27（★商材の平日夜クオータ）と No.32（商品枠クオータ・周期）は、このシートの内容で判定する。
+#   列：A=カテゴリー B=商品ID C=名称（★…MLのみ使用商材） D=使用頻度 E=最大使用回数(月) F=備考
+#   ・D列「毎月◯回以上」→月内の下限、E列「◯回」→月内の上限（以前からのユーザー確認済みスコープ）。
+#     「毎月」「毎月◯回」（以上なし）は下限・上限どちらとも断定できないため対象外。
+#   ・D列「隔月1回」「3カ月1回」→過去メニュー履歴との周期チェック（参考実装）。
+#   ・「在庫状況次第」など数値にできない表記は対象外（画面の『マスタ・設定の確認』に出す）。
+#   ・No.27は、名称に★があり、備考に「平日夜に◯回は入れる」とある商品が対象。
+#   ・「ここからは◯月商品枠外…」と書かれた行より下は、その月の商品枠に含まれないため判定しない。
+# 1つの商品に複数のIDが使われている場合（シートのID以外が実際のメニューで使われている等）は、
+# PRODUCT_ID_ALIASES に足す（今後は設定シートに出す予定）。
+# ============================================================================
+PRODUCT_ID_ALIASES = {
+    3001677: (3001677, 3000183),   # ピーマン肉詰めフライ。3000183=DKピーマン肉詰めフライ(大京食品)。実際に使われているID
+}
+FRAME_CATEGORIES = ('メイン', 'サブ', '副菜', 'サラダ')
+# No.27にはシートに載らない商材（備考にだけ書かれている）が1つあるため、コード側に残す。
+# (商品ID or None, 名前に含むキーワード, 月内の最低使用回数, 枠)
+FD_QUOTA_EXTRA = [
+    (None, '魚弁当', 1, 'サブ'),
+]
+
+
+def _frame_clean_name(name):
+    n = _nfkc(str(name)).replace('★', '')
+    return re.sub(r'\s+', ' ', n).strip()
+
+
+def parse_product_frame_rows(rows):
+    """商品枠シート（CSVを読んだ行のリスト）を解釈し、(商品のリスト, 注意メッセージのリスト) を返す。
+    見出し行（A列が「カテゴリー」）の位置や列の並びが多少ずれても、見出しの文言から列を探す。"""
+    notes = []
+    hdr_i, hdr = None, None
+    for i, r in enumerate(rows):
+        cells = [str(c).strip() for c in r]
+        if cells and cells[0].startswith('カテゴリー'):
+            hdr_i, hdr = i, cells
+            break
+
+    def col(prefix, default):
+        if hdr:
+            for j, c in enumerate(hdr):
+                if c.startswith(prefix):
+                    return j
+        return default
+    c_pid, c_name = col('商品ID', 1), col('名称', 2)
+    c_freq, c_max, c_note = col('使用頻度', 3), col('最大使用回数', 4), col('備考', 5)
+    start = (hdr_i + 1) if hdr_i is not None else 0
+    out, out_of_frame = [], False
+    for r in rows[start:]:
+        cells = [str(c).strip() for c in r] + [''] * 8
+        # 「ここからは◯月商品枠外…」はG列（使用日）に書かれている。その行以降は商品枠の対象外
+        if any(('ここからは' in c and '商品枠外' in c) for c in cells):
+            out_of_frame = True
+        cat = cells[0]
+        if cat not in FRAME_CATEGORIES:
+            continue
+        name_raw = cells[c_name]
+        freq = _nfkc(cells[c_freq]).replace(' ', '')
+        mx = _nfkc(cells[c_max]).replace(' ', '')
+        note = cells[c_note].replace('\n', ' ')
+        pid_txt = re.sub(r'[,\s]', '', _nfkc(cells[c_pid]))
+        pid = int(pid_txt) if pid_txt.isdigit() else None
+        e = {'cat': cat, 'pid': pid, 'name': _frame_clean_name(name_raw), 'star': '★' in name_raw,
+             'freq': freq, 'max_raw': mx, 'note': note, 'out_of_frame': out_of_frame,
+             'min_count': None, 'max_count': None, 'period_months': None, 'weekday_night_min': None}
+        m = re.fullmatch(r'毎月(\d+)回以上', freq)
+        if m:
+            e['min_count'] = int(m.group(1))
+        m = re.fullmatch(r'(\d+)回', mx)
+        if m:
+            e['max_count'] = int(m.group(1))
+        m = re.fullmatch(r'隔月(\d+)回', freq)
+        if m:
+            e['period_months'] = 2
+        m = re.fullmatch(r'(\d+)[カヶケか]月(\d+)回', freq)
+        if m:
+            e['period_months'] = int(m.group(1))
+        if e['star']:
+            m = re.search(r'平日夜に(\d+)回', _nfkc(note))
+            if m:
+                e['weekday_night_min'] = int(m.group(1))
+            elif '平日夜に入れる' in _nfkc(note):
+                e['weekday_night_min'] = 1
+        # --- 注意メッセージ ---
+        label = e['name'][:22] or '(名称なし)'
+        known = (freq == '' or freq == '毎月' or re.fullmatch(r'毎月\d+回(以上)?', freq)
+                 or e['period_months'] is not None)
+        if not known:
+            notes.append(f'商品枠「{label}」：使用頻度「{cells[c_freq]}」は回数に直せないため、回数の判定から外しました')
+        elif mx and e['max_count'] is None:
+            notes.append(f'商品枠「{label}」：最大使用回数「{cells[c_max]}」は回数に直せないため、上限の判定から外しました')
+        m2 = re.search(r'(\d+)回(?:使用)?(?:OK|ok|まで|可)', _nfkc(note))
+        if m2 and e['max_count'] is not None and int(m2.group(1)) != e['max_count'] and not out_of_frame:
+            notes.append(f'商品枠「{label}」：最大使用回数は{e["max_count"]}回ですが、備考に「{m2.group(0)}」とあり食い違っています'
+                         '（最大使用回数の列の値で判定します）')
+        e['pids'] = PRODUCT_ID_ALIASES.get(pid, (pid,)) if pid is not None else ()
+        out.append(e)
+    if not out:
+        notes.append('商品枠シートに商品の行が見つかりませんでした（別のタブを読み込んだ可能性があります）')
+    return out, notes
+
+
+def load_product_frame_csv(path):
+    """商品枠シートのCSV（Googleスプレッドシート1タブの書き出し）を読み、(商品のリスト, 注意メッセージ) を返す。"""
+    import csv
+    with open(path, encoding='utf-8-sig', newline='') as f:
+        rows = list(csv.reader(f))
+    return parse_product_frame_rows(rows)
+
+
+def _legacy_frame_entries():
+    """product_frame_paths が渡されなかった場合（旧app.py）の代わり：コードに残してある26年12月分の値。"""
+    ents = []
+    for pid, name, mn, mx in PRODUCT_FRAME_DEC2026_QUOTA:
+        pids = tuple(pid) if isinstance(pid, (tuple, list, set, frozenset)) else (pid,)
+        ents.append({'cat': '', 'pid': pids[0], 'pids': pids, 'name': name, 'star': False, 'freq': '', 'max_raw': '',
+                     'note': '', 'out_of_frame': False, 'min_count': mn, 'max_count': mx, 'period_months': None,
+                     'weekday_night_min': None})
+    for pid, name, gap in PRODUCT_FRAME_DEC2026_PERIODIC:
+        ents.append({'cat': '', 'pid': pid, 'pids': (pid,), 'name': name, 'star': False, 'freq': '', 'max_raw': '',
+                     'note': '', 'out_of_frame': False, 'min_count': None, 'max_count': None, 'period_months': gap,
+                     'weekday_night_min': None})
+    for pid, kw, mn, waku in FD_WEEKDAY_NIGHT_QUOTA:
+        if pid is None:
+            continue
+        pids = tuple(pid) if isinstance(pid, (tuple, list, set, frozenset)) else (pid,)
+        ents.append({'cat': waku, 'pid': pids[0], 'pids': pids, 'name': kw, 'star': True, 'freq': '', 'max_raw': '',
+                     'note': '', 'out_of_frame': False, 'min_count': None, 'max_count': None, 'period_months': None,
+                     'weekday_night_min': mn})
+    return ents
+
+
+def product_frame_for_month(data, month):
+    """その月の商品枠（商品のリスト）を返す。シートが無い月は None。
+    product_frame_paths が渡されなかった場合だけ、26年12月分のコード内の値を12月に使う（旧app.py対応）。"""
+    frames = getattr(data, 'product_frames', None)
+    if frames:
+        return frames.get(month)
+    if frames is None and month == 12 and getattr(data, 'frame_legacy', True):
+        return _legacy_frame_entries()
+    return None
+
+
 FISH_FD_ONLY = ['いわしの梅煮', 'マスの塩焼き', 'サーモン塩焼き', 'ぶりのみぞれ', 'さばの味噌煮',
                 'さわらの西京焼き', 'タラの香草焼き', 'あじみりん焼き', 'あじの塩焼き']
 # No.14用の栄養素基準（2026/9時点・ユーザー指定で昼夜共通に変更）。
@@ -479,6 +624,9 @@ class MenuData:
 
     def __init__(self):
         self.months = []                 # [7, 8, ...]
+        self.product_frames = None       # {月: 商品枠の商品リスト}。product_frame_paths を渡すと辞書になる（渡さなければNone＝旧方式）
+        self.frame_legacy = True         # Noneのとき12月だけコード内の26年12月分を使う（旧app.py対応）
+        self.master_checks = []          # [(レベル, 内容)] 画面の先頭に出す『マスタ・設定の確認』
         self.shoku = {}                  # month -> DataFrame (昼, build_day_index済み)
         self.shoku_night = {}            # month -> DataFrame (夜, build_day_index済み) ※無ければキー無し
         self.menu_lunch_tagged = {}      # month -> (df, pos_def) 調理法/タグ付き昼メニュー ※無ければキー無し
@@ -980,7 +1128,7 @@ def load_history(history_csv_paths, size='M'):
 
 def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                         seasoning_csv_path=None, fried_master_path=None, history_csv_paths=None,
-                        size='M'):
+                        size='M', product_frame_paths=None):
     """xlsx_path: メインのメニューワークブック。
     night_csv_paths: {month: csv_path} 夜食材CSV（任意）。
     day_csv_paths: {(month, '昼'|'夜'): csv_path} 商品ID単位のNo.1判定用CSV（任意）。
@@ -992,6 +1140,19 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
     night_csv_paths = night_csv_paths or {}
     day_csv_paths = day_csv_paths or {}
     data = MenuData()
+    if product_frame_paths is not None:
+        # 月ごとの商品枠シート（{月: CSVのパス}）。渡されたら、No.27/No.32はこのシートの内容で判定する。
+        data.product_frames = {}
+        for _m, _pth in dict(product_frame_paths).items():
+            try:
+                _ents, _notes = load_product_frame_csv(_pth)
+            except Exception as e:
+                data.master_checks.append(('警告', f'{_m}月の商品枠シートを読み込めませんでした（{e}）'))
+                continue
+            for _n in _notes:
+                data.master_checks.append(('注意', _n))
+            if _ents:
+                data.product_frames[int(_m)] = _ents
     if veg_master_path:
         try:
             data.veg_color_map = load_veg_color_map(veg_master_path)
@@ -4287,6 +4448,20 @@ def check_rule30(data):
     return pd.DataFrame(viol)
 
 
+def _note_frame_missing(data, month, what):
+    """その月の商品枠シートが無い／読めなかったため、商品枠に基づく判定をスキップしたことを記録する（1月1回だけ）。"""
+    seen = getattr(data, '_frame_missing_seen', None)
+    if seen is None:
+        seen = data._frame_missing_seen = set()
+    if (month, what) in seen:
+        return
+    seen.add((month, what))
+    by = getattr(data, 'base_year', None)
+    tab = f'「{by % 100}年{month}月商品枠」' if by else f'「{month}月商品枠」'
+    data.master_checks.append(('警告', f'{month}月の商品枠シート（タブ{tab}）が読み込めなかったため、'
+                                       f'{what}を判定しませんでした'))
+
+
 def check_rule27(data):
     """No.27: FD専用商材（魚弁当のみ、確定5商材）は平日に入れる（参考実装）＋
     「FDメニュールール」シート（★マーク商品の備考「平日夜に◯回は入れる」・ユーザー確認済みスコープ）に
@@ -4331,27 +4506,37 @@ def check_rule27(data):
             data.warnings.append(
                 f'{mth}月：{"夜" if has_l else "昼"}の食材データが無いため、No.27の★商材クオータは'
                 f'{"昼" if has_l else "夜"}のみの使用回数で判定しています（不足分は誤検出の可能性があります）')
-    for pid, kw, min_count, waku in FD_WEEKDAY_NIGHT_QUOTA:
-        by_month = {}
-        for d in dr:
-            month = d.month
-            md = (d.month, d.day)
-            for slot_label, shoku in (('昼', data.shoku.get(month)), ('夜', data.shoku_night.get(month))):
-                if shoku is None:
+    for month in quota_months:
+        fr = product_frame_for_month(data, month)
+        if fr is None:
+            _note_frame_missing(data, month, 'No.27（★商材の月内回数）')
+            continue
+        # シートの商品のうち、★があり備考に「平日夜に◯回は入れる」とあるものだけが対象。
+        # 「ここからは◯月商品枠外」より下の行は判定しない。
+        entries = [(e['pids'], e['name'], e['weekday_night_min'], e['cat']) for e in fr
+                   if e['weekday_night_min'] and e['pids'] and not e['out_of_frame']]
+        entries += list(FD_QUOTA_EXTRA)
+        for pid, kw, min_count, waku in entries:
+            used_set = set()
+            for d in dr:
+                if d.month != month:
                     continue
-                sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
-                if not len(sub):
-                    continue
-                if pid is not None:
-                    hit = pd.to_numeric(sub['商品ID'], errors='coerce').isin(_pid_set(pid)).any()
-                else:
-                    hit = sub['商品名'].astype(str).str.contains(kw, na=False).any() or \
-                        sub['レシピ名'].astype(str).str.contains(kw, na=False).any()
-                if hit:
-                    # 同じ日の昼と夜は別々に1回ずつ数える（(日付, 昼夜)を1回分とする）
-                    by_month.setdefault(month, set()).add((d, slot_label))
-        for month in quota_months:
-            used = sorted(by_month.get(month, set()), key=lambda x: (x[0], x[1] != '昼'))
+                md = (d.month, d.day)
+                for slot_label, shoku in (('昼', data.shoku.get(month)), ('夜', data.shoku_night.get(month))):
+                    if shoku is None:
+                        continue
+                    sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
+                    if not len(sub):
+                        continue
+                    if pid is not None:
+                        hit = pd.to_numeric(sub['商品ID'], errors='coerce').isin(_pid_set(pid)).any()
+                    else:
+                        hit = sub['商品名'].astype(str).str.contains(kw, na=False).any() or \
+                            sub['レシピ名'].astype(str).str.contains(kw, na=False).any()
+                    if hit:
+                        # 同じ日の昼と夜は別々に1回ずつ数える（(日付, 昼夜)を1回分とする）
+                        used_set.add((d, slot_label))
+            used = sorted(used_set, key=lambda x: (x[0], x[1] != '昼'))
             cnt = len(used)
             if cnt < min_count:
                 used_txt = '／'.join(f'{u.strftime("%-m/%-d")}({WD_JP[u.weekday()]}){sl}' for u, sl in used) or 'なし'
@@ -4580,85 +4765,95 @@ def check_rule31(data):
 
 
 def check_rule32(data):
-    """No.32: 「26年12月商品枠シート」に基づく、商品ID単位の使用回数・周期チェック。
-    ①月内使用回数チェック（PRODUCT_FRAME_DEC2026_QUOTA・使用頻度(D列)/最大使用回数(E列)）：
-      ・min_countがある商品：月内の使用回数がそれ未満なら下限未達
-      ・max_countがある商品：月内の使用回数がそれを超えたら上限超過
+    """No.32: 月ごとの「商品枠」シート（タブ「YY年M月商品枠」）に基づく、商品ID単位の使用回数・周期チェック。
+    ①月内使用回数チェック（使用頻度(D列)・最大使用回数(E列)）：
+      ・D列「毎月◯回以上」の商品：月内の使用回数がそれ未満なら下限未達
+      ・E列に「◯回」がある商品：月内の使用回数がそれを超えたら上限超過
       昼夜どちらの使用も区別せず、月内の使用（昼/夜・商品ID一致）の延べ回数で判定する。
       ただし平日昼（月〜金で祝日扱いでない日の昼）は商品枠のカウント対象外（担当者判断・2026/10。
       上限・下限の両方に適用）。
-    ②周期チェック（PRODUCT_FRAME_DEC2026_PERIODIC・「隔月1回」「3カ月1回」）：
+    ②周期チェック（D列「隔月1回」「3カ月1回」）：
       商品ID単位の過去メニュー履歴（_usage_history_by_id・history_csv_pathsで渡した場合のみ）
       と比較し、前回使用からの間隔が指定月数未満なら参考情報として検出する（低重要度）。
       履歴が無い商品は判定不能として何も出さない。備考の「YD使用翌月に使用可」等の在庫持ち越し
       例外は在庫データが無いと判定できないため誤検出の可能性がある（ユーザー確認済み・参考実装）。
-    このシートの内容は2026年12月のメニューにのみ適用する（ユーザー確認済み）ため、
-    date_range（対象期間）の中に2026年12月の日付が無い場合は何も判定しない。
-    他の月のデータが混在していても、2026年12月以外の日は集計・判定の対象外にする。"""
+    「ここからは◯月商品枠外」より下の行は判定しない。その月の商品枠シートが読み込めなかった月は
+    判定せず、『マスタ・設定の確認』に出す。"""
     dr = data.date_range
-    dec_days = [d for d in dr if d.year == 2026 and d.month == 12]
-    if not dec_days:
-        return pd.DataFrame()
     viol = []
-    for pid, name, min_count, max_count in PRODUCT_FRAME_DEC2026_QUOTA:
-        used = set()
-        for d in dec_days:
-            for slot, shoku_dict in (('昼', data.shoku), ('夜', data.shoku_night)):
-                shoku = shoku_dict.get(12)
-                if shoku is None:
-                    continue
-                md = (d.month, d.day)
-                sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
-                if not len(sub):
-                    continue
-                # 担当者判断（2026/10）：平日昼は商品枠のカウント無し（祝日扱いの日は平日に含めない）
-                if slot == '昼' and _is_workday(d):
-                    continue
-                hit = pd.to_numeric(sub['商品ID'], errors='coerce').isin(_pid_set(pid)).any()
-                if hit:
-                    used.add((d, slot))
-        used_sorted = sorted(used)
-        cnt = len(used_sorted)
-        used_txt = '／'.join(f'{u.strftime("%-m/%-d")}({WD_JP[u.weekday()]}{s})' for u, s in used_sorted) or 'なし'
-        if min_count is not None and cnt < min_count:
-            viol.append({
-                '日付': '2026年12月(月次)', '曜日': '-', 'No': 32,
-                'ルール': f'商品枠クオータ未達：{name}',
-                '該当箇所': f'2026年12月 全体（使用: {used_txt}。平日昼は除く）',
-                '理由': f'月内使用が{cnt}回のみ（下限{min_count}回）',
-                '修正提案': f'「{name}」をあと{min_count - cnt}回追加する', '重要度': '中（商品枠シート準拠）',
-            })
-        if max_count is not None and cnt > max_count:
-            viol.append({
-                '日付': '2026年12月(月次)', '曜日': '-', 'No': 32,
-                'ルール': f'商品枠クオータ超過：{name}',
-                '該当箇所': f'2026年12月 全体（使用: {used_txt}。平日昼は除く）',
-                '理由': f'月内使用が{cnt}回（上限{max_count}回）',
-                '修正提案': f'「{name}」の使用を{cnt - max_count}回減らす', '重要度': '中（商品枠シート準拠）',
-            })
-    # ②「隔月1回」「3カ月1回」の周期チェック（商品ID単位・過去メニュー履歴が必要）。
-    hist_id = _usage_history_by_id(data)
-    for pid, name, gap_months in PRODUCT_FRAME_DEC2026_PERIODIC:
-        uses = hist_id.get(pid, [])
-        dec_uses = sorted(u for u in uses if u.year == 2026 and u.month == 12)
-        if not dec_uses:
-            continue  # 12月に使用が無ければ周期チェック対象外
-        first_dec = dec_uses[0]
-        prior = [u for u in uses if u < pd.Timestamp(first_dec.year, first_dec.month, 1)]
-        if not prior:
-            continue  # 12月より前の使用履歴が無い（＝過去メニューCSV未提供等）ため判定不能
-        last_prior = max(prior)
-        month_gap = (first_dec.year - last_prior.year) * 12 + (first_dec.month - last_prior.month)
-        if month_gap < gap_months:
-            viol.append({
-                '日付': '2026年12月(月次)', '曜日': '-', 'No': 32,
-                'ルール': f'商品枠クオータ：周期未達（{name}）',
-                '該当箇所': f'2026年12月{first_dec.strftime("%-d")}日 使用（前回使用: {last_prior.strftime("%Y/%-m")}月）',
-                '理由': f'「{gap_months}ヶ月に1回」に対して前回使用から{month_gap}ヶ月しか空いていない'
-                        '（在庫(YD)持ち越し例外は判定不可のため参考情報）',
-                '修正提案': '在庫状況を確認し、YD持ち越しでなければ使用日をずらす',
-                '重要度': '低（参考実装・過去メニュー履歴が必要）',
-            })
+    hist_id = None
+    for month in sorted({d.month for d in dr}):
+        fr = product_frame_for_month(data, month)
+        if fr is None:
+            _note_frame_missing(data, month, 'No.32（商品枠クオータ・周期）')
+            continue
+        days = [d for d in dr if d.month == month]
+        label = f'{days[0].year}年{month}月'
+        for e in fr:
+            if e['out_of_frame'] or not e['pids']:
+                continue
+            name, pids = e['name'], e['pids']
+            if e['min_count'] is not None or e['max_count'] is not None:
+                used = set()
+                for d in days:
+                    for slot, shoku_dict in (('昼', data.shoku), ('夜', data.shoku_night)):
+                        shoku = shoku_dict.get(month)
+                        if shoku is None:
+                            continue
+                        md = (d.month, d.day)
+                        sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
+                        if not len(sub):
+                            continue
+                        # 担当者判断（2026/10）：平日昼は商品枠のカウント無し（祝日扱いの日は平日に含めない）
+                        if slot == '昼' and _is_workday(d):
+                            continue
+                        if pd.to_numeric(sub['商品ID'], errors='coerce').isin(_pid_set(pids)).any():
+                            used.add((d, slot))
+                used_sorted = sorted(used)
+                cnt = len(used_sorted)
+                used_txt = '／'.join(f'{u.strftime("%-m/%-d")}({WD_JP[u.weekday()]}{s})' for u, s in used_sorted) or 'なし'
+                if e['min_count'] is not None and cnt < e['min_count']:
+                    viol.append({
+                        '日付': f'{label}(月次)', '曜日': '-', 'No': 32,
+                        'ルール': f'商品枠クオータ未達：{name}',
+                        '該当箇所': f'{label} 全体（使用: {used_txt}。平日昼は除く）',
+                        '理由': f'月内使用が{cnt}回のみ（下限{e["min_count"]}回）',
+                        '修正提案': f'「{name}」をあと{e["min_count"] - cnt}回追加する', '重要度': '中（商品枠シート準拠）',
+                    })
+                if e['max_count'] is not None and cnt > e['max_count']:
+                    viol.append({
+                        '日付': f'{label}(月次)', '曜日': '-', 'No': 32,
+                        'ルール': f'商品枠クオータ超過：{name}',
+                        '該当箇所': f'{label} 全体（使用: {used_txt}。平日昼は除く）',
+                        '理由': f'月内使用が{cnt}回（上限{e["max_count"]}回）',
+                        '修正提案': f'「{name}」の使用を{cnt - e["max_count"]}回減らす', '重要度': '中（商品枠シート準拠）',
+                    })
+            if e['period_months']:
+                if hist_id is None:
+                    hist_id = _usage_history_by_id(data)
+                uses = []
+                for pid in pids:
+                    uses += list(hist_id.get(pid, []))
+                year = days[0].year
+                m_uses = sorted(u for u in uses if u.year == year and u.month == month)
+                if not m_uses:
+                    continue  # その月に使用が無ければ周期チェック対象外
+                first_use = m_uses[0]
+                prior = [u for u in uses if u < pd.Timestamp(year, month, 1)]
+                if not prior:
+                    continue  # 前月以前の使用履歴が無い（＝過去メニューCSV未提供等）ため判定不能
+                last_prior = max(prior)
+                month_gap = (year - last_prior.year) * 12 + (month - last_prior.month)
+                if month_gap < e['period_months']:
+                    viol.append({
+                        '日付': f'{label}(月次)', '曜日': '-', 'No': 32,
+                        'ルール': f'商品枠クオータ：周期未達（{name}）',
+                        '該当箇所': f'{label}{first_use.strftime("%-d")}日 使用（前回使用: {last_prior.strftime("%Y/%-m")}月）',
+                        '理由': f'「{e["period_months"]}ヶ月に1回」に対して前回使用から{month_gap}ヶ月しか空いていない'
+                                '（在庫(YD)持ち越し例外は判定不可のため参考情報）',
+                        '修正提案': '在庫状況を確認し、YD持ち越しでなければ使用日をずらす',
+                        '重要度': '低（参考実装・過去メニュー履歴が必要）',
+                    })
     return pd.DataFrame(viol)
 
 
@@ -4779,11 +4974,62 @@ def _redo_without_dessert_at_night(fn, data, result):
     return tuple(out) if isinstance(result, tuple) else out[0]
 
 
+def _master_gap_checks(data):
+    """マスタ・設定の不備を data.master_checks に追加する（違反としては数えず、画面の先頭に出す）。
+    ①商品枠で「商品枠外」とされた商品がその月のメニューで使われている
+    ②商品枠に載っている商品のIDがメニューに1度も出ないのに、商品名が似た別IDの商品が使われている
+      （ピーマン肉詰めフライのような『IDの登録違い』を見つけるため）"""
+    try:
+        for month in sorted(data.product_frames or {}):
+            fr = data.product_frames.get(month) or []
+            frames_ids = set()
+            for e in fr:
+                frames_ids |= _pid_set(e['pids']) if e['pids'] else set()
+            used_ids, names_by_id = {}, {}
+            for shoku_dict in (data.shoku, data.shoku_night):
+                shoku = shoku_dict.get(month)
+                if shoku is None or not len(shoku):
+                    continue
+                sub = shoku[shoku['isDX']]
+                for pid, nm, md in zip(pd.to_numeric(sub['商品ID'], errors='coerce'), sub['商品名'].astype(str), sub['md']):
+                    if pd.isna(pid):
+                        continue
+                    pid = int(pid)
+                    used_ids.setdefault(pid, set()).add(md)
+                    names_by_id[pid] = nm
+            for e in fr:
+                pids = _pid_set(e['pids']) if e['pids'] else set()
+                if not pids:
+                    continue
+                name = e['name']
+                hit = [i for i in pids if i in used_ids]
+                if e['out_of_frame']:
+                    if hit:
+                        n = sum(len(used_ids[i]) for i in hit)
+                        data.master_checks.append(('注意', f'{month}月の商品枠で「商品枠外」とされている「{name}」が、'
+                                                           f'メニューで{n}日使われています'))
+                    continue
+                if hit:
+                    continue
+                core = re.sub(r'[☆★【】\[\]()（）0-9０-９.,gGkKｇ×xX個枚切本パック入り袋kg]+', '', str(name))
+                core = core.replace('自然解凍', '').replace('要加熱', '')
+                if len(core) < 4:
+                    continue
+                cands = sorted({nm for i, nm in names_by_id.items() if i not in frames_ids and core in nm})
+                if cands:
+                    data.master_checks.append(('注意', f'{month}月の商品枠「{name}」（ID {e["pid"]}）はメニューに出ていませんが、'
+                                                       f'同じ名前の別IDの商品が使われています：{"／".join(cands[:2])}。'
+                                                       f'商品IDの登録違いの可能性があります'))
+    except Exception as ex:  # noqa: BLE001
+        data.master_checks.append(('注意', f'マスタ確認の途中でエラーが出ました（{ex}）'))
+
+
 def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                     seasoning_csv_path=None, fried_master_path=None, ai_client=None,
-                    history_csv_paths=None, size='M'):
+                    history_csv_paths=None, size='M', product_frame_paths=None):
     data = load_workbook_data(xlsx_path, night_csv_paths, day_csv_paths, veg_master_path,
-                               seasoning_csv_path, fried_master_path, history_csv_paths, size)
+                               seasoning_csv_path, fried_master_path, history_csv_paths, size,
+                               product_frame_paths=product_frame_paths)
     data.ai_client = ai_client
     frames = []
     # デザートは差し替え候補に一切出さない（昼夜とも。担当者判断・2026/11）：全ルールの実行中ずっと除外を有効にする。
@@ -4803,6 +5049,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
             if len(result):
                 frames.append(result.reindex(columns=cols_std))
     _DESSERT_CTX['data'] = None
+    _master_gap_checks(data)
     if frames:
         combined = pd.concat(frames, ignore_index=True)
         combined['No'] = combined['No'].astype(int)
@@ -4828,6 +5075,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
         'total': len(combined),
         'by_rule': combined['No'].value_counts().sort_index().to_dict() if len(combined) else {},
         'warnings': data.warnings,
+        'master_checks': list(data.master_checks),
     }
     return combined, summary
 
