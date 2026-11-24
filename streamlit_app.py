@@ -77,6 +77,8 @@ FRAME_SHEET_GIDS = {   # (西暦下2桁, 月): gid  ※無くても動く。タ�
 # ============================================================================
 SETTINGS_BOOK_URL = 'https://docs.google.com/spreadsheets/d/1SCqW9BttOKdIo-YAowcAEKMpsRnw0al-7NKfir58qLE/edit'
 SETTINGS_TABS = ('数値', '商品ID例外', 'キーワード')
+SETTINGS_EXTRA_TABS = ('終売',)    # 見出しが違うタブ（終売の一覧）
+SETTINGS_HISTORY_TAB = '履歴'     # 過去メニューの一覧（月｜URL｜有効）
 
 # ============================================================================
 # ★ 過去メニュー（履歴）の管理 ★
@@ -369,13 +371,16 @@ def resolve_settings():
     if not url:
         return {}, ['<span class="muted">設定シート：未設定（コードの既定値で動作）</span>']
     paths, ng = {}, []
-    for tab in SETTINGS_TABS:
+    for tab in SETTINGS_TABS + SETTINGS_EXTRA_TABS:
         try:
             data = fetch_settings_csv(url, tab)
             path = os.path.join(TMP_DIR, f'設定_{tab}.csv')
             with open(path, 'wb') as fh:
                 fh.write(data)
-            mc.load_settings_csv(path)       # 見出し行があるか確認
+            if tab == '終売':                # 見出し行があるか確認
+                mc.load_discontinued_csv(path)
+            else:
+                mc.load_settings_csv(path)
             paths[tab] = path
         except Exception as e:  # noqa: BLE001
             ng.append(f'{tab}（{e}）')
@@ -413,10 +418,14 @@ _TRUE_WORDS = {'○', '◯', '〇', 'o', 'O', '有効', 'はい', 'yes', 'YES', 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_history_registry(url):
-    """管理用スプレッドシートから [(月ラベル, URL), ...] を読む。
+    """管理用スプレッドシート（URL直指定）から [(月ラベル, URL), ...] を読む。"""
+    return parse_history_registry(fetch_master_bytes(url, 'csv'))
+
+
+def parse_history_registry(data):
+    """管理用の表（CSVのbytes）から [(月ラベル, URL), ...] を読む。
     列名は「月」「URL」「有効」を想定するが、見つからない場合は
     1列目=月・URLらしき列=URL として推定する。"""
-    data = fetch_master_bytes(url, 'csv')
     df = pd.read_csv(io.BytesIO(data), dtype=str).fillna('')
     if df.empty:
         return []
@@ -447,8 +456,18 @@ def load_history_registry(url):
 
 
 def history_sources():
-    """過去メニューの一覧を返す。管理用シートがあればそちらを優先する。"""
+    """過去メニューの一覧を返す。設定シートのタブ「履歴」→管理用シート→コード内の一覧の順に使う。"""
     url = (HISTORY_REGISTRY_URL or '').strip()
+    book = (SETTINGS_BOOK_URL or '').strip()
+    if not url and book:
+        try:
+            rows = parse_history_registry(fetch_settings_csv(book, SETTINGS_HISTORY_TAB))
+        except Exception as e:  # noqa: BLE001
+            return list(HISTORY_SHEET_URLS), f'設定シートのタブ「履歴」を読めませんでした（{e}）。コード内の一覧を使用します。'
+        if not rows:
+            return (list(HISTORY_SHEET_URLS),
+                    '設定シートのタブ「履歴」に有効な行がありません（タブが無い可能性があります）。コード内の一覧を使用します。')
+        return rows, None
     if not url:
         return list(HISTORY_SHEET_URLS), None
     try:
