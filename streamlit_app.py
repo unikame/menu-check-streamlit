@@ -21,6 +21,7 @@ import os
 import re
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pandas as pd
@@ -48,6 +49,23 @@ MASTER_SHEET_URLS = {
     # 食材データ（No.12 当日揚げ / No.21 禁止食材 / No.14 レシピ別栄養価）
     # 複数タブを使うため、ブック全体をxlsxとして取得します（gidは不要）。
     'shoku': 'https://docs.google.com/spreadsheets/d/1bPju1fjNDDV59eCFrzStjGFoM0RhVzzrPk_MMLu20v0/edit?gid=1718859394#gid=1718859394',
+}
+
+# ============================================================================
+# ★ 月ごとの「商品枠」シート ★
+#   チェック対象の月（食材CSVの名称欄から判定）に合わせて、ブック内の
+#   タブ「YY年M月商品枠」（例：27年2月商品枠）を自動で探して読みます。
+#   ・毎月は「YY年M月商品枠」というタブを足すだけでOK（コード修正は不要）。
+#   ・タブ名で見つからない場合の保険として、FRAME_SHEET_GIDS（タブのgid）も使えます。
+#   ・どちらでも読めない場合は、画面にCSVのアップロード欄が出ます。
+#   ・ブックは「リンクを知っている全員（閲覧者）」にしてください。
+# ============================================================================
+FRAME_BOOK_URL = 'https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY/edit'
+FRAME_TAB_FORMAT = '{yy}年{m}月商品枠'
+FRAME_SHEET_GIDS = {   # (西暦下2桁, 月): gid  ※無くても動く。タブ名で取れないときの保険
+    (26, 12): 2037364563,
+    (27, 1): 1069506425,
+    (27, 2): 762388340,
 }
 
 # ============================================================================
@@ -245,6 +263,85 @@ def resolve_master(key):
     return path, f'{label}（{rules}）', True
 
 
+def detect_target_months(uploaded_files):
+    """食材CSVの名称欄（例：高齢者 S・M 27年2月1日(月)の昼）から [(西暦下2桁, 月)] を拾う。"""
+    found = set()
+    for f in uploaded_files or []:
+        try:
+            raw = f.getvalue()
+        except Exception:  # noqa: BLE001
+            continue
+        for enc in ('utf-8-sig', 'cp932'):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                text = ''
+        for yy, m in re.findall(r'(\d{2})年(\d{1,2})月\d{1,2}日', text):
+            if 1 <= int(m) <= 12:
+                found.add((int(yy), int(m)))
+    return sorted(found)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_frame_csv(book_url, yy, month, gid):
+    """月の商品枠タブを取得して (CSVのbytes, 取得方法) を返す（1時間キャッシュ）。
+    ①タブ名で取得（gviz）→ ②gidで取得。どちらも「商品枠の行が読めた」ものだけ採用する。
+    ※gvizはタブ名が無いと先頭のタブを返すため、中身に『N月』が含まれるかも確認する。"""
+    m = _SHEET_ID_RE.search(str(book_url))
+    if not m:
+        raise ValueError('商品枠ブックのURLが正しくありません')
+    sid = m.group(1)
+    tab = FRAME_TAB_FORMAT.format(yy=yy, m=month)
+    tries = [('タブ名「%s」' % tab,
+              f'https://docs.google.com/spreadsheets/d/{sid}/gviz/tq?tqx=out:csv&sheet='
+              + urllib.parse.quote(tab))]
+    if gid:
+        tries.append((f'gid={gid}',
+                      f'https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}'))
+    errs = []
+    for how, url in tries:
+        try:
+            data = _download(url)
+            path = os.path.join(TMP_DIR, f'_probe_{yy}_{month}.csv')
+            with open(path, 'wb') as fh:
+                fh.write(data)
+            entries, _notes = mc.load_product_frame_csv(path)
+            if not entries:
+                raise ValueError('商品の行が見つかりません')
+            text = data.decode('utf-8-sig', errors='ignore')
+            if f'{month}月' not in text:
+                raise ValueError(f'中身に「{month}月」が無く、別のタブの可能性があります')
+            return data, how
+        except Exception as e:  # noqa: BLE001
+            errs.append(f'{how}：{e}')
+    raise PermissionError('／'.join(errs))
+
+
+def resolve_frames(months, manual=None):
+    """月ごとの商品枠を解決して ({月: パス}, チップ, 失敗した[(yy, 月)]) を返す。"""
+    manual = manual or {}
+    paths, chips, failed = {}, [], []
+    for yy, mo in months:
+        tab = FRAME_TAB_FORMAT.format(yy=yy, m=mo)
+        if (yy, mo) in manual:
+            paths[mo] = manual[(yy, mo)]
+            chips.append(f'<span class="ms-ok">● 商品枠 {tab}（手動指定）</span>')
+            continue
+        try:
+            data, how = fetch_frame_csv(FRAME_BOOK_URL, yy, mo, FRAME_SHEET_GIDS.get((yy, mo)))
+        except (PermissionError, ValueError, urllib.error.URLError, TimeoutError) as e:
+            failed.append((yy, mo))
+            chips.append(f'<span class="ms-ng">▲ 商品枠 {tab}：読めませんでした（{e}）</span>')
+            continue
+        path = os.path.join(TMP_DIR, f'商品枠_{yy}_{mo}.csv')
+        with open(path, 'wb') as fh:
+            fh.write(data)
+        paths[mo] = path
+        chips.append(f'<span class="ms-ok">● 商品枠 {tab}（{how}で取得）</span>')
+    return paths, chips, failed
+
+
 def history_label(code):
     """'2604' → '26年4月' のように読みやすくする。解釈できなければそのまま返す。"""
     m = re.fullmatch(r'(\d{2})(\d{2})', str(code))
@@ -402,7 +499,10 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
         st.markdown(
             '<div class="statusline"><b>マスタ</b>　' + '　'.join(status['master_chips']) + '</div>'
             '<div class="statusline"><b>過去メニュー</b>　' + '　'.join(status['hist_chips'])
-            + '　<span class="muted">※判定には使わず、代替え案の候補にのみ使用</span></div>',
+            + '　<span class="muted">※判定には使わず、代替え案の候補にのみ使用</span></div>'
+            + '<div class="statusline"><b>商品枠</b>　'
+            + ('　'.join(status.get('frame_chips', [])) or '<span class="muted">（月を判定できませんでした）</span>')
+            + '</div>',
             unsafe_allow_html=True)
     else:
         st.markdown(
@@ -417,6 +517,7 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
     with o2:
         if st.button('再読込', use_container_width=True):
             fetch_master_bytes.clear()
+            fetch_frame_csv.clear()
             load_history_registry.clear()
             st.session_state.pop('conn_status', None)
             st.rerun()
@@ -444,8 +545,19 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
             if up is not None:
                 manual_paths[key] = save_upload(up, 'master')
 
+    manual_frames = {}
+    frame_failed = (status or {}).get('frame_failed', [])
+    if frame_failed:
+        st.caption('取得できなかった月の商品枠シートは、そのタブをCSVで書き出して指定してください'
+                   '（ファイル → ダウンロード → CSV）')
+        for yy, mo in frame_failed:
+            up = st.file_uploader(f'商品枠：{FRAME_TAB_FORMAT.format(yy=yy, m=mo)}',
+                                  type=['csv'], key=f'frame_up_{yy}_{mo}')
+            if up is not None:
+                manual_frames[(yy, mo)] = save_upload(up, 'frame')
 
-def load_sources():
+
+def load_sources(months=(), manual_frames=None):
     """マスタと過去メニューを取得し、状態を session_state に残して返す。
     ページ表示時ではなく、実行時・確認時にだけ呼ぶ。"""
     master_paths, master_failed, chips = {}, [], []
@@ -459,15 +571,17 @@ def load_sources():
     hist_paths, hist_msgs, hist_labels = resolve_history()
     hchips = [f'<span class="{"ms-ok" if ok else "ms-ng"}">'
               f'{"●" if ok else "▲"} {msg}</span>' for ok, msg in hist_msgs]
+    frame_paths, frame_chips, frame_failed = resolve_frames(list(months), manual_frames)
     st.session_state['conn_status'] = {
         'master_chips': chips, 'hist_chips': hchips, 'master_failed': master_failed,
+        'frame_chips': frame_chips, 'frame_failed': frame_failed,
     }
-    return master_paths, hist_paths, hist_labels
+    return master_paths, hist_paths, hist_labels, frame_paths
 
 
 if check_conn:
     with st.spinner('スプレッドシートに接続しています…'):
-        load_sources()
+        load_sources(detect_target_months(day_csvs), manual_frames)
     st.rerun()
 
 # ----------------------------------------------------------------------------
@@ -479,7 +593,9 @@ if run:
         st.stop()
 
     with st.spinner('マスタ・過去メニューを取得しています…'):
-        master_paths, history_paths, history_labels = load_sources()
+        target_months = detect_target_months(day_csvs)
+        master_paths, history_paths, history_labels, frame_paths = load_sources(
+            target_months, manual_frames)
         master_paths.update(manual_paths)   # 手動指定があれば優先
 
     with st.spinner('チェック中…'):
@@ -525,6 +641,7 @@ if run:
             'fried_master_path': master_paths.get('shoku'),
             'ai_client': ai_client,
             'history_csv_paths': hist_paths or None,
+            'product_frame_paths': frame_paths or None,
         }
         # menu_checker.py が古い場合に落ちないよう、対応していない引数は落とす
         supported = set(inspect.signature(mc.run_all_checks).parameters)
@@ -537,6 +654,9 @@ if run:
             st.error(f'チェック中にエラーが発生しました：{e}')
             st.stop()
 
+        if 'product_frame_paths' in dropped:
+            st.warning('menu_checker.py が月ごとの商品枠シートに未対応です（コード内の12月分で判定します）。'
+                       'menu_checker.py も最新版に差し替えてください。')
         if 'history_csv_paths' in dropped and hist_paths:
             st.warning('menu_checker.py が過去メニューに未対応のため、履歴を使わずに実行しました。'
                        'menu_checker.py も最新版に差し替えてください。')
@@ -587,6 +707,17 @@ if overlap:
     st.warning('過去メニューの ' + '・'.join(overlap)
                + ' は、いまチェックしている月と同じです。実質の過去データが減るため、'
                'HISTORY_SHEET_URLS から外すか、別の月に差し替えることを検討してください。')
+
+# ---- マスタ・設定の確認（担当者がシート側で直せるものを、結果の先頭に出す） ----
+master_checks = summary.get('master_checks') or []
+if master_checks:
+    n_warn = sum(1 for lv, _ in master_checks if lv == '警告')
+    with st.expander(f'マスタ・設定の確認（{len(master_checks)}件）'
+                     + (f'　うち警告 {n_warn}件' if n_warn else ''), expanded=bool(n_warn)):
+        st.caption('チェック結果ではなく、商品枠・マスタ側の設定に関するお知らせです。'
+                   'シートを直すと、次回のチェックから反映されます。')
+        for lv, msg in sorted(master_checks, key=lambda x: 0 if x[0] == '警告' else 1):
+            (st.warning if lv == '警告' else st.info)(msg)
 
 st.write('')
 rules_df = summary.get('rules')
@@ -688,6 +819,8 @@ with tab_note:
         '- 重要度は付けていません。結果は日付順に並びます（月次集計の行はその月の先頭）。\n'
         '- 代替え案は商材名ではなくレシピ（メニュー）名で、その日時点で最も長く使われていないものを選びます。\n'
         '- 食材CSVをアップロードした月だけが判定対象です。\n'
+        '- 商品枠（No.27 / No.32）は、チェック対象の月のタブ「YY年M月商品枠」を自動で読みます。'
+        '月が替わったら、そのタブをシートに足すだけでOKです（読めない月は警告を出し、判定しません）。\n'
         '- メニューワークブックは任意です。無い場合は、枠（メイン/サブ/副菜1/副菜2/サラダ）を'
         '食材CSVのレシピ出現順から復元し、栄養価もCSVの列から集計します。'
         '同じ枠に複数の選択肢がある日は名寄せし、6枠目以降（混ぜご飯）は対象外です。\n'
