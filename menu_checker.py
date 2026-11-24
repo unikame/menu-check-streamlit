@@ -40,7 +40,7 @@
   No.12 当日揚げが3品超（当日揚げレシピIDマスタ照合）
   No.14 栄養素の月平均（「N月栄養価」シート優先。夜はデータ未入手のため昼のみ）
   No.15 健康食材 週1回以上
-  No.16 メイン・サブメイン・副菜1のうち固形（食材CSVでそのレシピの先頭行のユニット名が「個」「切」）は
+  No.16 メイン・サブメイン・副菜1のうち固形（食材CSVでそのレシピの先頭行のユニット名が「個」「切」「枚」）は
         同じ食事内で2種まで（2026/10・定義はユーザー確認済み。違反時は副菜1を固形でないメニューに差し替える提案）
   No.17 1食で赤・黄・緑を使用（野菜マスタの色列・昼夜別。黄(卵焼き)は毎食入っている前提のため
         常にクリア済みとして扱う。赤は赤パプリカ/かに風味蒲鉾ほぐし/花がんもも野菜マスタ未登録でも加味）
@@ -1601,6 +1601,27 @@ def _name_veg_set(name):
     return {c for c, rx in _NAME_VEG_RE if rx.search(n)}
 
 
+# 代替え案が、前後の日のメニュー名と同じ食材名で被らないようにするための、野菜以外の食材名（初期案・2026/11）。
+# 担当者指摘：2/6夜の差し替え案「明太バターポテト」が、翌日夜の「竹の子の明太炒め」と名前が続く。
+# 検出ルール（No.30のメニュー名連続）には使わない。代替え案の候補選びにだけ使う。足りない言葉はここに足す。
+NAME_ING_EXTRA_PATTERNS = [
+    ('明太', r'明太|めんたい'),
+    ('しらす', r'しらす|シラス'),
+    ('ツナ', r'ツナ'),
+    ('高菜', r'高菜|たかな'),
+    ('梅', r'梅'),
+    ('チーズ', r'チーズ'),
+    ('ベーコン', r'ベーコン'),
+]
+_NAME_ING_EXTRA_RE = [(c, re.compile(pt)) for c, pt in NAME_ING_EXTRA_PATTERNS]
+
+
+def _name_conflict_set(name):
+    """代替え案の候補選び用：メニュー名に含まれる野菜名＋NAME_ING_EXTRA_PATTERNSの食材名の集合。"""
+    n = _nfkc(str(name))
+    return _name_veg_set(name) | {c for c, rx in _NAME_ING_EXTRA_RE if rx.search(n)}
+
+
 def _near_veg_name_set(data, date, removed=()):
     """date の前日・当日（昼夜とも）・翌日のメニュー名に含まれる野菜名の集合と、その元のレシピ名の対応。
     removed（差し替えで抜けるレシピ）は数えない。"""
@@ -1613,14 +1634,14 @@ def _near_veg_name_set(data, date, removed=()):
         for nm in _day_recipe_names(data, base + pd.Timedelta(days=k)):
             if nm in rem:
                 continue
-            for v in _name_veg_set(nm):
+            for v in _name_conflict_set(nm):
                 out.setdefault(v, nm)
     return out
 
 
 def _veg_name_conflict(data, date, cand, removed=()):
     """候補レシピ名が、前後の日のメニュー名と同じ野菜名で被るなら、その野菜名のリストを返す（無ければ空）。"""
-    vs = _name_veg_set(cand)
+    vs = _name_conflict_set(cand)
     if not vs:
         return []
     near = _near_veg_name_set(data, date, removed)
@@ -1672,13 +1693,16 @@ def _is_mixed_rice(name):
     return any(k in base for k in MIXED_RICE_KW) or base.endswith('ご飯')
 
 
-# ---- 夜の差し替え候補にデザートを出さない（担当者判断・2026/11） ----
+# ---- 差し替え候補にデザートを出さない（担当者判断・2026/11）。昼夜とも：デザートはプレミアムと
+#      平日昼の店主おすすめの1品以外には入れないため、代替え案には一切出さない ----
 # デザート判定：商品ID（No.11の自然解凍例外リストのうちケーキ・大福等の分）＋メニュー名のキーワード。
 DESSERT_PRODUCT_IDS = None  # 下で NATURAL_THAW_PRODUCT_IDS_NO11 定義後に設定する
 DESSERT_NAME_RE = re.compile(
     r'(?<!カニ)(?<!かに)(?<!蟹)(?<!フィッシュ)(?<!クラブ)(?<!ポテト)(?<!チキン)ケーキ|ケーク|ロールケーキ|'
     r'大福|ゼリー|プリン|ようかん|羊羹|ババロア|ムース|わらび餅|きび団子|みたらし団子|蒸しパン|'
-    r'まんじゅう|饅頭|どら焼|スイーツ|デザート|タルト|クレープ|ドーナツ|パフェ|白玉|おはぎ|ぷちもっちーな')
+    r'まんじゅう|饅頭|どら焼|スイーツ|デザート|タルト|クレープ|ドーナツ|パフェ|白玉|おはぎ|ぷちもっちーな|'
+    r'ブラウニー|カステラ|クッキー|ビスケット|マフィン|ワッフル|ラスク|ぜんざい|あんみつ|シフォン|ガトー|'
+    r'パウンド|マドレーヌ|フィナンシェ|ホットケーキ|チョコ')
 _DESSERT_CTX = {'data': None}   # 夜の候補からデザートを外す再計算の間だけ data が入る
 
 
@@ -1732,7 +1756,7 @@ def _pick_least_recent(candidates, hist, before_date, exclude=(), spread=None, d
                 continue
             if not allow_near and near and (c in near or _nfkc(c) in near):
                 continue
-            if not allow_veg and veg_near and any(v in veg_near for v in _name_veg_set(c)):
+            if not allow_veg and veg_near and any(v in veg_near for v in _name_conflict_set(c)):
                 continue
             if data is not None and _curry_blocked(data, before_date, c, exclude):
                 continue
@@ -2103,7 +2127,7 @@ def _recipe_replacement2_core(data, date, ok=None, group=None, exclude=(), posit
             return bool(_near) and (n in _near or _nfkc(n) in _near)
 
         def _is_vegc(n):
-            return bool(_veg_near) and any(v in _veg_near for v in _name_veg_set(n))
+            return bool(_veg_near) and any(v in _veg_near for v in _name_conflict_set(n))
         _clean = [n for n in base_cands if not _is_near(n) and not _is_vegc(n)]
         _far = [n for n in base_cands if not _is_near(n)]
         if _clean:
@@ -3069,6 +3093,7 @@ def check_rule10(data, min_gap_days=8):
         key_pos.setdefault(key, set()).add(pos)
     last_seen = {}
     viol = []
+    sug10 = []   # このルールで既に提案した (候補キー, 提案先の日付)。近い日に同じ候補を重ねて出さない
     for d, slot, pos, recipe, key, prod in entries:
         if key in last_seen:
             prev_d, prev_slot, prev_pos, prev_recipe, prev_prod = last_seen[key]
@@ -3088,7 +3113,7 @@ def check_rule10(data, min_gap_days=8):
                 # 同じ日（昼・夜どちらも）に既に使われているレシピは候補から必ず外す（ユーザー報告・2026/10）
                 today_names = _day_recipe_names(data, t_d)
 
-                def _best_candidate(restrict_pos, restrict_dup):
+                def _best_candidate(restrict_pos, restrict_dup, strict_name=False):
                     best_key, best_gap = None, -1
                     for k2, dates2 in key_dates.items():
                         kr = key_recipe.get(k2)
@@ -3104,6 +3129,17 @@ def check_rule10(data, min_gap_days=8):
                             continue
                         if _curry_blocked(data, t_d, kr, {t_recipe}):
                             continue
+                        # 候補の食材が、前後（同日の別の食事を含む）min_gap_days日未満に既に使われていると、
+                        # 差し替えた先で再びNo.10違反になるため候補にしない（担当者指摘・2026/11：2/11昼）
+                        if any(abs((dt - t_d).days) < min_gap_days for dt in dates2):
+                            continue
+                        # 前後の日（同日の別の食事を含む）のメニュー名と、野菜名・食材名（明太等）が被る候補は
+                        # まず避ける（担当者指摘・2026/11：2/11昼 さつま芋のクリーミーマッシュ）。
+                        if strict_name and _veg_name_conflict(data, t_d, kr, {t_recipe}):
+                            continue
+                        # 別の違反の提案で、近い日（min_gap_days未満）に既に同じ候補を出している場合は避ける
+                        if any(k3 == k2 and abs((d3 - t_d).days) < min_gap_days for k3, d3 in sug10):
+                            continue
                         past = [dt for dt in dates2 if dt < t_d]
                         g2 = (t_d - past[-1]).days if past else 10 ** 6
                         if g2 > best_gap:
@@ -3113,10 +3149,16 @@ def check_rule10(data, min_gap_days=8):
                 # まず違反した枠（例：サラダの違反ならサラダ）で使われた実績があり、かつ同じ食事の
                 # 他レシピと食材被り・大豆豆腐系重複もしない候補に絞って探し、見つからなければ
                 # 枠の制約→重複の制約の順に緩めてフォールバックする（ユーザー指定・2026/10）。
-                best_key = (_best_candidate(restrict_pos=True, restrict_dup=True)
+                best_key = (_best_candidate(True, True, True)
+                            or _best_candidate(True, False, True)
+                            or _best_candidate(False, True, True)
+                            or _best_candidate(False, False, True)
+                            or _best_candidate(restrict_pos=True, restrict_dup=True)
                             or _best_candidate(restrict_pos=True, restrict_dup=False)
                             or _best_candidate(restrict_pos=False, restrict_dup=True)
                             or _best_candidate(restrict_pos=False, restrict_dup=False))
+                if best_key is not None and _side10 is not None:
+                    sug10.append((best_key, t_d))
                 if _side10 is None:
                     suggestion = _both_fixed_text((prev_d, prev_slot, prev_recipe), (d, slot, recipe))
                 elif _swap10:
@@ -3169,7 +3211,9 @@ NATURAL_THAW_PRODUCT_IDS_NO11 = {
 
 
 # デザート系の商品ID（上のリストのうち、ポテト/マカロニサラダ・きんぴら・ちくわ磯辺揚げ以外）
-DESSERT_PRODUCT_IDS = NATURAL_THAW_PRODUCT_IDS_NO11 - {2001583, 2001584, 1001877, 3002200}
+DESSERT_PRODUCT_IDS = (NATURAL_THAW_PRODUCT_IDS_NO11 - {2001583, 2001584, 1001877, 3002200}) | {
+    3000256,  # カット済ケーキ ブラウニー 300g 36カット（担当者指摘・2026/11：2/6夜の差し替え案に出てしまった）
+}
 
 
 def _is_natural_thaw_recipe(data, name):
@@ -4681,7 +4725,7 @@ _QUOTED_RE = re.compile(r'「([^」]+)」')
 
 
 def _night_dessert_rows(data, df):
-    """夜の違反行のうち、修正提案に『デザートの候補』が入っている行の index を返す。"""
+    """違反行（昼夜とも）のうち、修正提案に『デザートの候補』が入っている行の index を返す。"""
     idx = []
     if df is None or not len(df) or '修正提案' not in df.columns:
         return idx
@@ -4691,15 +4735,13 @@ def _night_dessert_rows(data, df):
             continue
         r2 = {'曜日': row.get('曜日', ''), '該当箇所': row.get('該当箇所', ''), '理由': row.get('理由', ''),
               '日付': row.get('日付', '')}
-        if _derive_slot(r2) != '夜':
-            continue
         if any(_is_dessert_recipe(data, q) for q in _QUOTED_RE.findall(sug)):
             idx.append(i)
     return idx
 
 
 def _redo_without_dessert_at_night(fn, data, result):
-    """夜の違反の差し替え候補にデザートが入ってしまった行だけ、デザートを候補から外して提案を作り直す。
+    """差し替え候補にデザートが入ってしまった行（昼夜とも）だけ、デザートを候補から外して提案を作り直す。
     （各ルールは候補選びに時間帯を渡していないため、ルールを一度だけデザート除外で再実行し、
      同じ違反行の修正提案を差し替える。担当者判断・2026/11）"""
     frames = list(result) if isinstance(result, tuple) else [result]
@@ -4737,10 +4779,12 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
                                seasoning_csv_path, fried_master_path, history_csv_paths, size)
     data.ai_client = ai_client
     frames = []
+    # デザートは差し替え候補に一切出さない（昼夜とも。担当者判断・2026/11）：全ルールの実行中ずっと除外を有効にする。
+    # （以前は夜の行だけ、デザートが出た行を後から作り直していたため、ルール内の提案の重複回避とずれることがあった）
+    _DESSERT_CTX['data'] = data
     for label, fn in ALL_RULES:
         try:
             result = fn(data)
-            result = _redo_without_dessert_at_night(fn, data, result)
         except Exception as e:
             data.warnings.append(f'{label} の判定中にエラーが発生しスキップしました（{e}）')
             continue
@@ -4751,6 +4795,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
         else:
             if len(result):
                 frames.append(result.reindex(columns=cols_std))
+    _DESSERT_CTX['data'] = None
     if frames:
         combined = pd.concat(frames, ignore_index=True)
         combined['No'] = combined['No'].astype(int)
