@@ -1128,7 +1128,7 @@ def load_history(history_csv_paths, size='M'):
 
 def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                         seasoning_csv_path=None, fried_master_path=None, history_csv_paths=None,
-                        size='M', product_frame_paths=None):
+                        size='M', product_frame_paths=None, settings_paths=None):
     """xlsx_path: メインのメニューワークブック。
     night_csv_paths: {month: csv_path} 夜食材CSV（任意）。
     day_csv_paths: {(month, '昼'|'夜'): csv_path} 商品ID単位のNo.1判定用CSV（任意）。
@@ -1140,6 +1140,16 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
     night_csv_paths = night_csv_paths or {}
     day_csv_paths = day_csv_paths or {}
     data = MenuData()
+    # 設定シート（数値・商品ID例外・キーワード）。渡されなければコードの既定値に戻す
+    reset_settings()
+    if settings_paths:
+        _tab_rows = {}
+        for _tab, _pth in dict(settings_paths).items():
+            try:
+                _tab_rows[_tab] = load_settings_csv(_pth)
+            except Exception as e:
+                data.master_checks.append(('警告', f'設定シートのタブ「{_tab}」を読み込めませんでした（{e}）。既定値で動かします'))
+        data.master_checks.extend(apply_settings(_tab_rows))
     if product_frame_paths is not None:
         # 月ごとの商品枠シート（{月: CSVのパス}）。渡されたら、No.27/No.32はこのシートの内容で判定する。
         data.product_frames = {}
@@ -3203,7 +3213,10 @@ def _check_potato_macaroni_alternation(pm_entries):
     return out
 
 
-def check_rule10(data, min_gap_days=8):
+RULE10_MIN_GAP_DAYS = 8   # No.10：同じ食材を再び使うまでに空ける日数（設定シートで変更可）
+
+
+def check_rule10(data, min_gap_days=None):
     """No.10: 同一食材のみで構成したメニュー（副菜・サラダ）は、味付けを変えても
     1週間以上空けて使用する。day_csv（商品ID紐付けCSV）が必要（No.1と同じ仕組みを流用）。
     副菜1/副菜2/サラダの各レシピについて、基礎調味料を除いた食材が1品だけのものを
@@ -3211,6 +3224,8 @@ def check_rule10(data, min_gap_days=8):
     代替え案は、まず違反した枠（副菜1/副菜2/サラダのいずれか）で使われた実績のある
     単一食材メニューに絞って探し、見つからなければ枠を問わずフォールバックする
     （ユーザー指定：サラダの違反に副菜の候補、またはその逆が出るのを防ぐため）。"""
+    if min_gap_days is None:
+        min_gap_days = RULE10_MIN_GAP_DAYS
     day_csv = data.day_csv
     if not day_csv or not data.rows:
         return pd.DataFrame()
@@ -4974,6 +4989,267 @@ def _redo_without_dessert_at_night(fn, data, result):
     return tuple(out) if isinstance(result, tuple) else out[0]
 
 
+# ============================================================================
+# 設定シート（スプレッドシート「メニューチェッカー設定」）
+#   コードに書いてある数値・商品ID・キーワードの既定値を、シートの内容で上書きする。
+#   ・シートは3タブ（数値／商品ID例外／キーワード）。各タブは「項目｜値｜備考」の3列（1行目が見出し）。
+#   ・リスト項目（商品IDやキーワード）は、1行に1つずつ書く（カンマ区切りで複数書いてもよい）。
+#     その項目の行が1つでもあれば「シートの内容が全て」となり、無ければコードの既定値を使う。
+#   ・数値項目は、行があればその値を使い、無ければ既定値を使う。
+#   ・シートが読めない場合も、既定値でそのまま動く。
+# ============================================================================
+SETTINGS_TABS = ('数値', '商品ID例外', 'キーワード')
+
+# (項目名, タブ, コード上の変数名, 種類, 説明)
+#   種類: int/float=数値1つ, str=文字1つ, ids=商品IDのリスト, words=文字のリスト, alias=ID別名, nutri=栄養基準, dessert_extra=デザート語の追加
+SETTINGS_SPEC = [
+    ('代替え案で避ける前後の日数', '数値', 'NEAR_DAYS_WINDOW', 'int',
+     '代替え案に、前後◯日以内に既に入っているメニューを出さない日数'),
+    ('野菜の連日の範囲（日）', '数値', 'VEG_NAME_CONFLICT_DAYS', 'int',
+     'メニュー名の野菜が「連日」で被ると見る範囲（当日のもう一方の食事＋前後◯日）'),
+    ('No.10 同じ食材を再使用するまでの間隔（日）', '数値', 'RULE10_MIN_GAP_DAYS', 'int',
+     '単品食材をこの日数より短い間隔で使うと違反'),
+    ('No.16 固形の上限（これを超えたら違反）', '数値', 'SOLID_MAX', 'int',
+     'メイン・サブメイン・副菜1のうち固形が何種までならOKか（2なら3枠すべて固形で違反）'),
+    ('No.28 本日の魚料理の必要回数（平日換算）', '数値', 'FISH_DAY_UNITS_MIN', 'int',
+     '1カ月に必要な「本日の魚料理」の回数（平日の夜＝1回）'),
+    ('No.28 土日祝の夜は何回で平日1回分か', '数値', 'FISH_DAY_WEEKEND_PER_UNIT', 'int',
+     '土日祝の夜が何回で平日の夜1回分になるか'),
+    ('No.14 エネルギー下限（kcal）', '数値', 'NUTRI_KCAL_MIN', 'nutri', '1食の平均エネルギーの下限'),
+    ('No.14 エネルギー上限（kcal）', '数値', 'NUTRI_KCAL_MAX', 'nutri', '1食の平均エネルギーの上限'),
+    ('No.14 食塩相当量の上限（g）', '数値', 'NUTRI_SALT_MAX', 'nutri', '1食の平均食塩相当量の上限'),
+    ('No.14 たんぱく質の下限（g）', '数値', 'NUTRI_PROTEIN_MIN', 'nutri', '1食の平均たんぱく質の下限'),
+    ('デザート扱いの商品ID', '商品ID例外', 'DESSERT_PRODUCT_IDS', 'ids',
+     'デザート扱いにする商品ID（夜に出ていても、代替え案の対象から除くなどの扱い）'),
+    ('自然解凍扱いの商品ID（No.11）', '商品ID例外', 'NATURAL_THAW_PRODUCT_IDS_NO11', 'ids',
+     'No.11で自然解凍の商品として扱う商品ID'),
+    ('禁止食材の例外：昼のみ使用可の商品ID', '商品ID例外', 'NG_EXEMPT_LUNCH_PRODUCT_IDS', 'ids',
+     '使用不可食材のうち、昼なら使ってよい商品ID'),
+    ('禁止食材の例外：平日昼のメインのみ使用可の商品ID', '商品ID例外', 'NG_EXEMPT_WEEKDAY_LUNCH_MAIN_IDS', 'ids',
+     '使用不可食材のうち、平日の昼なら使ってよい商品ID'),
+    ('赤とみなす商品ID（No.17）', '商品ID例外', 'RED_SUPPLEMENT_IDS_NO17', 'ids',
+     'No.17の「赤」の色として数える商品ID（人参入りなど）'),
+    ('間隔の制約がほぼ無い野菜の商品ID', '商品ID例外', 'VEG_FLEXIBLE_IDS', 'ids',
+     '昼夜連続でも使える野菜の商品ID（No.30の判定対象から外す）'),
+    ('IDの別名（同じ商品の別ID）', '商品ID例外', 'PRODUCT_ID_ALIASES', 'alias',
+     '商品枠のIDと実際に使われているIDが違う商品。「商品枠のID=実際のID」の形で書く'),
+    ('No.16 固形とみなすユニット名', 'キーワード', 'SOLID_UNITS', 'words',
+     'レシピの先頭行のユニット名がこれなら固形'),
+    ('No.16 固形チェックの対象枠', 'キーワード', 'SOLID_FRAME_POS', 'words',
+     '固形が続いていないか見る枠'),
+    ('おまかせ枠の名称（No.16など）', 'キーワード', 'OMAKASE_MENU_KW_NO16', 'words',
+     '「お楽しみの1品」のように、中身が日替わりで決まる枠の名称'),
+    ('代替え案を出さない枠の名称', 'キーワード', 'NO_SUGGEST_FRAME_TITLES', 'words',
+     '代替え案の提示を行わない枠の名称'),
+    ('夜のおまかせ枠の名称', 'キーワード', 'NIGHT_OMAKASE_FRAMES', 'words',
+     '夜の「お楽しみ」系の枠の名称'),
+    ('混ぜご飯系のキーワード', 'キーワード', 'MIXED_RICE_KW', 'words', '混ぜご飯系として扱うメニュー名のキーワード'),
+    ('餅・デザート系のキーワード', 'キーワード', 'MOCHI_DESSERT_KW', 'words', '餅・デザート系として扱うメニュー名のキーワード'),
+    ('だし系レシピのキーワード', 'キーワード', 'DASHI_RECIPE_NAME_KW', 'words', 'だしを使うレシピとして扱うメニュー名のキーワード'),
+    ('FD限定の魚メニュー', 'キーワード', 'FISH_FD_ONLY', 'words', 'FDの「本日の魚料理」として扱う魚メニュー名'),
+    ('メニュー名の野菜の隣り合い判定から除く野菜', 'キーワード', 'NAME_VEG_ADJ_EXCLUDE', 'words',
+     'メニュー名に入っていても、隣り合いのNo.30で見ない野菜'),
+    ('カレーのキーワード', 'キーワード', 'CURRY_KW', 'str', '同じ日のカレー被りを避けるためのキーワード'),
+    ('デザート扱いの名称キーワード（追加）', 'キーワード', 'DESSERT_NAME_EXTRA', 'dessert_extra',
+     'メニュー名にこの言葉を含むものもデザートとして扱う（コードの既定の語に追加される）'),
+]
+_SETTINGS_DEFAULTS = {}
+_NUTRI_KEYS = {'NUTRI_KCAL_MIN': ('kcal', 0), 'NUTRI_KCAL_MAX': ('kcal', 1),
+               'NUTRI_SALT_MAX': ('salt_max', None), 'NUTRI_PROTEIN_MIN': ('protein_min', None)}
+
+
+def _settings_capture_defaults():
+    import copy
+    if _SETTINGS_DEFAULTS:
+        return
+    g = globals()
+    for _lab, _tab, var, kind, _d in SETTINGS_SPEC:
+        if kind in ('nutri', 'dessert_extra'):
+            continue
+        _SETTINGS_DEFAULTS[var] = copy.deepcopy(g[var])
+    _SETTINGS_DEFAULTS['NUTRI_BOUNDS'] = copy.deepcopy(g['NUTRI_BOUNDS'])
+    _SETTINGS_DEFAULTS['_DESSERT_PATTERN'] = g['DESSERT_NAME_RE'].pattern
+
+
+def reset_settings():
+    """設定シートで上書きした値を、コードの既定値に戻す（実行のたびに最初に呼ぶ）。"""
+    _settings_capture_defaults()
+    import copy
+    g = globals()
+    for var, val in _SETTINGS_DEFAULTS.items():
+        if var == '_DESSERT_PATTERN':
+            g['DESSERT_NAME_RE'] = re.compile(val)
+        else:
+            g[var] = copy.deepcopy(val)
+
+
+def _split_cells(v):
+    return [x for x in re.split(r'[,、，\n]+', str(v)) if x.strip()]
+
+
+def _settings_default_text(var, kind):
+    d = _SETTINGS_DEFAULTS.get(var)
+    if kind == 'nutri':
+        k, idx = _NUTRI_KEYS[var]
+        v = _SETTINGS_DEFAULTS['NUTRI_BOUNDS']['昼'][k]
+        return v[idx] if idx is not None else v
+    return d
+
+
+def settings_template_rows():
+    """現在の既定値から、設定シートの初期内容 {タブ名: [[項目, 値, 備考], ...]} を作る。"""
+    reset_settings()
+    # 商品IDの横に添える名称（コードのコメントから拾う）
+    import re as _re
+    comments = {}
+    try:
+        for line in open(__file__, encoding='utf-8'):
+            m = _re.match(r'^\s+(\d{6,8}),?\s*#\s*(.+?)\s*$', line)
+            if m:
+                comments.setdefault(int(m.group(1)), m.group(2))
+    except Exception:
+        pass
+    out = {t: [['項目', '値', '備考']] for t in SETTINGS_TABS}
+    for lab, tab, var, kind, desc in SETTINGS_SPEC:
+        if kind in ('int', 'float', 'str', 'nutri'):
+            out[tab].append([lab, _settings_default_text(var, kind), desc])
+        elif kind == 'ids':
+            vals = _SETTINGS_DEFAULTS[var]
+            vals = sorted(vals) if isinstance(vals, (set, frozenset)) else list(vals)
+            for i, v in enumerate(vals):
+                out[tab].append([lab, v, comments.get(int(v), desc if i == 0 else '')])
+        elif kind == 'alias':
+            for a, b in _SETTINGS_DEFAULTS[var].items():
+                out[tab].append([lab, f'{a}=' + '='.join(str(x) for x in b if x != a), comments.get(a, desc)])
+        elif kind == 'words':
+            vals = _SETTINGS_DEFAULTS[var]
+            vals = sorted(vals) if isinstance(vals, (set, frozenset)) else list(vals)
+            for i, v in enumerate(vals):
+                out[tab].append([lab, v, desc if i == 0 else ''])
+        elif kind == 'dessert_extra':
+            out[tab].append([lab, '', desc + '（現在は追加なし。必要になったら、この行の値に書くか、行を足す）'])
+    return out
+
+
+def load_settings_csv(path):
+    """設定シート1タブのCSVを [(項目, 値, 備考)] にする。見出し行（A列が『項目』）より下だけを読む。"""
+    import csv
+    with open(path, encoding='utf-8-sig', newline='') as f:
+        rows = list(csv.reader(f))
+    start = None
+    for i, r in enumerate(rows[:10]):
+        if r and str(r[0]).strip() == '項目':
+            start = i + 1
+            break
+    if start is None:
+        raise ValueError('見出し行（A列が「項目」）が見つかりません。別のタブを読み込んだ可能性があります')
+    out = []
+    for r in rows[start:]:
+        r = [str(c).strip() for c in r] + ['', '', '']
+        if r[0]:
+            out.append((r[0], r[1], r[2]))
+    return out
+
+
+def apply_settings(tab_rows):
+    """tab_rows: {タブ名: [(項目, 値, 備考)]}。既定値を上書きし、[(レベル, 内容)] を返す。"""
+    reset_settings()
+    g = globals()
+    msgs = []
+    by_label = {lab: (tab, var, kind) for lab, tab, var, kind, _d in SETTINGS_SPEC}
+    grouped = {}
+    for tab, rows in (tab_rows or {}).items():
+        for lab, val, _note in rows:
+            if lab not in by_label:
+                msgs.append(('注意', f'設定シート「{tab}」：項目名「{lab}」は未対応のため無視しました（項目名を書き換えていませんか）'))
+                continue
+            if by_label[lab][0] != tab:
+                msgs.append(('注意', f'設定シート「{tab}」：項目「{lab}」は「{by_label[lab][0]}」タブの項目です。無視しました'))
+                continue
+            grouped.setdefault(lab, []).append(str(val).strip())
+    changed = []
+    for lab, vals in grouped.items():
+        tab, var, kind = by_label[lab]
+        vals = [v for v in vals]
+        try:
+            if kind in ('int', 'float', 'nutri', 'str'):
+                vs = [v for v in vals if v != '']
+                if not vs:
+                    continue
+                if len(vs) > 1:
+                    msgs.append(('注意', f'設定シート「{lab}」が複数行あります。最後の値「{vs[-1]}」を使います'))
+                v = vs[-1]
+                if kind == 'str':
+                    new = v
+                else:
+                    new = float(v) if (kind == 'float' or kind == 'nutri' and ('.' in v)) else int(float(v))
+                    if kind == 'nutri' and var in ('NUTRI_KCAL_MIN', 'NUTRI_KCAL_MAX'):
+                        new = int(new)
+                if kind == 'nutri':
+                    k, idx = _NUTRI_KEYS[var]
+                    nb = {sl: dict(b) for sl, b in g['NUTRI_BOUNDS'].items()}
+                    for sl in nb:
+                        if idx is None:
+                            nb[sl][k] = new
+                        else:
+                            lo, hi = nb[sl][k]
+                            nb[sl][k] = (new, hi) if idx == 0 else (lo, new)
+                    g['NUTRI_BOUNDS'] = nb
+                    old = _settings_default_text(var, kind)
+                else:
+                    old = g[var]
+                    g[var] = new
+                if new != old:
+                    changed.append(f'{lab}：{old} → {new}')
+            elif kind == 'ids':
+                items = [x for v in vals for x in _split_cells(v)]
+                if not items:
+                    continue
+                ids = []
+                for x in items:
+                    ids.append(int(re.sub(r'\D', '', x)))
+                d = _SETTINGS_DEFAULTS[var]
+                new = type(d)(ids) if not isinstance(d, (set, frozenset)) else set(ids)
+                if set(new) != set(d):
+                    add, rem = sorted(set(new) - set(d)), sorted(set(d) - set(new))
+                    changed.append(f'{lab}：' + (f'追加 {add} ' if add else '') + (f'削除 {rem}' if rem else ''))
+                g[var] = new
+            elif kind == 'alias':
+                items = [x for v in vals for x in _split_cells(v)]
+                if not items:
+                    continue
+                new = {}
+                for x in items:
+                    ids = [int(re.sub(r'\D', '', y)) for y in re.split(r'[=＝]', x) if re.sub(r'\D', '', y)]
+                    if len(ids) >= 2:
+                        new[ids[0]] = tuple(dict.fromkeys(ids))
+                if new != g[var]:
+                    changed.append(f'{lab}：{len(new)}件（既定は{len(g[var])}件）')
+                g[var] = new
+            elif kind == 'words':
+                items = [x.strip() for v in vals for x in _split_cells(v)]
+                if not items:
+                    continue
+                d = _SETTINGS_DEFAULTS[var]
+                new = set(items) if isinstance(d, (set, frozenset)) else (
+                    list(items) if isinstance(d, list) else tuple(items))
+                if set(new) != set(d):
+                    add, rem = sorted(set(new) - set(d)), sorted(set(d) - set(new))
+                    changed.append(f'{lab}：' + (f'追加 {add} ' if add else '') + (f'削除 {rem}' if rem else ''))
+                g[var] = new
+            elif kind == 'dessert_extra':
+                items = [x.strip() for v in vals for x in _split_cells(v)]
+                if items:
+                    g['DESSERT_NAME_RE'] = re.compile(
+                        _SETTINGS_DEFAULTS['_DESSERT_PATTERN'] + '|' + '|'.join(re.escape(x) for x in items))
+                    changed.append(f'{lab}：追加 {items}')
+        except Exception as e:  # noqa: BLE001
+            msgs.append(('注意', f'設定シート「{lab}」の値が読めませんでした（{e}）。既定値を使います'))
+    if changed:
+        msgs.append(('情報', '設定シートの内容でコードの既定値から変更している項目：' + ' ／ '.join(changed)))
+    return msgs
+
+
 def _master_gap_checks(data):
     """マスタ・設定の不備を data.master_checks に追加する（違反としては数えず、画面の先頭に出す）。
     ①商品枠で「商品枠外」とされた商品がその月のメニューで使われている
@@ -5026,10 +5302,10 @@ def _master_gap_checks(data):
 
 def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                     seasoning_csv_path=None, fried_master_path=None, ai_client=None,
-                    history_csv_paths=None, size='M', product_frame_paths=None):
+                    history_csv_paths=None, size='M', product_frame_paths=None, settings_paths=None):
     data = load_workbook_data(xlsx_path, night_csv_paths, day_csv_paths, veg_master_path,
                                seasoning_csv_path, fried_master_path, history_csv_paths, size,
-                               product_frame_paths=product_frame_paths)
+                               product_frame_paths=product_frame_paths, settings_paths=settings_paths)
     data.ai_client = ai_client
     frames = []
     # デザートは差し替え候補に一切出さない（昼夜とも。担当者判断・2026/11）：全ルールの実行中ずっと除外を有効にする。
