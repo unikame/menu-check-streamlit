@@ -1089,6 +1089,7 @@ def load_history(history_csv_paths, size='M'):
     （ユーザー確認済み：商品名より商品IDの方が追跡として確実）。
     戻り値: dict(dish=..., prod=..., prod_id=..., recipe_products=..., all_names=..., fried_names=...)"""
     dish, prod, prod_id, recipe_prods = {}, {}, {}, {}
+    recipe_pids = {}
     all_names, fried_ids_by_name = set(), {}
     for path in history_csv_paths or []:
         df = pd.read_csv(path)
@@ -1102,6 +1103,9 @@ def load_history(history_csv_paths, size='M'):
             rn = str(recipe)
             dish.setdefault(rn, set()).update(grp['_dt'].tolist())
             recipe_prods.setdefault(rn, set()).update(grp['商品名'].astype(str).tolist())
+            if '商品ID' in grp.columns:
+                _pi = pd.to_numeric(grp['商品ID'], errors='coerce').dropna().astype(int)
+                recipe_pids.setdefault(rn, set()).update(_pi.tolist())
             all_names.add(rn)
             if 'レシピID' in grp.columns:
                 ids = pd.to_numeric(grp['レシピID'], errors='coerce').dropna().astype(int)
@@ -1121,6 +1125,7 @@ def load_history(history_csv_paths, size='M'):
         'prod': {k: sorted(v) for k, v in prod.items()},
         'prod_id': {k: sorted(v) for k, v in prod_id.items()},
         'recipe_products': recipe_prods,
+        'recipe_prod_ids': recipe_pids,
         'all_names': all_names,
         'recipe_ids': fried_ids_by_name,
     }
@@ -1143,13 +1148,18 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
     # 設定シート（数値・商品ID例外・キーワード）。渡されなければコードの既定値に戻す
     reset_settings()
     if settings_paths:
-        _tab_rows = {}
+        _tab_rows, _disc_rows = {}, None
         for _tab, _pth in dict(settings_paths).items():
             try:
-                _tab_rows[_tab] = load_settings_csv(_pth)
+                if _tab == '終売':
+                    _disc_rows = load_discontinued_csv(_pth)
+                else:
+                    _tab_rows[_tab] = load_settings_csv(_pth)
             except Exception as e:
                 data.master_checks.append(('警告', f'設定シートのタブ「{_tab}」を読み込めませんでした（{e}）。既定値で動かします'))
         data.master_checks.extend(apply_settings(_tab_rows))
+        if _disc_rows is not None:
+            data.master_checks.extend(apply_discontinued(_disc_rows))
     if product_frame_paths is not None:
         # 月ごとの商品枠シート（{月: CSVのパス}）。渡されたら、No.27/No.32はこのシートの内容で判定する。
         data.product_frames = {}
@@ -1839,6 +1849,8 @@ def _curry_blocked(data, date, cand, removed=()):
 # 終売レシピ（代替え案の候補に出さない）。担当者から「終売商材」と指摘されたレシピ名のキーワードを
 # 追加していく（ユーザー確認済み・2026/10）。レシピ名にこのキーワード（NFKC正規化後）が含まれると
 # 代替え案の候補から外す。過去メニューCSV由来の候補に終売商品が残っている問題の対策。
+DISCONTINUED_PRODUCT_IDS = set()     # 設定シート「終売」タブの商品ID（その商品を使うレシピを代替え案から外す）
+DISCONTINUED_PRODUCT_NAMES = []      # 同・商品名（IDが空の行用）
 DISCONTINUED_RECIPE_KW = (
     'かぼちゃ天ぷら', 'かぼちゃの天ぷら', 'カボチャ天ぷら', '南瓜天ぷら',   # 担当者指摘（2026/10・終売商材）
 )
@@ -1899,6 +1911,7 @@ def _is_discontinued(name):
             or 'おまかせ' in re.split(r'[☆※]', n, maxsplit=1)[0] or 'お任せ' in re.split(r'[☆※]', n, maxsplit=1)[0]
             or _is_mixed_rice(n)
             or '要試作' in n   # 試作中のメニューは差し替え候補に出さない（担当者指摘・2026/11）
+            or _recipe_has_disc_product(_DESSERT_CTX['data'], name)   # 終売の商品を使うレシピ（設定シート「終売」タブ）
             or (_DESSERT_CTX['data'] is not None and _is_dessert_recipe(_DESSERT_CTX['data'], name)))
 
 
@@ -5068,6 +5081,9 @@ def _settings_capture_defaults():
             continue
         _SETTINGS_DEFAULTS[var] = copy.deepcopy(g[var])
     _SETTINGS_DEFAULTS['NUTRI_BOUNDS'] = copy.deepcopy(g['NUTRI_BOUNDS'])
+    _SETTINGS_DEFAULTS['DISCONTINUED_RECIPE_KW'] = copy.deepcopy(g['DISCONTINUED_RECIPE_KW'])
+    _SETTINGS_DEFAULTS['DISCONTINUED_PRODUCT_IDS'] = set()
+    _SETTINGS_DEFAULTS['DISCONTINUED_PRODUCT_NAMES'] = []
     _SETTINGS_DEFAULTS['_DESSERT_PATTERN'] = g['DESSERT_NAME_RE'].pattern
 
 
@@ -5250,6 +5266,115 @@ def apply_settings(tab_rows):
     return msgs
 
 
+def load_discontinued_csv(path):
+    """設定シートのタブ「終売」のCSVを読み、{'products': [(商品ID, 商品名, 備考)], 'kw': [(名称キーワード, 備考)]} を返す。
+    見出し行のA列が『商品ID』なら商品の一覧、『名称キーワード』ならレシピ名の一覧（旧形式）として読む。"""
+    import csv
+    with open(path, encoding='utf-8-sig', newline='') as f:
+        rows = list(csv.reader(f))
+    out = {'products': [], 'kw': []}
+    for i, r in enumerate(rows[:10]):
+        head = str(r[0]).strip() if r else ''
+        if head not in ('商品ID', '名称キーワード'):
+            continue
+        for rr in rows[i + 1:]:
+            rr = [str(c).strip() for c in rr] + ['', '', '']
+            if head == '商品ID':
+                if rr[0] or rr[1]:
+                    out['products'].append((rr[0], rr[1], rr[2]))
+            elif rr[0]:
+                out['kw'].append((rr[0], rr[1]))
+        return out
+    raise ValueError('見出し行（A列が「商品ID」）が見つかりません。別のタブを読み込んだ可能性があります')
+
+
+def apply_discontinued(parsed):
+    """終売の一覧（シート）を反映する。
+    ・商品の行：その商品を使うレシピ全体を代替え案から外す（商品IDまたは商品名で照合）。
+    ・レシピ名の行（旧形式）：1行でもあれば、コードの既定の終売キーワードをシートの内容で置き換える。"""
+    g = globals()
+    msgs = []
+    ids, names = set(), []
+    for pid, nm, _note in parsed.get('products', []):
+        digits = re.sub(r'\D', '', str(pid))
+        if digits:
+            ids.add(int(digits))
+        elif str(nm).strip():
+            names.append(str(nm).strip())
+    if ids or names:
+        g['DISCONTINUED_PRODUCT_IDS'] = ids
+        g['DISCONTINUED_PRODUCT_NAMES'] = names
+        msgs.append(('情報', f'終売の一覧（シート）：商品{len(ids) + len(names)}件を使うレシピを、代替え案から外します'))
+    kws = [str(k).strip() for k, _n in parsed.get('kw', []) if str(k).strip()]
+    if kws:
+        old = set(_SETTINGS_DEFAULTS.get('DISCONTINUED_RECIPE_KW', ()))
+        g['DISCONTINUED_RECIPE_KW'] = tuple(dict.fromkeys(kws))
+        msg = f'終売の一覧（シート・レシピ名）：{len(kws)}件を、代替え案から外します'
+        if old and set(kws) != old:
+            add, rem = sorted(set(kws) - old), sorted(old - set(kws))
+            msg += '（コードの既定値との差：' + (f'追加 {add} ' if add else '') + (f'削除 {rem}' if rem else '') + '）'
+        msgs.append(('情報', msg))
+    return msgs
+
+
+def _disc_name_match(sheet_name, prod_name):
+    a, b = _nfkc(re.sub(r'[☆★\s]', '', str(sheet_name))), _nfkc(re.sub(r'[☆★\s]', '', str(prod_name)))
+    if len(a) < 4 or len(b) < 4:
+        return a == b
+    return a in b or b in a
+
+
+_DISC_RECIPE_CACHE = {}
+
+
+def _recipe_has_disc_product(data, name):
+    """レシピ（過去メニューの履歴にあるもの）が、終売の商品を使っているか。"""
+    if not (DISCONTINUED_PRODUCT_IDS or DISCONTINUED_PRODUCT_NAMES) or data is None:
+        return False
+    hist = getattr(data, 'history', None)
+    if not hist:
+        return False
+    key = (id(hist), name, tuple(sorted(DISCONTINUED_PRODUCT_IDS)), tuple(DISCONTINUED_PRODUCT_NAMES))
+    if key in _DISC_RECIPE_CACHE:
+        return _DISC_RECIPE_CACHE[key]
+    hit = False
+    ids = (hist.get('recipe_prod_ids') or {}).get(name, set())
+    if ids & DISCONTINUED_PRODUCT_IDS:
+        hit = True
+    elif DISCONTINUED_PRODUCT_NAMES:
+        for pn in (hist.get('recipe_products') or {}).get(name, ()):
+            if any(_disc_name_match(sn, pn) for sn in DISCONTINUED_PRODUCT_NAMES):
+                hit = True
+                break
+    if len(_DISC_RECIPE_CACHE) > 20000:
+        _DISC_RECIPE_CACHE.clear()
+    _DISC_RECIPE_CACHE[key] = hit
+    return hit
+
+
+def _disc_usage_checks(data):
+    """設定シートの『終売』に載っている商品が、今月のメニューに使われていないか。使われていれば警告に出す。"""
+    if not (DISCONTINUED_PRODUCT_IDS or DISCONTINUED_PRODUCT_NAMES):
+        return
+    try:
+        found = {}
+        for shoku_dict in (data.shoku, data.shoku_night):
+            for month, shoku in shoku_dict.items():
+                if shoku is None or not len(shoku):
+                    continue
+                pids = pd.to_numeric(shoku['商品ID'], errors='coerce')
+                for pid, nm, md in zip(pids, shoku['商品名'].astype(str), shoku['md']):
+                    hit = (not pd.isna(pid) and int(pid) in DISCONTINUED_PRODUCT_IDS) or any(
+                        _disc_name_match(sn, nm) for sn in DISCONTINUED_PRODUCT_NAMES)
+                    if hit and isinstance(md, tuple):
+                        found.setdefault((nm, md[0]), set()).add(md[1])
+        for (nm, month), days in sorted(found.items(), key=lambda x: (x[0][1], x[0][0])):
+            ds = '・'.join(f'{month}/{d}' for d in sorted(days))
+            data.master_checks.append(('警告', f'終売の商品「{nm}」が、メニューで使われています（{ds}）'))
+    except Exception as ex:  # noqa: BLE001
+        data.master_checks.append(('注意', f'終売の商品の使用確認の途中でエラーが出ました（{ex}）'))
+
+
 def _master_gap_checks(data):
     """マスタ・設定の不備を data.master_checks に追加する（違反としては数えず、画面の先頭に出す）。
     ①商品枠で「商品枠外」とされた商品がその月のメニューで使われている
@@ -5326,6 +5451,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
                 frames.append(result.reindex(columns=cols_std))
     _DESSERT_CTX['data'] = None
     _master_gap_checks(data)
+    _disc_usage_checks(data)
     if frames:
         combined = pd.concat(frames, ignore_index=True)
         combined['No'] = combined['No'].astype(int)
