@@ -69,6 +69,16 @@ FRAME_SHEET_GIDS = {   # (西暦下2桁, 月): gid  ※無くても動く。タ�
 }
 
 # ============================================================================
+# ★ 設定シート（数値・商品ID例外・キーワード）★
+#   「メニューチェッカー設定」ブックのURLを入れると、コードに書いてある数値や例外の
+#   既定値を、シートの内容で上書きします（タブ名：数値／商品ID例外／キーワード）。
+#   空文字のままなら、これまでどおりコードの既定値で動きます。
+#   ブックは「リンクを知っている全員（閲覧者）」にしてください。
+# ============================================================================
+SETTINGS_BOOK_URL = ''
+SETTINGS_TABS = ('数値', '商品ID例外', 'キーワード')
+
+# ============================================================================
 # ★ 過去メニュー（履歴）の管理 ★
 #   違反判定には使わず、代替え案の候補と「直近いつ使ったか」の参照にだけ使います。
 #
@@ -342,6 +352,42 @@ def resolve_frames(months, manual=None):
     return paths, chips, failed
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_settings_csv(book_url, tab):
+    """設定シートの1タブをCSVで取得して bytes で返す（1時間キャッシュ）。"""
+    m = _SHEET_ID_RE.search(str(book_url))
+    if not m:
+        raise ValueError('設定シートのURLが正しくありません')
+    url = (f'https://docs.google.com/spreadsheets/d/{m.group(1)}/gviz/tq?tqx=out:csv&sheet='
+           + urllib.parse.quote(tab))
+    return _download(url)
+
+
+def resolve_settings():
+    """設定シートを解決して ({タブ名: パス}, チップ) を返す。URL未設定なら何もしない。"""
+    url = (SETTINGS_BOOK_URL or '').strip()
+    if not url:
+        return {}, ['<span class="muted">設定シート：未設定（コードの既定値で動作）</span>']
+    paths, ng = {}, []
+    for tab in SETTINGS_TABS:
+        try:
+            data = fetch_settings_csv(url, tab)
+            path = os.path.join(TMP_DIR, f'設定_{tab}.csv')
+            with open(path, 'wb') as fh:
+                fh.write(data)
+            mc.load_settings_csv(path)       # 見出し行があるか確認
+            paths[tab] = path
+        except Exception as e:  # noqa: BLE001
+            ng.append(f'{tab}（{e}）')
+    chips = []
+    if paths:
+        chips.append(f'<span class="ms-ok">● 設定シート（{"・".join(paths)}）</span>')
+    if ng:
+        chips.append('<span class="ms-ng">▲ 設定シート：' + '／'.join(ng)
+                     + '。読めなかったタブは既定値で動きます</span>')
+    return paths, chips
+
+
 def history_label(code):
     """'2604' → '26年4月' のように読みやすくする。解釈できなければそのまま返す。"""
     m = re.fullmatch(r'(\d{2})(\d{2})', str(code))
@@ -500,6 +546,7 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
             '<div class="statusline"><b>マスタ</b>　' + '　'.join(status['master_chips']) + '</div>'
             '<div class="statusline"><b>過去メニュー</b>　' + '　'.join(status['hist_chips'])
             + '　<span class="muted">※判定には使わず、代替え案の候補にのみ使用</span></div>'
+            + '<div class="statusline"><b>設定</b>　' + '　'.join(status.get('settings_chips', [])) + '</div>'
             + '<div class="statusline"><b>商品枠</b>　'
             + ('　'.join(status.get('frame_chips', [])) or '<span class="muted">（月を判定できませんでした）</span>')
             + '</div>',
@@ -518,6 +565,7 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
         if st.button('再読込', use_container_width=True):
             fetch_master_bytes.clear()
             fetch_frame_csv.clear()
+            fetch_settings_csv.clear()
             load_history_registry.clear()
             st.session_state.pop('conn_status', None)
             st.rerun()
@@ -572,11 +620,13 @@ def load_sources(months=(), manual_frames=None):
     hchips = [f'<span class="{"ms-ok" if ok else "ms-ng"}">'
               f'{"●" if ok else "▲"} {msg}</span>' for ok, msg in hist_msgs]
     frame_paths, frame_chips, frame_failed = resolve_frames(list(months), manual_frames)
+    settings_paths, settings_chips = resolve_settings()
     st.session_state['conn_status'] = {
         'master_chips': chips, 'hist_chips': hchips, 'master_failed': master_failed,
         'frame_chips': frame_chips, 'frame_failed': frame_failed,
+        'settings_chips': settings_chips,
     }
-    return master_paths, hist_paths, hist_labels, frame_paths
+    return master_paths, hist_paths, hist_labels, frame_paths, settings_paths
 
 
 if check_conn:
@@ -594,7 +644,7 @@ if run:
 
     with st.spinner('マスタ・過去メニューを取得しています…'):
         target_months = detect_target_months(day_csvs)
-        master_paths, history_paths, history_labels, frame_paths = load_sources(
+        master_paths, history_paths, history_labels, frame_paths, settings_paths = load_sources(
             target_months, manual_frames)
         master_paths.update(manual_paths)   # 手動指定があれば優先
 
@@ -642,6 +692,7 @@ if run:
             'ai_client': ai_client,
             'history_csv_paths': hist_paths or None,
             'product_frame_paths': frame_paths or None,
+            'settings_paths': settings_paths or None,
         }
         # menu_checker.py が古い場合に落ちないよう、対応していない引数は落とす
         supported = set(inspect.signature(mc.run_all_checks).parameters)
@@ -654,6 +705,9 @@ if run:
             st.error(f'チェック中にエラーが発生しました：{e}')
             st.stop()
 
+        if 'settings_paths' in dropped and settings_paths:
+            st.warning('menu_checker.py が設定シートに未対応のため、既定値で実行しました。'
+                       'menu_checker.py も最新版に差し替えてください。')
         if 'product_frame_paths' in dropped:
             st.warning('menu_checker.py が月ごとの商品枠シートに未対応です（コード内の12月分で判定します）。'
                        'menu_checker.py も最新版に差し替えてください。')
@@ -719,7 +773,7 @@ if master_checks:
                      + (f'　うち警告 {n_warn}件' if n_warn else ''), expanded=bool(n_warn)):
         st.caption('チェック結果ではなく、商品枠・マスタ側の設定に関するお知らせです。'
                    'シートを直すと、次回のチェックから反映されます。')
-        for lv, msg in sorted(master_checks, key=lambda x: 0 if x[0] == '警告' else 1):
+        for lv, msg in sorted(master_checks, key=lambda x: {'警告': 0, '注意': 1}.get(x[0], 2)):
             (st.warning if lv == '警告' else st.info)(msg)
 
 st.write('')
