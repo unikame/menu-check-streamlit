@@ -672,6 +672,9 @@ if run:
         'combined': combined, 'summary': summary,
         'out_path': out_path, 'history_labels': list(history_labels),
     }
+    # 上の「マスタ・商品枠」の接続状態の行は、この実行より前に描画済みで1回前の状態のままなので、
+    # 画面を描き直して最新にする（結果は session_state に保存済み）
+    st.rerun()
 
 # ----------------------------------------------------------------------------
 # 結果表示
