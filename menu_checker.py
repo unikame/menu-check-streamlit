@@ -52,7 +52,7 @@
   No.22 魚メニュー3日に1回  No.24 白和えの分類
   No.25 かぼちゃ週1回  No.26 かにのふわふわ5日以上
   No.27 FD専用魚商材の平日縛り＋★商材の月内使用回数クオータ（FDメニュールール準拠。平日/土日祝・昼/夜すべて数え、同日の昼夜は2回）
-  No.28 本日の魚料理は夜（平日1回・土日祝2回以上）  No.29 おまかせ月2回以上
+  No.28 本日の魚料理は夜（平日換算2回以上。土日祝2回＝平日1回分）  No.29 おまかせ月2回以上
   No.30 野菜の使用間隔（FDメニュールール（野菜）シート準拠・商品ID単位。
         メニュー名記載時は必要日数2倍、芋類/かぼちゃは昼夜連続OK）
   No.31 マッシュ系同日重複
@@ -4365,14 +4365,18 @@ def check_rule27(data):
     return pd.DataFrame(viol)
 
 
-FISH_DAY_WEEKDAY_MIN = 1   # 本日の魚料理：月内の平日（月〜金）夜の最低回数
-FISH_DAY_WEEKEND_MIN = 2   # 本日の魚料理：月内の土日祝夜の最低回数（祝日扱いは_is_holiday_like参照）
+# 本日の魚料理：月内の夜の使用を『平日換算』で数え、FISH_DAY_UNITS_MIN 以上あればOK（担当者回答・2026/11）。
+# 平日の夜1回＝1、土日祝の夜は2回で1（平日1回分＝土日祝2回）。
+# 例：平日2回／平日1回＋土日祝2回／土日祝4回 はOK。平日1回＋土日祝1回（1.5）や平日1回のみは不足。
+FISH_DAY_UNITS_MIN = 2
+FISH_DAY_WEEKEND_PER_UNIT = 2   # 土日祝の夜が何回で平日1回分か（祝日扱いは_is_holiday_like参照）
 
 
 def check_rule28(data):
-    """No.28: 本日の魚料理は夜に採用する。月内に平日（月〜金・祝日扱いを除く）の夜1回以上・土日祝の夜2回以上。
-    担当者判断（2026/10）で「平日1回以上、土日2回以上で可」に更新：以前は土日に使うたび
-    「休日に使用（要:平日）」と判定していたが、月内の最低回数チェックに変えた。
+    """No.28: 本日の魚料理は夜に採用する。月内の夜の使用を『平日換算』で数え、2回以上あればOK。
+    平日の夜1回＝1、土日祝の夜2回＝1（平日1回分＝土日祝2回。担当者回答・2026/11）。
+    例：平日2回／平日1回＋土日祝2回／土日祝4回 はOK。平日1回のみ、平日1回＋土日祝1回は不足。
+    （以前は「平日1回以上かつ土日祝2回以上」だった。2月は平日2回・土日祝0回で誤って指摘されたため変更）
     ・夜だけを数える（昼の使用は回数に数えず、従来どおり「昼に使用（要:夜）」と判定する）。
     ・同じ日に複数あっても1回と数える。"""
     viol = []
@@ -4393,21 +4397,24 @@ def check_rule28(data):
         used_days = {d for (d, wd, slot, pos, name) in fish_rows if d.month == month}
         wk_cnt = sum(1 for d in night_days if _is_workday(d))
         we_cnt = sum(1 for d in night_days if not _is_workday(d))
+        units = wk_cnt + we_cnt / FISH_DAY_WEEKEND_PER_UNIT
+        if units >= FISH_DAY_UNITS_MIN:
+            continue
         month_dates = sorted({d for (d, wd, slot, pos, name) in data.rows if d.month == month})
-        for label, cnt, need, is_we in (('平日', wk_cnt, FISH_DAY_WEEKDAY_MIN, False),
-                                        ('土日祝', we_cnt, FISH_DAY_WEEKEND_MIN, True)):
-            if cnt >= need:
-                continue
-            free = [d for d in month_dates if ((not _is_workday(d)) == is_we) and d not in used_days]
-            ex = '・'.join(f'{d.strftime("%-m/%-d")}({WD_JP[d.weekday()]})' for d in free[:2])
-            viol.append({
-                '日付': f'{month}月(月次)', '曜日': '-', 'No': 28,
-                'ルール': '本日の魚料理は夜に採用する',
-                '該当箇所': f'{month}月夜（{label}）',
-                '理由': f'{label}の夜の本日の魚料理が{cnt}回のみ（月{need}回以上必要）',
-                '修正提案': f'{label}の夜枠に本日の魚料理を追加する' + (f'（例: {ex}）' if ex else ''),
-                '重要度': '中',
-            })
+        short = FISH_DAY_UNITS_MIN - units
+        free_wk = [d for d in month_dates if _is_workday(d) and d not in used_days]
+        ex = '・'.join(f'{d.strftime("%-m/%-d")}({WD_JP[d.weekday()]})' for d in free_wk[:2])
+        need_wk = int(-(-short // 1))   # 不足分を平日夜だけで補う場合の回数（切り上げ）
+        viol.append({
+            '日付': f'{month}月(月次)', '曜日': '-', 'No': 28,
+            'ルール': '本日の魚料理は夜に採用する',
+            '該当箇所': f'{month}月夜（平日{wk_cnt}回・土日祝{we_cnt}回）',
+            '理由': (f'平日換算{units:g}回（必要{FISH_DAY_UNITS_MIN}回）。'
+                     f'土日祝の夜{FISH_DAY_WEEKEND_PER_UNIT}回＝平日1回分'),
+            '修正提案': (f'平日の夜枠に本日の魚料理をあと{need_wk}回追加する' + (f'（例: {ex}）' if ex else '')
+                       + f'（土日祝の夜{FISH_DAY_WEEKEND_PER_UNIT}回で平日1回分に数えます）'),
+            '重要度': '中',
+        })
     return pd.DataFrame(viol)
 
 
@@ -4681,7 +4688,7 @@ ALL_RULES = [
     ('No.25 かぼちゃ週1回', check_rule25),
     ('No.26 かにのふわふわ5日以上空ける', check_rule26),
     ('No.27 FD専用商材（魚弁当）は平日', check_rule27),
-    ('No.28 本日の魚料理は夜（平日1回・土日祝2回以上）', check_rule28),
+    ('No.28 本日の魚料理は夜（平日換算2回以上）', check_rule28),
     ('No.29 おまかせメニュー月2回以上', check_rule29),
     ('No.30 野菜使用間隔（FDメニュールール）', check_rule30),
     ('No.30 メニュー名の野菜名が隣り合う食事で連続', check_rule30_name_adjacent),
@@ -4835,7 +4842,7 @@ RULE_NAME_JP = {
     19: '同じ調味料のみの味付け禁止', 20: 'だし味付け1品以上', 21: '禁止食材・調味料',
     22: '魚メニュー3日に1回', 23: '食べにくさチェック', 24: '白和えの分類',
     25: 'かぼちゃ週1回', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★月内使用回数クオータ',
-    28: '本日の魚料理は夜（平日1回・土日祝2回以上）', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
+    28: '本日の魚料理は夜（平日換算2回以上）', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
     31: 'マッシュ系同日重複', 32: '商品枠クオータ（12月商品枠シート）', 36: 'コロッケとクリームコロッケ',
     37: '1食内で大豆・豆腐系レシピが複数使用',
 }
