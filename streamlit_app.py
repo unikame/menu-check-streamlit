@@ -75,7 +75,7 @@ FRAME_SHEET_GIDS = {   # (西暦下2桁, 月): gid  ※無くても動く。タ�
 #   空文字のままなら、これまでどおりコードの既定値で動きます。
 #   ブックは「リンクを知っている全員（閲覧者）」にしてください。
 # ============================================================================
-SETTINGS_BOOK_URL = ''
+SETTINGS_BOOK_URL = 'https://docs.google.com/spreadsheets/d/1SCqW9BttOKdIo-YAowcAEKMpsRnw0al-7NKfir58qLE/edit'
 SETTINGS_TABS = ('数値', '商品ID例外', 'キーワード')
 
 # ============================================================================
