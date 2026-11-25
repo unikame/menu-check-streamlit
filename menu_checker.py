@@ -1322,7 +1322,8 @@ def load_history(history_csv_paths, size='M'):
 
 def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                         seasoning_csv_path=None, fried_master_path=None, history_csv_paths=None,
-                        size='M', product_frame_paths=None, settings_paths=None, veg_tier_path=None):
+                        size='M', product_frame_paths=None, settings_paths=None, veg_tier_path=None,
+                        discontinued_book=None):
     """xlsx_path: メインのメニューワークブック。
     night_csv_paths: {month: csv_path} 夜食材CSV（任意）。
     day_csv_paths: {(month, '昼'|'夜'): csv_path} 商品ID単位のNo.1判定用CSV（任意）。
@@ -1349,6 +1350,16 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
         data.master_checks.extend(apply_settings(_tab_rows))
         if _disc_rows is not None:
             data.master_checks.extend(apply_discontinued(_disc_rows))
+    # 終売の一覧：月ごとのシート（{タブ名: 行のリスト}）。渡されたら設定シートの『終売』タブより優先する
+    if discontinued_book is not None:
+        _prods, _used = [], []
+        for _tabname, _rows in discontinued_book.items():
+            _got = parse_discontinued_book_rows(_rows, _tabname)
+            _prods += _got
+            _used.append(f'{_tabname}（{len(_got)}件）')
+        data.master_checks.extend(apply_discontinued({'products': _prods, 'kw': []}))
+        data.master_checks.append(('情報', '終売の一覧：月ごとのシートのタブ ' + '・'.join(_used) + ' から読み込みました'
+                                   if _used else '終売の一覧：月ごとのシートに該当するタブがありませんでした'))
     # 野菜の使用間隔シート（No.30）。設定シートより後に反映する（シートの内容を優先）。渡されなければコード内の表
     _veg_msgs = apply_veg_tier(veg_tier_path)
     data.master_checks.extend(_veg_msgs)
@@ -5806,6 +5817,31 @@ def apply_discontinued(parsed):
     return msgs
 
 
+def parse_discontinued_book_rows(rows, tab=''):
+    """月ごとの『新商品・切替・値上げ・終売』シート（タブ「27年2月」など）の行から、終売の商品を拾う。
+    ・B列などに「■終売」と書かれた見出しから、次の「■…」の見出しまでが終売の欄（見出しは複数あってよい）。
+    ・商品ID（C列）がある行だけを終売とする。商品名だけの行（「…：見つかり次第」）は拾わない（担当者確認・2026/11）。
+    ・B列に「YDのみ終売」「→ML継続」のように、MLでは使える旨があれば終売にしない（MLのチェックのため）。
+    戻り値：[(商品ID, 商品名, 備考)]"""
+    out, sec = [], None
+    for r in rows:
+        r = [_nfkc(str(c)).strip() for c in list(r)] + [''] * 6
+        head = next((c for c in r[:3] if c.startswith('■')), None)
+        if head is not None:
+            sec = head.replace('■', '').strip()
+            continue
+        if sec != '終売':
+            continue
+        pid = r[2]
+        if not re.fullmatch(r'\d{5,8}', pid):
+            continue
+        mark = r[1]
+        if re.search(r'YD.*のみ|継続', mark):
+            continue
+        out.append((pid, r[4], (mark + ' ' + tab).strip()))
+    return out
+
+
 def _disc_name_match(sheet_name, prod_name):
     a, b = _nfkc(re.sub(r'[☆★\s]', '', str(sheet_name))), _nfkc(re.sub(r'[☆★\s]', '', str(prod_name)))
     if len(a) < 4 or len(b) < 4:
@@ -5917,11 +5953,11 @@ def _master_gap_checks(data):
 def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                     seasoning_csv_path=None, fried_master_path=None, ai_client=None,
                     history_csv_paths=None, size='M', product_frame_paths=None, settings_paths=None,
-                    veg_tier_path=None):
+                    veg_tier_path=None, discontinued_book=None):
     data = load_workbook_data(xlsx_path, night_csv_paths, day_csv_paths, veg_master_path,
                                seasoning_csv_path, fried_master_path, history_csv_paths, size,
                                product_frame_paths=product_frame_paths, settings_paths=settings_paths,
-                               veg_tier_path=veg_tier_path)
+                               veg_tier_path=veg_tier_path, discontinued_book=discontinued_book)
     data.ai_client = ai_client
     frames = []
     # デザートは差し替え候補に一切出さない（昼夜とも。担当者判断・2026/11）：全ルールの実行中ずっと除外を有効にする。
