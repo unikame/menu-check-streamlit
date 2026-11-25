@@ -3647,6 +3647,65 @@ def check_rule6_name_veg(data):
     return pd.DataFrame(viol)
 
 
+LEAFY_BUTTER_MIN_GAP_DAYS = 5   # No.38：同じ型のメニューを、この日数未満で再び出すとNG（担当者指定・2026/11）
+LEAFY_BUTTER_SAUCE_WORDS = ['バター']
+LEAFY_BUTTER_LEAF_WORDS = ['小松菜', 'ほうれん草', 'うまい菜', 'チンゲン菜', '青菜', '水菜', '春菊', 'キャベツ', '白菜', 'ニラ']
+LEAFY_BUTTER_COOK_WORDS = ['炒め', 'ソテー']
+
+
+def _is_leafy_butter(name):
+    """メニュー名に『バター（味付け）』『葉物』『炒め／ソテー』の3つが全て入っているか（No.38）。"""
+    n = _nfkc(str(name))
+    return (any(_nfkc(w) in n for w in LEAFY_BUTTER_SAUCE_WORDS if str(w).strip())
+            and any(_nfkc(w) in n for w in LEAFY_BUTTER_LEAF_WORDS if str(w).strip())
+            and any(_nfkc(w) in n for w in LEAFY_BUTTER_COOK_WORDS if str(w).strip()))
+
+
+def check_rule38(data):
+    """No.38：葉物を入れたバターソースの炒め物（メニュー名に『バター』『葉物』『炒め／ソテー』がある）は、
+    LEAFY_BUTTER_MIN_GAP_DAYS（既定5日）未満の間隔で使わない。
+    担当者指摘・2026/11：2/6夜 副菜2『ひじきと小松菜のバター醤油ソテー』と2/8夜 副菜2
+    『うまい菜のバターソテー』が近い。食材が違うためNo.10にもNo.30にも当たらず、検出できなかった
+    （No.10は単一食材の再使用だけを見る）。メニュー名の表記から判定する。
+    昼夜を区別せず日付順に並べ、直前の同じ型のメニューとの間隔を見る（同じ日の昼→夜は0日）。
+    修正提案：平日昼・土日祝昼メイン（チラシ掲載）は変更せず、変更できる側を差し替える。"""
+    seen = {}
+    for (d, wd, slot, pos, name) in data.rows:
+        if _is_leafy_butter(name):
+            seen[(d, slot, name)] = pos
+    items = sorted(seen.items(), key=lambda x: (x[0][0], 0 if x[0][1] == '昼' else 1))
+    viol = []
+    prev = None
+    for (d, slot, name), pos in items:
+        if prev is not None:
+            (pd_, pslot, pname), ppos = prev
+            gap = (d - pd_).days
+            if gap < LEAFY_BUTTER_MIN_GAP_DAYS:
+                side = _pick_change_target((pd_, pslot, ppos), (d, slot, pos))
+                lab = lambda dd, sl: f'{dd.strftime("%-m/%-d")}({WD_JP[dd.weekday()]}){sl}'
+                if side is None:
+                    suggestion = _both_fixed_text((pd_, pslot, pname), (d, slot, name))
+                else:
+                    td, ts, tn, tp = ((pd_, pslot, pname, ppos) if side == 'prev' else (d, slot, name, pos))
+                    meal_names = raw_dish_names_slot(data, td, ts)
+                    cand = _recipe_replacement(
+                        data, td, ok=lambda n: not _is_leafy_butter(n),
+                        exclude={pname, name}, position=tp,
+                        avoid_with=meal_names - {tn}, meal=(ts, tn))
+                    suffix = '（平日昼は変更しない）' if side == 'prev' else ''
+                    suggestion = (f'{lab(td, ts)}の「{tn[:18]}」を「{cand[:22]}」等、バター×葉物の炒め物以外に変更{suffix}'
+                                  if cand else f'{lab(td, ts)}の使用日をずらす{suffix}')
+                viol.append({
+                    '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 38,
+                    'ルール': '葉物を入れたバターの炒め物の間隔が近い',
+                    '該当箇所': f'{slot}{pos}:{name[:22]} ← 前回 {lab(pd_, pslot)}{ppos}:{pname[:22]}',
+                    '理由': f'同じ型（バター×葉物の炒め物）を{gap}日しか空けず使用（要{LEAFY_BUTTER_MIN_GAP_DAYS}日以上）',
+                    '修正提案': suggestion, '重要度': '低',
+                })
+        prev = ((d, slot, name), pos)
+    return pd.DataFrame(viol)
+
+
 def raw_dish_names_slot(data, date, slot):
     """raw_dish_namesの昼/夜を分けた版。指定slot（'昼' or '夜'）のレシピ名だけを返す。"""
     names = set()
@@ -5025,6 +5084,7 @@ ALL_RULES = [
     ('No.4/36 コロッケ間隔', check_rule4_36),
     ('No.6 同一食材の複数レシピ重複（1食内）', check_rule6),
     ('No.6 メニュー名の野菜名の被り（1食内）', check_rule6_name_veg),
+    ('No.38 葉物を入れたバターの炒め物の間隔', check_rule38),
     ('No.8 食材+調味料の複数レシピ重複（1食内）', check_rule8),
     ('No.8 味付けワードの被り（メニュー名・1食内）', check_rule8_flavor),
     ('No.9 見た目（色）が同じ野菜の2日連続', check_rule9),
@@ -5159,6 +5219,8 @@ SETTINGS_SPEC = [
      '単品食材をこの日数より短い間隔で使うと違反'),
     ('No.16 固形の上限（これを超えたら違反）', '数値', 'SOLID_MAX', 'int',
      'メイン・サブメイン・副菜1のうち固形が何種までならOKか（2なら3枠すべて固形で違反）'),
+    ('No.38 葉物＋バターの炒め物を空ける日数', '数値', 'LEAFY_BUTTER_MIN_GAP_DAYS', 'int',
+     'メニュー名にバター・葉物・炒め/ソテーが入るメニューを、この日数未満で再び出すとNG'),
     ('No.28 本日の魚料理の必要回数（平日換算）', '数値', 'FISH_DAY_UNITS_MIN', 'int',
      '1カ月に必要な「本日の魚料理」の回数（平日の夜＝1回）'),
     ('No.28 土日祝の夜は何回で平日1回分か', '数値', 'FISH_DAY_WEEKEND_PER_UNIT', 'int',
@@ -5199,6 +5261,10 @@ SETTINGS_SPEC = [
      'メニュー名に入っていても、隣り合いのNo.30で見ない野菜'),
     ('No.8 味付けワード（メニュー名が被るとNG）', 'キーワード', 'FLAVOR_NAME_WORDS', 'words',
      '1食の中で、メニュー名にこの言葉が2品以上に出るとNG（醤油・和風など）'),
+    ('No.38 味付けワード（バターなど）', 'キーワード', 'LEAFY_BUTTER_SAUCE_WORDS', 'words',
+     'この言葉をメニュー名に含み、かつ葉物・炒め/ソテーを含むメニューが対象'),
+    ('No.38 葉物のワード', 'キーワード', 'LEAFY_BUTTER_LEAF_WORDS', 'words', '葉物として扱う野菜名'),
+    ('No.38 調理法のワード（炒め・ソテー）', 'キーワード', 'LEAFY_BUTTER_COOK_WORDS', 'words', '炒め物として扱う調理法の言葉'),
     ('カレーのキーワード', 'キーワード', 'CURRY_KW', 'str', '同じ日のカレー被りを避けるためのキーワード'),
     ('デザート扱いの名称キーワード（追加）', 'キーワード', 'DESSERT_NAME_EXTRA', 'dessert_extra',
      'メニュー名にこの言葉を含むものもデザートとして扱う（コードの既定の語に追加される）'),
@@ -5631,7 +5697,7 @@ RULE_NAME_JP = {
     25: 'かぼちゃ週1回', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★月内使用回数クオータ',
     28: '本日の魚料理は夜（平日換算2回以上）', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
     31: 'マッシュ系同日重複', 32: '商品枠クオータ（月ごとの商品枠シート）', 36: 'コロッケとクリームコロッケ',
-    37: '1食内で大豆・豆腐系レシピが複数使用',
+    37: '1食内で大豆・豆腐系レシピが複数使用', 38: '葉物＋バターの炒め物の間隔',
 }
 
 
