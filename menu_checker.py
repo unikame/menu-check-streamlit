@@ -262,6 +262,8 @@ _VEG_TIER_MASTER_DEFAULT = list(VEG_TIER_MASTER)   # シートが読めないと
 #     同じ商品の別ID（PRODUCT_ID_ALIASES・組み込み分）も1商品として扱う。
 #   ・A列が空でB列だけある行（かぼちゃの煮物など）：名前だけの行。同じ階層で同じ野菜名のIDの行と1つの品目にまとめ、
 #     野菜名で判定する（かぼちゃ3商品＝「2日空けばOK（かぼちゃの商品が3種類あるため）」）。
+#   ・連続OKの階層の商品に注記「カリフラワー添えの場合は1.5日空ける」「…メニュー名に入る場合間1日空けて」があれば、
+#     添え（付け合わせ）のとき／メニュー名に入るとき（前回・今回とも）だけ、その日数を空ける。それ以外は階層どおり。
 #   ・シートの注記「芋（じゃがいも・さつまいも・里芋）とかぼちゃは昼と夜の連続でもOK」は、
 #     『芋類とかぼちゃの組み合わせ（別の野菜どうし）が昼と夜に続いてもOK』という意味（担当者確認・2026/11）。
 #     野菜ごとに別々に間隔を見るので、組み合わせは元々チェックされない。同じ野菜の昼→夜の連続はOKにしない
@@ -272,6 +274,16 @@ VEG_TIER_ID_ALIASES_BUILTIN = {
     3002349: (3002349, 3000071),   # ほうれん草。3000071=自然解凍 ほうれん草 ファーストシダーズ（担当者確認・2026/11）
     3002371: (3002371, 3000094),   # オクラ。3000094=【自然解凍】オクラスライスIQF 青山（担当者指摘・2026/11）
 }
+
+
+def _veg_is_sozoe(recipe_name, canon):
+    """メニュー名に『添え』の字とその野菜名の両方がある（例：鶏の照り焼き カリフラワー添え）ものだけ『添え』とする
+    （担当者確認・2026/11）。☆以降の注記にだけ野菜名があるもの（照り焼きチキンステーキ☆カリフラワー）は添えと見ない。"""
+    n = _nfkc(str(recipe_name))
+    for c, rx in _NAME_VEG_RE:
+        if c in set(canon) and re.search(r'(?:' + rx.pattern + r')[^☆※]{0,2}添え|添え[^☆※]{0,1}(?:' + rx.pattern + r')', n):
+            return True
+    return False
 
 
 def _veg_alias_ids(pid):
@@ -315,7 +327,7 @@ def parse_veg_tier_rows(rows):
         a, b = _nfkc(r[0]), _nfkc(r[1])
         if re.fullmatch(r'\d{5,8}', a):
             if cur is not None:
-                cur['items'].append((int(a), b))
+                cur['items'].append((int(a), b, _nfkc(r[3])))
             else:
                 notes.append(f'野菜の使用間隔：階層の見出しより前にある行（商品ID {a}）は読みませんでした')
         elif a:
@@ -328,7 +340,11 @@ def parse_veg_tier_rows(rows):
                 cur = {'kind': c[0], 'base': c[1], 'doubled': c[2], 'items': [], 'head': a}
                 tiers.append(cur)
         elif b and cur is not None:
-            cur['items'].append((None, b))
+            cur['items'].append((None, b, ''))
+        elif not a and not b and r[3] and cur is not None and cur['items']:
+            # 商品の行の下に続く注記の行（例：「→昼に使用したら翌日の夜から。…」）は、直前の商品の注記に足す
+            pid0, nm0, note0 = cur['items'][-1]
+            cur['items'][-1] = (pid0, nm0, (note0 + ' ' + _nfkc(r[3])).strip())
     def _kw(name):
         canon = tuple(sorted(_name_veg_set(name)))
         if canon:
@@ -339,12 +355,25 @@ def parse_veg_tier_rows(rows):
     entries, flex = [], set()
     for t in tiers:
         if t['kind'] == 'flex':
-            for pid, _n in t['items']:
-                if pid is not None:
-                    flex |= _veg_alias_ids(pid)
+            for pid, _n, note in t['items']:
+                if pid is None:
+                    continue
+                ids = _veg_alias_ids(pid)
+                flex |= ids
+                # 注記で「メニュー名に入る（添え）場合は◯日空ける」とあれば、その野菜だけ条件つきで判定する
+                #   ・「間◯日空けてから使用」＝間に◯日（昼→翌日の夜が1.5日。◯＋0.5日）／「◯日空ける」＝◯日
+                #   ・メニュー名に入っていない場合は制約なし（半日空いていればOK）
+                mg = re.search(r'間(\d+(?:\.\d+)?)日空けて', note)
+                md = re.search(r'(\d+(?:\.\d+)?)日空ける', note)
+                req = float(mg.group(1)) + 0.5 if mg else (float(md.group(1)) if md else None)
+                if req:
+                    kind = 'sozoe' if '添え' in note else ('named' if 'メニュー名' in note else None)
+                    entries.append(('id', tuple(sorted(ids)), _kw(_n), 0.5 if kind else req, req, False,
+                                    _veg_tier_clean_name(_n) + ('（添えのとき）' if kind == 'sozoe' else
+                                                                 '（メニュー名記載のとき）' if kind else ''), kind))
             continue
         name_only = {}
-        for pid, name in t['items']:
+        for pid, name, _note in t['items']:
             if pid is None:
                 canon = tuple(sorted(_name_veg_set(name)))
                 if canon:
@@ -353,7 +382,7 @@ def parse_veg_tier_rows(rows):
                 else:
                     notes.append(f'野菜の使用間隔：「{_veg_tier_clean_name(name)[:20]}」は野菜名を読み取れないため、判定に使いません')
         id_groups = {}   # 同じ階層で同じ野菜名の商品（例：ミニミニブロッコリーの2商品）は、IDを2つ持つ1品目にまとめる
-        for pid, name in t['items']:
+        for pid, name, _note in t['items']:
             if pid is None:
                 continue
             canon = tuple(sorted(_name_veg_set(name)))
@@ -4826,7 +4855,9 @@ def check_rule30(data):
       差し替える提案にする（担当者判断・2026/10）。"""
     dr = data.date_range
     viol = []
-    for match_type, key, name_kw, base_days, doubled_days, same_day_exempt, label in VEG_TIER_MASTER:
+    for _ent in VEG_TIER_MASTER:
+        match_type, key, name_kw, base_days, doubled_days, same_day_exempt, label = _ent[:7]
+        cond = _ent[7] if len(_ent) > 7 else None   # None / 'named'(メニュー名記載) / 'sozoe'(添え)
         name_kws = name_kw if isinstance(name_kw, tuple) else (name_kw,)
         occurrences = []  # (slot_datetime, date, slot, is_named, matched_product_name, recipe_name)
         for d in dr:
@@ -4854,9 +4885,12 @@ def check_rule30(data):
                 # 「メニュー名に食材名が記載されている」判定は、☆・※以降の社内用の注記（例：黒酢の酢鶏☆れんこん）を
                 # 除いた表示用のメニュー名で見る（担当者判断・2026/10）。枠タイトル（お楽しみの1品☆…等）は
                 # ☆以降が実際の料理名のため、そのまま全体で見る。
-                is_named = hit['レシピ名'].astype(str).apply(
-                    lambda rn: any(k in _menu_display_name(rn) for k in name_kws)
-                    or bool(set(name_kws) & _name_veg_set(_menu_display_name(rn)))).any()
+                if cond == 'sozoe':
+                    is_named = hit['レシピ名'].astype(str).apply(lambda rn: _veg_is_sozoe(rn, name_kws)).any()
+                else:
+                    is_named = hit['レシピ名'].astype(str).apply(
+                        lambda rn: any(k in _menu_display_name(rn) for k in name_kws)
+                        or bool(set(name_kws) & _name_veg_set(_menu_display_name(rn)))).any()
                 slot_dt = pd.Timestamp(d) + pd.Timedelta(days=(0 if slot == '昼' else 0.5))
                 occurrences.append((slot_dt, d, slot, is_named, str(hit['商品名'].iloc[0]),
                                     str(hit['レシピ名'].iloc[0])))
@@ -4868,7 +4902,8 @@ def check_rule30(data):
                 continue
             # 担当者判断（2026/11）：間隔が倍になるのは、前回・今回の『どちらもメニュー名に記載』のとき。
             # どちらか一方だけの記載では適用しない（基本の日数でよい）。
-            named_both = bool(named0 and named1)
+            # 添え（cond='sozoe'）は、前回・今回のどちらかが添えなら延長。メニュー名記載は、どちらもそうなら延長
+            named_both = bool(named0 or named1) if cond == 'sozoe' else bool(named0 and named1)
             required = doubled_days if named_both else base_days
             if gap < required:
                 # 代替え案はレシピ名で出す：当該野菜を使わず、間隔制約の緩い野菜を使うメニュー
@@ -4911,7 +4946,7 @@ def check_rule30(data):
                     '該当箇所': f'{n1[:24]}（前回{d0.strftime("%-m/%-d")}{slot0}）',
                     # 「メニュー名記載のため延長」は、実際に必要日数が伸びた階層でのみ注記する
                     '理由': f'{gap:g}日しか空いていない（要{required:g}日以上'
-                            f'{"・前回・今回ともメニュー名記載のため延長適用" if named_both and doubled_days != base_days else ""}）',
+                            f'{("・前回か今回が添えのため延長適用" if cond == "sozoe" else "・前回・今回ともメニュー名記載のため延長適用") if named_both and doubled_days != base_days else ""}）',
                     '修正提案': sug, '重要度': '低（参考実装）',
                 })
     return pd.DataFrame(viol)
