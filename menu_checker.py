@@ -56,7 +56,7 @@
   No.30 野菜の使用間隔（FDメニュールール（野菜）シート準拠・商品ID単位。
         メニュー名記載時は必要日数2倍、芋類/かぼちゃは昼夜連続OK）
   No.31 マッシュ系同日重複
-  No.32 商品枠クオータ（26年12月商品枠シート限定・商品ID単位）。
+  No.32 商品枠クオータ（月ごとの商品枠シート「YY年M月商品枠」・商品ID単位）。
         D列下限/E列上限は月内延べ使用回数で判定、「隔月1回」「3カ月1回」は
         過去メニュー履歴（history_csv_paths・商品ID単位）と比較する周期チェック（参考実装・低重要度）
   No.37 1食内（昼/夜別）で大豆・豆腐系（SOY_KW）のレシピが複数使用（2026/10・ユーザー報告で追加。
@@ -3010,6 +3010,59 @@ def _name_has_seasoning_kw(kw, recipe_name):
     return any(a in n for a in SEASONING_NAME_ALIASES.get(kw, (kw,)))
 
 
+FLAVOR_NAME_WORDS = ['醤油', '和風', '味噌', 'ポン酢', '甘酢', '中華', '洋風']
+# No.8（味付けワードの被り）：1食の中で、レシピ名に同じ味付けワードが2品以上に出ているとNG
+# （担当者指摘・2026/11：2/1夜 副菜1「鶏さつまの出汁醤油」×副菜2「オクラと人参の和風醤油和え」で『醤油』、
+#   副菜2×サラダ「水菜としば漬けの和風サラダ」で『和風』が被っている）。ワードは設定シート（キーワード）で編集できる。
+
+
+def check_rule8_flavor(data):
+    """No.8（味付けワードの被り）：1食（昼/夜は別々）の中で、メニュー名に同じ味付けワード
+    （FLAVOR_NAME_WORDS：醤油・和風・味噌など）が2品以上に出ているとNG。
+    素材の被り（check_rule8）とは別に、名前から分かる『味付けの被り』を見る。
+    1食に被りが複数あるときは1行にまとめ、被りの数が最も多いレシピを差し替え対象にする。"""
+    dr = data.date_range
+    viol = []
+    words = [_nfkc(w) for w in FLAVOR_NAME_WORDS if str(w).strip()]
+    if not words:
+        return pd.DataFrame()
+    for d in dr:
+        for slot in ('昼', '夜'):
+            names = [n for n in sorted(raw_dish_names_slot(data, d, slot)) if not _is_mixed_rice(n)]
+            if len(names) < 2:
+                continue
+            by_word = {}
+            for w in words:
+                hit = [n for n in names if w in _nfkc(n)]
+                if len(hit) >= 2:
+                    by_word[w] = hit
+            if not by_word:
+                continue
+            count = {}
+            for hit in by_word.values():
+                for n in hit:
+                    count[n] = count.get(n, 0) + 1
+            max_c = max(count.values())
+            victim = [n for n in names if count.get(n, 0) == max_c][-1]
+            dup_words = set(by_word)
+            cand = _recipe_replacement(
+                data, d, ok=lambda n: not any(w in _nfkc(n) for w in dup_words),
+                position=_pos_on(data, d, slot, victim),
+                avoid_with=set(names) - {victim}, meal=(slot, victim))
+            suggestion = (f'「{victim[:18]}」を「{cand[:22]}」等、{"・".join(sorted(dup_words))}を含まないメニューに変更'
+                          if cand else '被っている味付けワードを含まないメニューに変更')
+            detail = '、'.join(f'「{w}」：' + ' / '.join(_nfkc(n).split('☆')[0][:18] for n in hit)
+                              for w, hit in by_word.items())
+            viol.append({
+                '日付': d.strftime('%-m/%-d'), '曜日': f'{slot}/{WD_JP[d.weekday()]}', 'No': 8,
+                'ルール': '1食内でメニュー名の味付けワードが被っている',
+                '該当箇所': f'[{slot}] {detail}',
+                '理由': '同じ味付けワード（' + '・'.join(by_word) + '）が複数のメニュー名に含まれる',
+                '修正提案': suggestion, '重要度': '低',
+            })
+    return pd.DataFrame(viol)
+
+
 def check_rule8(data):
     """No.8: 1食のうち『食材と調味料での食材被り』はNG。
     例：生姜おろし（食材）と やどかり国産生姜焼きのタレ（調味料）を同じ食事内で使う。
@@ -4892,6 +4945,7 @@ ALL_RULES = [
     ('No.4/36 コロッケ間隔', check_rule4_36),
     ('No.6 同一食材の複数レシピ重複（1食内）', check_rule6),
     ('No.8 食材+調味料の複数レシピ重複（1食内）', check_rule8),
+    ('No.8 味付けワードの被り（メニュー名・1食内）', check_rule8_flavor),
     ('No.9 見た目（色）が同じ野菜の2日連続', check_rule9),
     ('No.10 単一食材メニューの1週間ルール', check_rule10),
     ('No.11 自然解凍1品ルール', check_rule11),
@@ -4916,7 +4970,7 @@ ALL_RULES = [
     ('No.30 野菜使用間隔（FDメニュールール）', check_rule30),
     ('No.30 メニュー名の野菜名が隣り合う食事で連続', check_rule30_name_adjacent),
     ('No.31 マッシュ系同日重複', check_rule31),
-    ('No.32 商品枠クオータ（26年12月商品枠シート）', check_rule32),
+    ('No.32 商品枠クオータ（月ごとの商品枠シート）', check_rule32),
     ('No.37 1食内で大豆・豆腐系レシピが複数使用', check_rule37),
 ]
 
@@ -5062,6 +5116,8 @@ SETTINGS_SPEC = [
     ('FD限定の魚メニュー', 'キーワード', 'FISH_FD_ONLY', 'words', 'FDの「本日の魚料理」として扱う魚メニュー名'),
     ('メニュー名の野菜の隣り合い判定から除く野菜', 'キーワード', 'NAME_VEG_ADJ_EXCLUDE', 'words',
      'メニュー名に入っていても、隣り合いのNo.30で見ない野菜'),
+    ('No.8 味付けワード（メニュー名が被るとNG）', 'キーワード', 'FLAVOR_NAME_WORDS', 'words',
+     '1食の中で、メニュー名にこの言葉が2品以上に出るとNG（醤油・和風など）'),
     ('カレーのキーワード', 'キーワード', 'CURRY_KW', 'str', '同じ日のカレー被りを避けるためのキーワード'),
     ('デザート扱いの名称キーワード（追加）', 'キーワード', 'DESSERT_NAME_EXTRA', 'dessert_extra',
      'メニュー名にこの言葉を含むものもデザートとして扱う（コードの既定の語に追加される）'),
@@ -5485,7 +5541,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
 RULE_NAME_JP = {
     1: 'メイン/サブ商材1週間', 2: '見た目酷似1週間+月2回', 3: '挽肉のメイン/サブ重複',
     4: 'コロッケ間隔', 5: '鶏豚牛のメイン/サブ重複', 6: '同一食材の複数レシピ重複',
-    7: '大豆系は半日空ける', 8: '食材と調味料の中身被り', 9: '同じ色の野菜が2日連続',
+    7: '大豆系は半日空ける', 8: '食材と調味料の中身被り／メニュー名の味付けワード被り', 9: '同じ色の野菜が2日連続',
     10: '単一食材メニュー1週間', 11: '自然解凍1品', 12: '当日揚げ3品まで',
     13: '盛付工数3工程まで', 14: '栄養素基準（月平均）', 15: '健康食材 週1回以上',
     16: '固形は2種まで（メイン・サブメイン・副菜1）', 17: '赤・黄・緑を使用（黄は常にクリア）', 18: '1食の重量下限（平日昼は除く）',
@@ -5493,7 +5549,7 @@ RULE_NAME_JP = {
     22: '魚メニュー3日に1回', 23: '食べにくさチェック', 24: '白和えの分類',
     25: 'かぼちゃ週1回', 26: 'かにのふわふわ5日以上', 27: 'FD専用商材・★月内使用回数クオータ',
     28: '本日の魚料理は夜（平日換算2回以上）', 29: 'おまかせ月2回以上', 30: '野菜の使用間隔',
-    31: 'マッシュ系同日重複', 32: '商品枠クオータ（12月商品枠シート）', 36: 'コロッケとクリームコロッケ',
+    31: 'マッシュ系同日重複', 32: '商品枠クオータ（月ごとの商品枠シート）', 36: 'コロッケとクリームコロッケ',
     37: '1食内で大豆・豆腐系レシピが複数使用',
 }
 
