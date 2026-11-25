@@ -3567,6 +3567,86 @@ def check_rule6(data):
     return pd.DataFrame(viol)
 
 
+def check_rule6_name_veg(data):
+    """No.6（メニュー名の野菜名の被り）：1食（昼/夜は別々）の中で、メニュー名に同じ野菜名
+    （NAME_VEG_PATTERNS：ピーマン・人参・なす・大根など）が2品以上に出ているとNG。
+    No.6の商品単位の判定は、商品が違うと（例：加工品『ピーマン肉詰めフライ』と、副菜の
+    『緑ピーマン』）検出できないため、メニュー名から分かる被りを別に見る
+    （担当者指摘・2026/11：2/2夜 メイン『ピーマン肉詰めフライ』×副菜2『ピーマンのバター醤油炒め』）。
+    同じ商品を使っていて、すでにNo.6（商品単位）で検出される組み合わせは、重複して出さない。
+    しょうが・大葉（NAME_VEG_ADJ_EXCLUDE）は調味料的に使われるため見ない。"""
+    dr = data.date_range
+    viol = []
+    for d in dr:
+        for meal in ('昼', '夜'):
+            shoku = data.shoku.get(d.month) if meal == '昼' else data.shoku_night.get(d.month)
+            if shoku is None:
+                continue
+            names = [n for n in sorted(raw_dish_names_slot(data, d, meal)) if not _is_mixed_rice(n)]
+            if len(names) < 2:
+                continue
+            by_veg = {}
+            for n in names:
+                for v in _name_veg_set(n) - set(NAME_VEG_ADJ_EXCLUDE):
+                    by_veg.setdefault(v, []).append(n)
+            by_veg = {v: h for v, h in by_veg.items() if len(h) >= 2}
+            if not by_veg:
+                continue
+            # 同じ商品を使う組み合わせは、No.6（商品単位）が検出するので除く
+            md = (d.month, d.day)
+            sub = shoku[(shoku['md'] == md) & (shoku['isDX'])]
+            prods = {}
+            for _, r in sub.iterrows():
+                prod = str(r['商品名'])
+                qty = r.get('食材数量')
+                if pd.isna(qty) or qty == 0 or cm.is_noise(prod) or is_base_seasoning(prod):
+                    continue
+                prods.setdefault(str(r['レシピ名']), set()).add(prod)
+            hits = {}
+            for v, h in by_veg.items():
+                independent = any(not (prods.get(a, set()) & prods.get(b, set()))
+                                  for i, a in enumerate(h) for b in h[i + 1:])
+                if independent:
+                    hits[v] = h
+            if not hits:
+                continue
+
+            def _pos_idx(rn):
+                ps = _pos_on(data, d, meal, rn)
+                return POS_ORDER_5.index(ps) if ps in POS_ORDER_5 else len(POS_ORDER_5)
+            count = {}
+            for h in hits.values():
+                for n in h:
+                    count[n] = count.get(n, 0) + 1
+            max_c = max(count.values())
+            pool = [n for n in names if count.get(n, 0) == max_c]
+            # 「店主おすすめの1品」などの枠は差し替え対象にしない（他に選べるときだけ）
+            fixed = lambda n: any(_nfkc(n).startswith(_nfkc(t)) for t in NO_SUGGEST_FRAME_TITLES)
+            free = [n for n in names if count.get(n, 0) > 0 and not fixed(n)]
+            if all(fixed(n) for n in pool) and free:
+                pool = [n for n in free if count.get(n, 0) == max(count[x] for x in free)]
+            elif any(not fixed(n) for n in pool):
+                pool = [n for n in pool if not fixed(n)]
+            victim = sorted(pool, key=_pos_idx)[-1]
+            dup_vegs = set(hits)
+            cand = _recipe_replacement(
+                data, d, ok=lambda n: not (_name_veg_set(n) & dup_vegs),
+                position=_pos_on(data, d, meal, victim),
+                avoid_with=set(names) - {victim}, meal=(meal, victim))
+            suggestion = (f'「{victim[:18]}」を「{cand[:22]}」等、{"・".join(sorted(dup_vegs))}を含まないメニューに変更'
+                          if cand else '被っている野菜を含まないメニューに変更')
+            detail = '、'.join(f'「{v}」：' + ' / '.join(_nfkc(n).split('☆')[0][:18] for n in h)
+                              for v, h in hits.items())
+            viol.append({
+                '日付': d.strftime('%-m/%-d'), '曜日': f'{meal}/{WD_JP[d.weekday()]}', 'No': 6,
+                'ルール': '1食内でメニュー名の野菜名が被っている',
+                '該当箇所': f'[{meal}] {detail}',
+                '理由': '同じ野菜名（' + '・'.join(hits) + '）が複数のメニュー名に含まれる',
+                '修正提案': suggestion, '重要度': '中',
+            })
+    return pd.DataFrame(viol)
+
+
 def raw_dish_names_slot(data, date, slot):
     """raw_dish_namesの昼/夜を分けた版。指定slot（'昼' or '夜'）のレシピ名だけを返す。"""
     names = set()
@@ -4944,6 +5024,7 @@ ALL_RULES = [
     ('No.3/5 挽肉・鶏豚牛のメイン/サブ重複', check_rule3_5),
     ('No.4/36 コロッケ間隔', check_rule4_36),
     ('No.6 同一食材の複数レシピ重複（1食内）', check_rule6),
+    ('No.6 メニュー名の野菜名の被り（1食内）', check_rule6_name_veg),
     ('No.8 食材+調味料の複数レシピ重複（1食内）', check_rule8),
     ('No.8 味付けワードの被り（メニュー名・1食内）', check_rule8_flavor),
     ('No.9 見た目（色）が同じ野菜の2日連続', check_rule9),
@@ -5540,7 +5621,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
 
 RULE_NAME_JP = {
     1: 'メイン/サブ商材1週間', 2: '見た目酷似1週間+月2回', 3: '挽肉のメイン/サブ重複',
-    4: 'コロッケ間隔', 5: '鶏豚牛のメイン/サブ重複', 6: '同一食材の複数レシピ重複',
+    4: 'コロッケ間隔', 5: '鶏豚牛のメイン/サブ重複', 6: '同一食材の複数レシピ重複／メニュー名の野菜名被り',
     7: '大豆系は半日空ける', 8: '食材と調味料の中身被り／メニュー名の味付けワード被り', 9: '同じ色の野菜が2日連続',
     10: '単一食材メニュー1週間', 11: '自然解凍1品', 12: '当日揚げ3品まで',
     13: '盛付工数3工程まで', 14: '栄養素基準（月平均）', 15: '健康食材 週1回以上',
