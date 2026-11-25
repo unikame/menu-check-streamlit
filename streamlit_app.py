@@ -120,6 +120,14 @@ HISTORY_SHEET_URLS = [
     ('追加3', 'https://docs.google.com/spreadsheets/d/1Hl8USvY6nb0czO_nBksLJXkXIqIVhitRrzpAnpyQHZ8/edit?gid=2107519398#gid=2107519398'),
 ]
 
+# ============================================================================
+# ★ 野菜の使用間隔（No.30）のシート ★
+#   担当者が直して社内で共有している「FDメニュールール（野菜）」のタブを、そのまま読みます。
+#   （設定シートに移さず、元のシートを見に行きます。シートの形は変えなくてOK）
+#   読めなかったとき・読み取れなかったときは、コード内の表で判定し、画面に出します。
+# ============================================================================
+VEG_TIER_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY/edit?gid=1671677088#gid=1671677088'
+
 MASTER_META = {
     'veg':       ('野菜マスタ', 'csv',  '野菜マスタ_テンプレート.csv', 'No.9 / No.17'),
     'seasoning': ('調味料',     'csv',  '調味料.csv',                  'No.8 / No.19'),
@@ -349,6 +357,25 @@ def resolve_master(key):
             f.write(data)
     old_note = '（設定シートにタブが無いため旧URLから）' if (SETTINGS_BOOK_URL or '').strip() else ''
     return path, f'{label}（{rules}）{old_note}', True
+
+
+def resolve_veg_tier():
+    """野菜の使用間隔シートを取得して (パス or None, チップHTML) を返す。"""
+    url = (VEG_TIER_SHEET_URL or '').strip()
+    if not url:
+        return None, '<span class="muted">野菜の使用間隔：コード内の表で判定</span>'
+    try:
+        data = fetch_master_bytes(url, 'csv')
+        path = os.path.join(TMP_DIR, '野菜の使用間隔.csv')
+        with open(path, 'wb') as f:
+            f.write(data)
+        entries, _flex, _notes = mc.load_veg_tier_csv(path)
+        if not entries:
+            raise ValueError('判定対象の野菜を読み取れませんでした')
+    except Exception as e:  # noqa: BLE001
+        return None, (f'<span class="ms-ng">▲ 野菜の使用間隔：シートを読めませんでした（{e}）。'
+                      'コード内の表で判定します</span>')
+    return path, f'<span class="ms-ok">● 野菜の使用間隔（No.30）＝シート（{len(entries)}品目）</span>'
 
 
 def detect_target_months(uploaded_files):
@@ -711,6 +738,9 @@ def load_sources(months=(), manual_frames=None):
             master_failed.append(key)
         chips.append(f'<span class="{"ms-ok" if ok else "ms-ng"}">'
                      f'{"●" if ok else "▲"} {msg}</span>')
+    veg_tier_path, veg_tier_chip = resolve_veg_tier()
+    chips.append(veg_tier_chip)
+    master_paths['veg_tier'] = veg_tier_path
     hist_paths, hist_msgs, hist_labels = resolve_history()
     hchips = [f'<span class="{"ms-ok" if ok else "ms-ng"}">'
               f'{"●" if ok else "▲"} {msg}</span>' for ok, msg in hist_msgs]
@@ -788,6 +818,7 @@ if run:
             'history_csv_paths': hist_paths or None,
             'product_frame_paths': frame_paths or None,
             'settings_paths': settings_paths or None,
+            'veg_tier_path': master_paths.get('veg_tier'),
         }
         # menu_checker.py が古い場合に落ちないよう、対応していない引数は落とす
         supported = set(inspect.signature(mc.run_all_checks).parameters)
