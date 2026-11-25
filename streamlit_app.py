@@ -361,7 +361,8 @@ def resolve_master(key):
 
 def resolve_veg_tier():
     """野菜の使用間隔シートを取得して (パス or None, チップHTML) を返す。"""
-    url = (VEG_TIER_SHEET_URL or '').strip()
+    url, from_refs = ref_url('野菜の使用間隔', VEG_TIER_SHEET_URL)
+    url = (url or '').strip()
     if not url:
         return None, '<span class="muted">野菜の使用間隔：コード内の表で判定</span>'
     try:
@@ -375,7 +376,8 @@ def resolve_veg_tier():
     except Exception as e:  # noqa: BLE001
         return None, (f'<span class="ms-ng">▲ 野菜の使用間隔：シートを読めませんでした（{e}）。'
                       'コード内の表で判定します</span>')
-    return path, f'<span class="ms-ok">● 野菜の使用間隔（No.30）＝シート（{len(entries)}品目）</span>'
+    return path, (f'<span class="ms-ok">● 野菜の使用間隔（No.30）＝シート（{len(entries)}品目'
+                  f'{"・設定シートの参照先" if from_refs else ""}）</span>')
 
 
 def detect_target_months(uploaded_files):
@@ -433,10 +435,42 @@ def fetch_frame_csv(book_url, yy, month, gid):
     raise PermissionError('／'.join(errs))
 
 
+REFS_TAB = '参照先'
+
+
+def settings_refs():
+    """設定シートの「参照先」タブ（名前, URL）を {名前: URL} で返す。無い・読めない・形が違うときは {}。"""
+    url = (SETTINGS_BOOK_URL or '').strip()
+    if not url:
+        return {}
+    try:
+        text = fetch_settings_csv(url, REFS_TAB).decode('utf-8-sig', errors='ignore')
+        import csv as _csv
+        rows = list(_csv.reader(io.StringIO(text)))
+    except Exception:  # noqa: BLE001
+        return {}
+    # gviz はタブ名が無いと先頭のタブを返すため、見出しが『名前, URL』かを確かめる
+    if not rows or [c.strip() for c in rows[0][:2]] != ['名前', 'URL']:
+        return {}
+    out = {}
+    for r in rows[1:]:
+        if len(r) >= 2 and r[0].strip() and _SHEET_ID_RE.search(r[1] or ''):
+            out[r[0].strip()] = r[1].strip()
+    return out
+
+
+def ref_url(name, default):
+    """設定シートの「参照先」タブにあればそのURL、無ければコード内の既定URL。(URL, 参照先タブから取ったか) を返す。"""
+    u = settings_refs().get(name)
+    return (u, True) if u else (default, False)
+
+
 def resolve_frames(months, manual=None):
     """月ごとの商品枠を解決して ({月: パス}, チップ, 失敗した[(yy, 月)]) を返す。"""
     manual = manual or {}
     paths, chips, failed = {}, [], []
+    book_url, from_refs = ref_url('商品枠ブック', FRAME_BOOK_URL)
+    same_book = (_SHEET_ID_RE.search(book_url or '') or [None, 1])[1] == (_SHEET_ID_RE.search(FRAME_BOOK_URL) or [None, 2])[1]
     for yy, mo in months:
         tab = FRAME_TAB_FORMAT.format(yy=yy, m=mo)
         if (yy, mo) in manual:
@@ -444,7 +478,7 @@ def resolve_frames(months, manual=None):
             chips.append(f'<span class="ms-ok">● 商品枠 {tab}（手動指定）</span>')
             continue
         try:
-            data, how = fetch_frame_csv(FRAME_BOOK_URL, yy, mo, FRAME_SHEET_GIDS.get((yy, mo)))
+            data, how = fetch_frame_csv(book_url, yy, mo, FRAME_SHEET_GIDS.get((yy, mo)) if same_book else None)
         except (PermissionError, ValueError, urllib.error.URLError, TimeoutError) as e:
             failed.append((yy, mo))
             chips.append(f'<span class="ms-ng">▲ 商品枠 {tab}：読めませんでした（{e}）</span>')
@@ -453,7 +487,7 @@ def resolve_frames(months, manual=None):
         with open(path, 'wb') as fh:
             fh.write(data)
         paths[mo] = path
-        chips.append(f'<span class="ms-ok">● 商品枠 {tab}（{how}で取得）</span>')
+        chips.append(f'<span class="ms-ok">● 商品枠 {tab}（{how}で取得{"・設定シートの参照先" if from_refs else ""}）</span>')
     return paths, chips, failed
 
 
