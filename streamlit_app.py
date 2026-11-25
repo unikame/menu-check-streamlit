@@ -13,7 +13,8 @@ menu_checker.run_all_checks() を呼び出して結果を表示するだけの�
 ■ 毎回アップロードするファイル
   必須：メニューワークブック（新構成ルール確認.xlsx など）
   推奨：食材CSV（7月昼.csv / 7月夜.csv …）※CSVがある月だけが判定対象になる
-  マスタ3種はGoogleスプレッドシートから自動取得（MASTER_SHEET_URLS）
+  マスタ3種（野菜マスタ・調味料・食材データ）は設定シートのタブから自動取得
+  （タブが無いときだけ、MASTER_SHEET_URLS の旧URLにフォールバック）
 """
 import inspect
 import io
@@ -40,6 +41,14 @@ except ImportError:  # pragma: no cover
 #     Googleドライブのファイル共有URL（.../file/d/xxx/view）でもそのまま貼れます。
 #   ・いずれも共有設定を「リンクを知っている全員」→「閲覧者」にしてください。
 #   ・空文字にすると、そのマスタは画面からの手動アップロードになります。
+# ============================================================================
+#
+#   ★2026/11：3つのマスタは設定シート（SETTINGS_BOOK_URL）のタブに一本化しました。
+#     設定シートに下のタブがあれば、そちらを優先して読みます。
+#       野菜マスタ … タブ名に「野菜マスタ」または「野菜の色」を含むタブ
+#       調味料     … タブ名が「調味料」のタブ（「…該当」は除く）
+#       食材データ … 「調理法（当日揚げ）」タブ（元のブックのタブ名のままコピーしてください）
+#     タブが無いマスタだけ、下の旧URLから読みます（移行期間のための保険）。
 # ============================================================================
 MASTER_SHEET_URLS = {
     # 野菜マスタ_テンプレート（No.9 色の2日連続 / No.17 赤黄緑）
@@ -214,9 +223,9 @@ def gviz_csv_url(url):
 FETCH_TIMEOUT = 20   # 1件あたりの取得タイムアウト（秒）。長すぎると起動が固まるため短めにする
 
 
-def _download(url):
+def _download(url, timeout=None):
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as res:
+    with urllib.request.urlopen(req, timeout=timeout or FETCH_TIMEOUT) as res:
         data = res.read()
     head = data[:200].lstrip().lower()
     if head.startswith(b'<!doctype html') or head.startswith(b'<html'):
@@ -250,12 +259,78 @@ def fetch_master_bytes(url, fmt):
             '「リンクを知っている全員（閲覧者）」にしてください。') from first_err
 
 
-def resolve_master(key):
-    """マスタ1つ分を解決して (パス, 状態メッセージ, 成否) を返す。"""
+# 設定シートの中でマスタのタブを探すときのタブ名（完全一致を優先、次に部分一致）
+MASTER_TAB_HINTS = {
+    'veg':       (('野菜マスタ_テンプレート', '野菜マスタ', '野菜の色'), ()),
+    'seasoning': (('調味料',), ('該当',)),
+}
+SHOKU_MARKER_TAB = '調理法（当日揚げ）'   # 食材データのブックにある目印のタブ
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_book_xlsx(book_url):
+    """設定シート全体をxlsxで取得して bytes で返す（1時間キャッシュ）。"""
+    m = _SHEET_ID_RE.search(str(book_url))
+    if not m:
+        raise ValueError('設定シートのURLが正しくありません')
+    return _download(f'https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=xlsx',
+                     timeout=60)
+
+
+def _find_master_tab(sheet_names, hints, excludes):
+    for h in hints:                       # ①完全一致
+        if h in sheet_names:
+            return h
+    for h in hints:                       # ②部分一致（「…のコピー」など）
+        for n in sheet_names:
+            if h in n and not any(x in n for x in excludes):
+                return n
+    return None
+
+
+def master_from_settings(key):
+    """設定シートのタブからマスタを作る。見つかれば (パス, 状態メッセージ, True)、
+    設定シートが読めない／該当タブが無い場合は None（旧URLにフォールバックする）。"""
+    url = (SETTINGS_BOOK_URL or '').strip()
+    if not url:
+        return None
+    try:
+        xl = pd.ExcelFile(io.BytesIO(fetch_book_xlsx(url)))
+    except Exception:  # noqa: BLE001
+        return None
     label, fmt, filename, rules = MASTER_META[key]
+    path = os.path.join(TMP_DIR, filename)
+    if key == 'shoku':
+        if SHOKU_MARKER_TAB not in xl.sheet_names:
+            return None
+        with open(path, 'wb') as f:
+            f.write(fetch_book_xlsx(url))
+        return path, f'{label}（{rules}）＝設定シート', True
+    hints, excludes = MASTER_TAB_HINTS[key]
+    tab = _find_master_tab(xl.sheet_names, hints, excludes)
+    if not tab:
+        return None
+    try:
+        df = xl.parse(tab, header=0, dtype=str)
+    except Exception:  # noqa: BLE001
+        return None
+    df = df.dropna(how='all')
+    if not len(df):
+        return None
+    df.to_csv(path, index=False)
+    return path, f'{label}（{rules}）＝設定シート「{tab}」', True
+
+
+def resolve_master(key):
+    """マスタ1つ分を解決して (パス, 状態メッセージ, 成否) を返す。
+    設定シートにタブがあればそれを使い、無ければ MASTER_SHEET_URLS の旧URLから読む。"""
+    label, fmt, filename, rules = MASTER_META[key]
+    got = master_from_settings(key)
+    if got:
+        return got
     url = (MASTER_SHEET_URLS.get(key) or '').strip()
     if not url:
-        return None, f'{label}：URL未設定', False
+        return None, f'{label}：設定シートにタブがなく、URLも未設定です', False
     try:
         data = fetch_master_bytes(url, fmt)
     except PermissionError as e:
@@ -272,7 +347,8 @@ def resolve_master(key):
     else:
         with open(path, 'wb') as f:
             f.write(data)
-    return path, f'{label}（{rules}）', True
+    old_note = '（設定シートにタブが無いため旧URLから）' if (SETTINGS_BOOK_URL or '').strip() else ''
+    return path, f'{label}（{rules}）{old_note}', True
 
 
 def detect_target_months(uploaded_files):
