@@ -128,6 +128,15 @@ HISTORY_SHEET_URLS = [
 # ============================================================================
 VEG_TIER_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY/edit?gid=1671677088#gid=1671677088'
 
+# ============================================================================
+# ★ 新商品・終売のシート（月ごとのタブ「27年2月」など） ★
+#   担当者が月ごとに「■新商品」「■切替」「■値上げ」「■終売」をまとめているブック。
+#   チェック対象の月と、それ以前のタブをすべて読み、「■終売」の欄の商品ID（MLのもの）を終売として扱います。
+#   （設定シートの「終売」タブは、このブックが読めないときの保険になります）
+#   URLは設定シートの「参照先」タブ（名前：新商品・終売ブック）でも指定できます。
+# ============================================================================
+DISC_BOOK_URL = 'https://docs.google.com/spreadsheets/d/1PdY1Ibwwl7C3apPGEtTn0sG6KCVqWv0AYj8d_ogrZqY/edit?gid=167806867#gid=167806867'
+
 MASTER_META = {
     'veg':       ('野菜マスタ', 'csv',  '野菜マスタ_テンプレート.csv', 'No.9 / No.17'),
     'seasoning': ('調味料',     'csv',  '調味料.csv',                  'No.8 / No.19'),
@@ -378,6 +387,50 @@ def resolve_veg_tier():
                       'コード内の表で判定します</span>')
     return path, (f'<span class="ms-ok">● 野菜の使用間隔（No.30）＝シート（{len(entries)}品目'
                   f'{"・設定シートの参照先" if from_refs else ""}）</span>')
+
+
+def resolve_discontinued(months):
+    """新商品・終売ブックの、対象月以前のタブを読んで ({タブ名: 行のリスト} or None, チップHTML) を返す。
+    読めない／月が分からないときは None（設定シートの『終売』タブで動く）。"""
+    import unicodedata
+    url, from_refs = ref_url('新商品・終売ブック', DISC_BOOK_URL)
+    url = (url or '').strip()
+    if not url:
+        return None, ''
+    months = [(int(y), int(m)) for y, m in months]
+    if not months:
+        return None, '<span class="muted">終売：月が分かると、新商品・終売ブックを読みます</span>'
+    try:
+        xl = pd.ExcelFile(io.BytesIO(fetch_book_xlsx(url)))
+    except Exception as e:  # noqa: BLE001
+        return None, (f'<span class="ms-ng">▲ 終売：新商品・終売ブックを読めませんでした（{e}）。'
+                      '設定シートの「終売」タブで判定します</span>')
+    limit = max(y * 12 + m for y, m in months)
+    tabs = []
+    for name in xl.sheet_names:
+        mm = re.match(r'^\s*(\d{2})年\s*(\d{1,2})月', unicodedata.normalize('NFKC', name))
+        if mm and int(mm.group(1)) * 12 + int(mm.group(2)) <= limit:
+            tabs.append((int(mm.group(1)) * 12 + int(mm.group(2)), name))
+    tabs.sort()
+    rows = {}
+    for _k, name in tabs:
+        try:
+            df = xl.parse(name, header=None, dtype=str).fillna('')
+            rows[name] = df.values.tolist()
+        except Exception:  # noqa: BLE001
+            continue
+    target_names = [f'{y}年{m}月' for y, m in months]
+    miss = [t for t in target_names
+            if not any(unicodedata.normalize('NFKC', n).replace(' ', '').startswith(t) for n in rows)]
+    note = '・設定シートの参照先' if from_refs else ''
+    if not rows:
+        return None, ('<span class="ms-ng">▲ 終売：新商品・終売ブックに「◯◯年◯月」のタブが見つかりません。'
+                      '設定シートの「終売」タブで判定します</span>')
+    chip = (f'<span class="ms-ok">● 終売＝新商品・終売ブック（{len(rows)}タブ：{"・".join(rows)}{note}）</span>')
+    if miss:
+        chip += (f'<span class="ms-ng">▲ 終売：{"・".join(miss)}のタブがありません'
+                 '（それ以前のタブの終売だけで判定します）</span>')
+    return rows, chip
 
 
 def detect_target_months(uploaded_files):
@@ -704,7 +757,7 @@ with st.expander('入力ファイルと設定', expanded=('result' not in st.ses
             + '　<span class="muted">※判定には使わず、代替え案の候補にのみ使用</span></div>'
             + '<div class="statusline"><b>設定</b>　' + '　'.join(status.get('settings_chips', [])) + '</div>'
             + '<div class="statusline"><b>商品枠</b>　'
-            + ('　'.join(status.get('frame_chips', [])) or '<span class="muted">（月を判定できませんでした）</span>')
+            + ('　'.join(status.get('frame_chips', [])) or '<span class="muted">（月を判定できませんでした。食材CSVを入れて「チェックを実行」すると表示されます。CSVを入れても出る場合は、CSVの「名称」欄に「27年2月1日(月)」のような日付があるか確認してください）</span>')
             + '</div>',
             unsafe_allow_html=True)
     else:
@@ -780,6 +833,10 @@ def load_sources(months=(), manual_frames=None):
               f'{"●" if ok else "▲"} {msg}</span>' for ok, msg in hist_msgs]
     frame_paths, frame_chips, frame_failed = resolve_frames(list(months), manual_frames)
     settings_paths, settings_chips = resolve_settings()
+    disc_rows, disc_chip = resolve_discontinued(list(months))
+    if disc_chip:
+        settings_chips = list(settings_chips) + [disc_chip]
+    master_paths['disc_rows'] = disc_rows
     st.session_state['conn_status'] = {
         'master_chips': chips, 'hist_chips': hchips, 'master_failed': master_failed,
         'frame_chips': frame_chips, 'frame_failed': frame_failed,
@@ -851,7 +908,9 @@ if run:
             'ai_client': ai_client,
             'history_csv_paths': hist_paths or None,
             'product_frame_paths': frame_paths or None,
-            'settings_paths': settings_paths or None,
+            'settings_paths': ({k: v for k, v in (settings_paths or {}).items()
+                                if not (k == '終売' and master_paths.get('disc_rows') is not None)} or None),
+            'discontinued_book': master_paths.get('disc_rows'),
             'veg_tier_path': master_paths.get('veg_tier'),
         }
         # menu_checker.py が古い場合に落ちないよう、対応していない引数は落とす
