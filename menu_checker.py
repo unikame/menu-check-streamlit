@@ -232,20 +232,180 @@ VEG_TIER_MASTER = [
     ('id', 3002287, 'かぶ', 1.5, 1.5, False, '冷凍かぶ 銀杏切り 500g'),
     ('id', 3001594, '竹の子', 1.5, 1.5, False, '冷凍竹の子千切り 500g'),
     ('id', 3000084, 'スナップ', 1.5, 1.5, False, 'アイガースナップピース 500g'),
-    # 3日空けばOK（メニュー名に無ければ2日でも可）階層。芋(じゃがいも/さつまいも/里芋)とかぼちゃは
-    # 昼夜連続使用（半日空き）は例外的にOK（シートD42注記）。
-    # れんこん・油調ナス・スイートポテトは芋の例外に含めず対象外（ユーザー確認済み）。
+    # 3日空けばOK（メニュー名に無ければ2日でも可）階層。
+    # シート注記「芋（じゃがいも・さつまいも・里芋）とかぼちゃは昼と夜の連続でもOK」は『芋類とかぼちゃの組み合わせ
+    # （別の野菜どうし）なら昼と夜に続いてもOK』の意味（担当者確認・2026/11）。野菜ごとに別々に判定するので
+    # 組み合わせは元々チェックされず、同じ野菜の昼→夜の連続は例外にしない（以前の版は例外にしていた）。
     ('id', 3002377, '油調ナス', 2, 3, False, '油調ナス(自然解凍) 500g'),
-    ('id', 3003062, ('さといも', '里芋'), 2, 3, True, 'さといもSS 500g'),
-    ('id', 3002214, 'じゃがいも', 2, 3, True, '乱切りじゃがいも 500g'),
-    ('id', 3001814, ('さつま芋', 'さつまいも'), 2, 3, True, 'ひとくち焼きいも(さつま芋)'),
+    ('id', 3003062, ('さといも', '里芋'), 2, 3, False, 'さといもSS 500g'),
+    ('id', 3002214, 'じゃがいも', 2, 3, False, '乱切りじゃがいも 500g'),
+    ('id', 3001814, ('さつま芋', 'さつまいも'), 2, 3, False, 'ひとくち焼きいも(さつま芋)'),
     ('id', 3001964, 'スイートポテト', 2, 3, False, 'スイートポテト 1kg'),
     ('id', 3002355, 'れんこん', 2, 3, False, 'れんこん乱切り 500g'),
     # 2日空けばOK（かぼちゃ3商品）階層。同上、昼夜連続はOK。
     # 「栗南瓜コロッケ」のように「南瓜」表記の商品もあるため、両表記で拾う（ユーザー確認済み）。
-    ('name', ('かぼちゃ', '南瓜'), ('かぼちゃ', '南瓜'), 2, 2, True,
+    ('name', ('かぼちゃ', '南瓜'), ('かぼちゃ', '南瓜'), 2, 2, False,
      'かぼちゃ系（皮つき乱切り/かぼちゃの煮物/栗南瓜コロッケ）'),
 ]
+_VEG_TIER_MASTER_DEFAULT = list(VEG_TIER_MASTER)   # シートが読めないときに使うコード内の表（実行のたびにここへ戻す）
+
+# ----------------------------------------------------------------------------
+# No.30：野菜の使用間隔を、担当者が直している「FDメニュールール（野菜）」シートから読む（2026/11）。
+#   シートの書き方（階層の見出し行＋商品ID行）をそのまま読む。シートの形を変える必要はない。
+#   ・見出し行（A列に文章）で階層を決める：
+#       「昼･夜、夜･昼使用可能」「連続OK」  → 間隔の制約がほぼ無い野菜（判定しない・代わりの野菜の候補になる）
+#       「◯日空けばOK」                      → ◯日の階層（◯＝1.5, 2, 3 など。見出しの数字から読む）
+#       「メニュー名に入っていなければ◯日でも可」とあれば、メニュー名に無いときは◯日、ある（前回・今回とも）ときは階層の日数
+#       1.5日の階層は、メニュー名に関係なく1.5日（担当者確認・2026/11）
+#   ・商品ID行（A列が数字）：同じ階層で同じ野菜名の行は、IDを複数持つ1品目にまとめる（担当者指示・2026/11：
+#     ミニミニブロッコリーの2商品は、どちらかが表から消えるまでは2つのIDを持つ1つの野菜として、1.5日空ける）。
+#     同じ商品の別ID（PRODUCT_ID_ALIASES・組み込み分）も1商品として扱う。
+#   ・A列が空でB列だけある行（かぼちゃの煮物など）：名前だけの行。同じ階層で同じ野菜名のIDの行と1つの品目にまとめ、
+#     野菜名で判定する（かぼちゃ3商品＝「2日空けばOK（かぼちゃの商品が3種類あるため）」）。
+#   ・シートの注記「芋（じゃがいも・さつまいも・里芋）とかぼちゃは昼と夜の連続でもOK」は、
+#     『芋類とかぼちゃの組み合わせ（別の野菜どうし）が昼と夜に続いてもOK』という意味（担当者確認・2026/11）。
+#     野菜ごとに別々に間隔を見るので、組み合わせは元々チェックされない。同じ野菜の昼→夜の連続はOKにしない
+#     （以前の版は、同じ野菜の昼→夜もOKにしていた）。
+# ----------------------------------------------------------------------------
+# シートのIDと、実際のメニューで使われるIDが違う野菜（別仕入先・同じ商品）。設定シートの『IDの別名』と合わせて使う。
+VEG_TIER_ID_ALIASES_BUILTIN = {
+    3002349: (3002349, 3000071),   # ほうれん草。3000071=自然解凍 ほうれん草 ファーストシダーズ（担当者確認・2026/11）
+    3002371: (3002371, 3000094),   # オクラ。3000094=【自然解凍】オクラスライスIQF 青山（担当者指摘・2026/11）
+}
+
+
+def _veg_alias_ids(pid):
+    """商品IDと、同じ商品とみなす別ID（PRODUCT_ID_ALIASES＋組み込み）をまとめた集合。"""
+    out = {pid}
+    for src in (PRODUCT_ID_ALIASES, VEG_TIER_ID_ALIASES_BUILTIN):
+        for k, t in src.items():
+            if pid == k or pid in t:
+                out |= set(t) | {k}
+    return out
+
+
+def _veg_tier_clean_name(name):
+    n = _nfkc(str(name)).split('※')[0]
+    n = re.sub(r'[☆★]', '', n)
+    n = re.sub(r'【[^】]*】', '', n)
+    n = re.sub(r'\s+', ' ', n).strip()
+    return n
+
+
+def _classify_veg_tier_header(text):
+    """見出し行の文章から階層を決める。(kind, base_days, doubled_days) または None。kind='flex'/'days'。"""
+    t = _nfkc(str(text))
+    if re.search(r'昼・夜.*夜・昼使用可能', t) or '連続OK' in t:
+        return ('flex', None, None)
+    m = re.search(r'(\d+(?:\.\d+)?)日空けばOK', t)
+    if not m:
+        return None
+    n = float(m.group(1))
+    if n < 2:
+        return ('days', n, n)     # 1.5日の階層は、メニュー名に関係なく常に同じ日数
+    m2 = re.search(r'入っていなければ(\d+(?:\.\d+)?)日', t)
+    return ('days', float(m2.group(1)) if m2 else n, n)
+
+
+def parse_veg_tier_rows(rows):
+    """野菜の使用間隔シート（CSVの行）を読み、(VEG_TIER_MASTER形式のリスト, 制約が無い商品IDの集合, 注意メッセージ) を返す。"""
+    notes, tiers, cur = [], [], None
+    for r in rows:
+        r = [str(c).strip() for c in list(r)] + [''] * 4
+        a, b = _nfkc(r[0]), _nfkc(r[1])
+        if re.fullmatch(r'\d{5,8}', a):
+            if cur is not None:
+                cur['items'].append((int(a), b))
+            else:
+                notes.append(f'野菜の使用間隔：階層の見出しより前にある行（商品ID {a}）は読みませんでした')
+        elif a:
+            c = _classify_veg_tier_header(a)
+            if c is None:
+                cur = None
+                notes.append(f'野菜の使用間隔：見出し「{a[:24]}」の階層を読み取れませんでした（その下の行は判定に使いません）。'
+                             '「◯日空けばOK」「連続OK」「昼・夜、夜・昼使用可能」のいずれかを含む書き方にしてください')
+            else:
+                cur = {'kind': c[0], 'base': c[1], 'doubled': c[2], 'items': [], 'head': a}
+                tiers.append(cur)
+        elif b and cur is not None:
+            cur['items'].append((None, b))
+    def _kw(name):
+        canon = tuple(sorted(_name_veg_set(name)))
+        if canon:
+            return canon
+        core = re.sub(r'\s*\d[\d.\-]*\s*(?:kg|g|ｇ|㎏|個|枚|切|cm|mm|ml|l|L|本|袋)\S*', '', _veg_tier_clean_name(name)).strip()
+        return (core or _veg_tier_clean_name(name),)
+
+    entries, flex = [], set()
+    for t in tiers:
+        if t['kind'] == 'flex':
+            for pid, _n in t['items']:
+                if pid is not None:
+                    flex |= _veg_alias_ids(pid)
+            continue
+        name_only = {}
+        for pid, name in t['items']:
+            if pid is None:
+                canon = tuple(sorted(_name_veg_set(name)))
+                if canon:
+                    g = name_only.setdefault(canon, {'ids': set(), 'texts': [], 'label': _veg_tier_clean_name(name)})
+                    g['texts'].append(name)
+                else:
+                    notes.append(f'野菜の使用間隔：「{_veg_tier_clean_name(name)[:20]}」は野菜名を読み取れないため、判定に使いません')
+        id_groups = {}   # 同じ階層で同じ野菜名の商品（例：ミニミニブロッコリーの2商品）は、IDを2つ持つ1品目にまとめる
+        for pid, name in t['items']:
+            if pid is None:
+                continue
+            canon = tuple(sorted(_name_veg_set(name)))
+            if canon in name_only:
+                g = name_only[canon]
+                g['ids'] |= _veg_alias_ids(pid)
+                g['texts'].append(name)
+                continue
+            key = canon if canon else ('pid', pid)
+            g = id_groups.setdefault(key, {'ids': set(), 'texts': [], 'canon': canon, 'name': name})
+            g['ids'] |= _veg_alias_ids(pid)
+            g['texts'].append(name)
+        for key, g in id_groups.items():
+            entries.append(('id', tuple(sorted(g['ids'])), _kw(g['name']), t['base'], t['doubled'],
+                            False, _veg_tier_clean_name(g['name'])))
+        for canon, g in name_only.items():
+            _lab = canon[0] + '系（' + '／'.join(dict.fromkeys(re.sub(r'\s*\d[\d.\-]*\s*(?:kg|g|ｇ|㎏|個|枚|切|cm|mm).*$', '', _veg_tier_clean_name(x))[:14] for x in g['texts'])) + '）'
+            entries.append(('veg', (canon, tuple(sorted(g['ids']))), canon, t['base'], t['doubled'],
+                            False, _lab))
+    return entries, flex, notes
+
+
+def load_veg_tier_csv(path):
+    import csv
+    with open(path, encoding='utf-8-sig', newline='') as f:
+        rows = list(csv.reader(f))
+    return parse_veg_tier_rows(rows)
+
+
+def apply_veg_tier(path):
+    """野菜の使用間隔シートの内容を VEG_TIER_MASTER / VEG_FLEXIBLE_IDS に反映する。
+    path が無い・読めない場合は、コード内の表のまま。[(レベル, 内容)] を返す。"""
+    g = globals()
+    g['VEG_TIER_MASTER'] = list(_VEG_TIER_MASTER_DEFAULT)
+    if not path:
+        return []
+    try:
+        entries, flex, notes = load_veg_tier_csv(path)
+    except Exception as e:  # noqa: BLE001
+        return [('警告', f'野菜の使用間隔シートを読めなかったため、コード内の表で判定します（{e}）')]
+    if not entries:
+        return [('警告', '野菜の使用間隔シートから判定対象の野菜を1つも読み取れなかったため、コード内の表で判定します'
+                         '（「◯日空けばOK」の見出しと商品IDの行があるか確認してください）')]
+    g['VEG_TIER_MASTER'] = entries
+    if flex:
+        g['VEG_FLEXIBLE_IDS'] = sorted(flex)
+    out = [('注意', n) for n in notes]
+    out.append(('情報', f'野菜の使用間隔（No.30）：シートから読み込みました（判定対象{len(entries)}品目・'
+                        f'間隔の制約がほぼ無い商品{len(flex)}件）'))
+    return out
+
+
 # No.27用: 「FDメニュールール」シート（★マーク商品のうち備考欄に「平日夜に◯回は入れる」という
 # 明示クオータがある商品のみ・ユーザー確認済みスコープ）。
 # (https://docs.google.com/spreadsheets/d/1w6ck7gAUbJIOOlDODM58QKj6nkBc2WSX5T0_Cpv7QBY/edit?gid=1597935310)
@@ -1133,7 +1293,7 @@ def load_history(history_csv_paths, size='M'):
 
 def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                         seasoning_csv_path=None, fried_master_path=None, history_csv_paths=None,
-                        size='M', product_frame_paths=None, settings_paths=None):
+                        size='M', product_frame_paths=None, settings_paths=None, veg_tier_path=None):
     """xlsx_path: メインのメニューワークブック。
     night_csv_paths: {month: csv_path} 夜食材CSV（任意）。
     day_csv_paths: {(month, '昼'|'夜'): csv_path} 商品ID単位のNo.1判定用CSV（任意）。
@@ -1160,6 +1320,13 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
         data.master_checks.extend(apply_settings(_tab_rows))
         if _disc_rows is not None:
             data.master_checks.extend(apply_discontinued(_disc_rows))
+    # 野菜の使用間隔シート（No.30）。設定シートより後に反映する（シートの内容を優先）。渡されなければコード内の表
+    _veg_msgs = apply_veg_tier(veg_tier_path)
+    data.master_checks.extend(_veg_msgs)
+    if veg_tier_path and any(lv == '情報' for lv, _m in _veg_msgs) and settings_paths:
+        if any(lab == '間隔の制約がほぼ無い野菜の商品ID' for rows in locals().get('_tab_rows', {}).values() for lab, _v, _n in rows):
+            data.master_checks.append(('注意', '設定シートの「間隔の制約がほぼ無い野菜の商品ID」は、野菜の使用間隔シートを読んでいるため'
+                                               '使われていません（野菜の使用間隔シートの方を直してください。設定シート側の行は消して構いません）'))
     if product_frame_paths is not None:
         # 月ごとの商品枠シート（{月: CSVのパス}）。渡されたら、No.27/No.32はこのシートの内容で判定する。
         data.product_frames = {}
@@ -3063,6 +3230,81 @@ def check_rule8_flavor(data):
     return pd.DataFrame(viol)
 
 
+FLAVOR_ADJ_DAYS = 1   # No.8：味付けワードを、何日先の食事まで続けない（1＝翌日の昼・夜まで／0＝連続は見ない）
+
+
+def check_rule8_flavor_adjacent(data):
+    """No.8（味付けワードの連続）：ある食事のメニュー名に入っている味付けワード（FLAVOR_NAME_WORDS）が、
+    翌日（FLAVOR_ADJ_DAYS日先まで）の昼・夜のメニュー名にも入っているとNG（担当者指摘・2026/11：2日連続は無しにしたい）。
+    同じ日の昼→夜は対象外（1食内の被りは check_rule8_flavor が見る）。
+    違反は、日付の後ろ側の食事に1行（前日側の食事と、被っているワードを該当箇所に表示）。
+    修正提案：平日昼・土日祝昼メイン（チラシ掲載）は変更せず、変更できる側を差し替える。"""
+    n_days = int(FLAVOR_ADJ_DAYS or 0)
+    words = [_nfkc(w) for w in FLAVOR_NAME_WORDS if str(w).strip()]
+    if n_days <= 0 or not words:
+        return pd.DataFrame()
+    dr = list(data.date_range)
+    meals = {}
+    for d in dr:
+        for slot in ('昼', '夜'):
+            meals[(d, slot)] = [n for n in sorted(raw_dish_names_slot(data, d, slot)) if not _is_mixed_rice(n)]
+    viol = []
+    lab = lambda dd, sl: f'{dd.strftime("%-m/%-d")}({WD_JP[dd.weekday()]}){sl}'
+    for d in dr:
+        for slot in ('昼', '夜'):
+            a = meals[(d, slot)]
+            if not a:
+                continue
+            for k in range(1, n_days + 1):
+                d2 = d + datetime.timedelta(days=k)
+                for slot2 in ('昼', '夜'):
+                    b = meals.get((d2, slot2))
+                    if not b:
+                        continue
+                    by_word = {}
+                    for w in words:
+                        ha = [n for n in a if w in _nfkc(n)]
+                        hb = [n for n in b if w in _nfkc(n)]
+                        if ha and hb:
+                            by_word[w] = (ha, hb)
+                    if not by_word:
+                        continue
+                    dup = set(by_word)
+
+                    def worst(names):
+                        cnt = {n: sum(1 for w in dup if w in _nfkc(n)) for n in names}
+                        m = max(cnt.values())
+                        return [n for n in names if cnt[n] == m][-1]
+                    pa, pb = worst(a), worst(b)
+                    apos, bpos = _pos_on(data, d, slot, pa), _pos_on(data, d2, slot2, pb)
+                    side = _pick_change_target((d, slot, apos), (d2, slot2, bpos))
+                    if side is None:
+                        suggestion = _both_fixed_text((d, slot, pa), (d2, slot2, pb))
+                    else:
+                        td, ts, tn, tp = ((d, slot, pa, apos) if side == 'prev' else (d2, slot2, pb, bpos))
+                        cand = _recipe_replacement(
+                            data, td, ok=lambda n: not any(w in _nfkc(n) for w in dup),
+                            exclude={pa, pb}, position=tp,
+                            avoid_with=set(meals[(td, ts)]) - {tn}, meal=(ts, tn))
+                        suffix = '（平日昼は変更しない）' if side == 'prev' else ''
+                        suggestion = (f'{lab(td, ts)}の「{tn[:18]}」を「{cand[:22]}」等、{"・".join(sorted(dup))}を含まないメニューに変更{suffix}'
+                                      if cand else f'{lab(td, ts)}の「{tn[:18]}」の味付けを変更{suffix}')
+                    def _short(n, w):
+                        n = _nfkc(n)
+                        head = n.split('☆')[0]
+                        return head[:16] if w in head else n.replace('☆', '・')[:24]
+                    detail = '、'.join(f'「{w}」：' + _short(ha[0], w) + ' → ' + _short(hb[0], w)
+                                      for w, (ha, hb) in by_word.items())
+                    viol.append({
+                        '日付': d2.strftime('%-m/%-d'), '曜日': f'{slot2}/{WD_JP[d2.weekday()]}', 'No': 8,
+                        'ルール': '味付けワードが翌日までに続いている',
+                        '該当箇所': f'[{slot2}] {detail}（前回 {lab(d, slot)}）',
+                        '理由': '同じ味付けワード（' + '・'.join(by_word) + f'）が{k}日後までの食事に続けて使われている',
+                        '修正提案': suggestion, '重要度': '低',
+                    })
+    return pd.DataFrame(viol)
+
+
 def check_rule8(data):
     """No.8: 1食のうち『食材と調味料での食材被り』はNG。
     例：生姜おろし（食材）と やどかり国産生姜焼きのタレ（調味料）を同じ食事内で使う。
@@ -4594,6 +4836,12 @@ def check_rule30(data):
                     continue
                 if match_type == 'id':
                     hit = rows[pd.to_numeric(rows['商品ID'], errors='coerce').isin(_pid_set(key))]
+                elif match_type == 'veg':
+                    # シート由来：商品IDの一致、または商品名に同じ野菜名（里芋＝さといも等の表記ゆれ込み）が入る
+                    _canon, _ids = key
+                    _idset = set(_ids)
+                    hit = rows[pd.to_numeric(rows['商品ID'], errors='coerce').isin(_idset) |
+                               rows['商品名'].astype(str).apply(lambda x: bool(set(_canon) & _name_veg_set(x)))]
                 else:
                     # 商品名（実際の食材）のみで判定する。レシピ名も含めると、同じレシピ内の
                     # 無関係な食材（例：かぼちゃ系メニューに入っているさつまいも等）まで
@@ -4607,7 +4855,8 @@ def check_rule30(data):
                 # 除いた表示用のメニュー名で見る（担当者判断・2026/10）。枠タイトル（お楽しみの1品☆…等）は
                 # ☆以降が実際の料理名のため、そのまま全体で見る。
                 is_named = hit['レシピ名'].astype(str).apply(
-                    lambda rn: any(k in _menu_display_name(rn) for k in name_kws)).any()
+                    lambda rn: any(k in _menu_display_name(rn) for k in name_kws)
+                    or bool(set(name_kws) & _name_veg_set(_menu_display_name(rn)))).any()
                 slot_dt = pd.Timestamp(d) + pd.Timedelta(days=(0 if slot == '昼' else 0.5))
                 occurrences.append((slot_dt, d, slot, is_named, str(hit['商品名'].iloc[0]),
                                     str(hit['レシピ名'].iloc[0])))
@@ -5087,6 +5336,7 @@ ALL_RULES = [
     ('No.38 葉物を入れたバターの炒め物の間隔', check_rule38),
     ('No.8 食材+調味料の複数レシピ重複（1食内）', check_rule8),
     ('No.8 味付けワードの被り（メニュー名・1食内）', check_rule8_flavor),
+    ('No.8 味付けワードの連続（メニュー名・翌日まで）', check_rule8_flavor_adjacent),
     ('No.9 見た目（色）が同じ野菜の2日連続', check_rule9),
     ('No.10 単一食材メニューの1週間ルール', check_rule10),
     ('No.11 自然解凍1品ルール', check_rule11),
@@ -5259,12 +5509,13 @@ SETTINGS_SPEC = [
     ('FD限定の魚メニュー', 'キーワード', 'FISH_FD_ONLY', 'words', 'FDの「本日の魚料理」として扱う魚メニュー名'),
     ('メニュー名の野菜の隣り合い判定から除く野菜', 'キーワード', 'NAME_VEG_ADJ_EXCLUDE', 'words',
      'メニュー名に入っていても、隣り合いのNo.30で見ない野菜'),
+    ('No.8 味付けワードを続けない日数', '数値', 'FLAVOR_ADJ_DAYS', 'int',
+     'メニュー名の味付けワードを、この日数先の昼・夜まで続けない（1＝翌日の昼・夜まで。0にすると連続は見ない）'),
     ('No.8 味付けワード（メニュー名が被るとNG）', 'キーワード', 'FLAVOR_NAME_WORDS', 'words',
      '1食の中で、メニュー名にこの言葉が2品以上に出るとNG（醤油・和風など）'),
     ('No.38 味付けワード（バターなど）', 'キーワード', 'LEAFY_BUTTER_SAUCE_WORDS', 'words',
      'この言葉をメニュー名に含み、かつ葉物・炒め/ソテーを含むメニューが対象'),
     ('No.38 葉物のワード', 'キーワード', 'LEAFY_BUTTER_LEAF_WORDS', 'words', '葉物として扱う野菜名'),
-    ('No.38 調理法のワード（炒め・ソテー）', 'キーワード', 'LEAFY_BUTTER_COOK_WORDS', 'words', '炒め物として扱う調理法の言葉'),
     ('カレーのキーワード', 'キーワード', 'CURRY_KW', 'str', '同じ日のカレー被りを避けるためのキーワード'),
     ('デザート扱いの名称キーワード（追加）', 'キーワード', 'DESSERT_NAME_EXTRA', 'dessert_extra',
      'メニュー名にこの言葉を含むものもデザートとして扱う（コードの既定の語に追加される）'),
@@ -5630,10 +5881,12 @@ def _master_gap_checks(data):
 
 def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_master_path=None,
                     seasoning_csv_path=None, fried_master_path=None, ai_client=None,
-                    history_csv_paths=None, size='M', product_frame_paths=None, settings_paths=None):
+                    history_csv_paths=None, size='M', product_frame_paths=None, settings_paths=None,
+                    veg_tier_path=None):
     data = load_workbook_data(xlsx_path, night_csv_paths, day_csv_paths, veg_master_path,
                                seasoning_csv_path, fried_master_path, history_csv_paths, size,
-                               product_frame_paths=product_frame_paths, settings_paths=settings_paths)
+                               product_frame_paths=product_frame_paths, settings_paths=settings_paths,
+                               veg_tier_path=veg_tier_path)
     data.ai_client = ai_client
     frames = []
     # デザートは差し替え候補に一切出さない（昼夜とも。担当者判断・2026/11）：全ルールの実行中ずっと除外を有効にする。
