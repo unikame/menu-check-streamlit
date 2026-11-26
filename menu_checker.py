@@ -1660,7 +1660,7 @@ def _min_gap_check(data, match_fn, min_gap, rule_no, rule_name, severity='中'):
     dates_with = []
     for d in dr:
         names = raw_dish_names(data, d)
-        hit = [n for n in names if match_fn(n)]
+        hit = sorted(n for n in names if match_fn(n))   # 順番を固定（実行のたびに表示が変わらないように）
         if hit:
             dates_with.append((d, hit))
     viol = []
@@ -1701,7 +1701,7 @@ def _max_gap_check(data, match_fn, max_gap, rule_no, rule_name, severity='中'):
     dates_with = []
     for d in dr:
         names = raw_dish_names(data, d)
-        hit = [n for n in names if match_fn(n)]
+        hit = sorted(n for n in names if match_fn(n))   # 順番を固定（実行のたびに表示が変わらないように）
         if hit:
             dates_with.append((d, hit))
     viol = []
@@ -1988,14 +1988,32 @@ NAME_VEG_PATTERNS = [
     ('大葉', r'大葉|しそ|シソ|紫蘇'),
     ('しょうが', r'生姜|しょうが|ショウガ'),
 ]
+NAME_VEG_EXCLUDES = {}   # 野菜名 -> 『この言葉は別物（取り除いてから判定する）』の正規表現（設定シート「野菜名」の「除外」）
+NAME_ING_EXCLUDES = {}
 _NAME_VEG_RE = [(c, re.compile(pt)) for c, pt in NAME_VEG_PATTERNS]
+_NAME_VEG_EXCL_RE = {}
+_NAME_ING_EXCL_RE = {}
+
+
+def _rebuild_name_regex():
+    """NAME_VEG_PATTERNS / NAME_ING_EXTRA_PATTERNS（と除外）から、判定用の正規表現を作り直す。"""
+    global _NAME_VEG_RE, _NAME_ING_EXTRA_RE, _NAME_VEG_EXCL_RE, _NAME_ING_EXCL_RE
+    _NAME_VEG_RE = [(c, re.compile(pt)) for c, pt in NAME_VEG_PATTERNS]
+    _NAME_ING_EXTRA_RE = [(c, re.compile(pt)) for c, pt in NAME_ING_EXTRA_PATTERNS]
+    _NAME_VEG_EXCL_RE = {c: re.compile(x) for c, x in NAME_VEG_EXCLUDES.items() if x}
+    _NAME_ING_EXCL_RE = {c: re.compile(x) for c, x in NAME_ING_EXCLUDES.items() if x}
 VEG_NAME_CONFLICT_DAYS = 1   # 『連日』＝当日のもう一方の食事＋前日＋翌日（担当者指定・2026/10）
 
 
 def _name_veg_set(name):
     """レシピ名に含まれる野菜名（正規名）の集合。"""
     n = _nfkc(str(name))
-    return {c for c, rx in _NAME_VEG_RE if rx.search(n)}
+    out = set()
+    for c, rx in _NAME_VEG_RE:
+        ex = _NAME_VEG_EXCL_RE.get(c)
+        if rx.search(ex.sub('', n) if ex else n):
+            out.add(c)
+    return out
 
 
 # 代替え案が、前後の日のメニュー名と同じ食材名で被らないようにするための、野菜以外の食材名（初期案・2026/11）。
@@ -2016,7 +2034,12 @@ _NAME_ING_EXTRA_RE = [(c, re.compile(pt)) for c, pt in NAME_ING_EXTRA_PATTERNS]
 def _name_conflict_set(name):
     """代替え案の候補選び用：メニュー名に含まれる野菜名＋NAME_ING_EXTRA_PATTERNSの食材名の集合。"""
     n = _nfkc(str(name))
-    return _name_veg_set(name) | {c for c, rx in _NAME_ING_EXTRA_RE if rx.search(n)}
+    out = set(_name_veg_set(name))
+    for c, rx in _NAME_ING_EXTRA_RE:
+        ex = _NAME_ING_EXCL_RE.get(c)
+        if rx.search(ex.sub('', n) if ex else n):
+            out.add(c)
+    return out
 
 
 def _near_veg_name_set(data, date, removed=()):
@@ -3854,7 +3877,7 @@ def check_rule6(data):
                     viol.append({
                         '日付': d.strftime('%-m/%-d'), '曜日': meal, 'No': 6,
                         'ルール': '1食内で同一食材が複数レシピに重複使用',
-                        '該当箇所': f'[{meal}] {prod[:26]} → ' + ' / '.join(list(recipes)[:4]),
+                        '該当箇所': f'[{meal}] {prod[:26]} → ' + ' / '.join(sorted(recipes)[:4]),   # 順番は固定（実行のたびに入れ替わらないように）
                         '理由': f'{len(recipes)}レシピで使用',
                         '修正提案': suggestion, '重要度': '中',
                     })
@@ -5514,10 +5537,11 @@ def _redo_without_dessert_at_night(fn, data, result):
 #   ・数値項目は、行があればその値を使い、無ければ既定値を使う。
 #   ・シートが読めない場合も、既定値でそのまま動く。
 # ============================================================================
-SETTINGS_TABS = ('数値', '商品ID例外', 'キーワード')
+SETTINGS_TABS = ('数値', '商品ID例外', 'キーワード', '言葉の一覧', '野菜名')
 
 # (項目名, タブ, コード上の変数名, 種類, 説明)
-#   種類: int/float=数値1つ, str=文字1つ, ids=商品IDのリスト, words=文字のリスト, alias=ID別名, nutri=栄養基準, dessert_extra=デザート語の追加
+#   種類: int/float=数値1つ, str=文字1つ, ids=商品IDのリスト, words=文字のリスト, alias=ID別名, nutri=栄養基準, dessert_extra=デザート語の追加,
+#         pairs=「言葉=理由」, wordgroups=「言葉=言い換え=…」, idnames=「商品ID=名前」, lookalike=「メニュー名=メニュー名」, namepat=「名前=言葉,言葉／除外=言葉」
 SETTINGS_SPEC = [
     ('代替え案で避ける前後の日数', '数値', 'NEAR_DAYS_WINDOW', 'int',
      '代替え案に、前後◯日以内に既に入っているメニューを出さない日数'),
@@ -5580,6 +5604,46 @@ SETTINGS_SPEC = [
     ('カレーのキーワード', 'キーワード', 'CURRY_KW', 'str', '同じ日のカレー被りを避けるためのキーワード'),
     ('デザート扱いの名称キーワード（追加）', 'キーワード', 'DESSERT_NAME_EXTRA', 'dessert_extra',
      'メニュー名にこの言葉を含むものもデザートとして扱う（コードの既定の語に追加される）'),
+    # ---- 以下は「言葉の一覧」タブ（これまでコードの中にあった言葉の一覧）----
+    ('基礎調味料の言葉（調味料の被りに数えない）', '言葉の一覧', 'BASE_SEASONING_KW', 'words',
+     'ほぼ全ての料理に入る基礎調味料。商品名にこの言葉があれば、No.6・No.8・No.19で調味料の被りに数えない'),
+    ('基礎野菜の言葉', '言葉の一覧', 'BASE_VEG_KW', 'words',
+     '下ごしらえ済みの定番野菜（白ネギ・玉ねぎ・人参など）の言葉'),
+    ('大豆・豆腐系の言葉', '言葉の一覧', 'SOY_KW', 'words',
+     'No.7（昼夜で半日空ける）・No.37（1食に複数使わない）で大豆・豆腐系として扱う言葉'),
+    ('魚メニューの言葉', '言葉の一覧', 'FISH_KW', 'words',
+     'No.22（魚メニューを3日に1回）などで、魚のメニューとして扱う言葉'),
+    ('健康食材の言葉', '言葉の一覧', 'HEALTH_KW', 'words',
+     'No.15（週に1回以上）で、健康食材として扱う言葉'),
+    ('禁止食材のキーワード（マスタが無いときの保険）', '言葉の一覧', 'NG_WORDS', 'words',
+     'No.21で、食材データの禁止マスタが読めないときに使う言葉'),
+    ('食べにくい食材と理由（No.23）', '言葉の一覧', 'EAT_NG', 'pairs',
+     '「食材の言葉=理由」の形で、1行に1つ（例：こんにゃく=弾力が強すぎる）'),
+    ('見た目が同じメニューの組（No.2）', '言葉の一覧', 'LOOKALIKE_PAIRS', 'lookalike',
+     '「メニュー名=メニュー名」の形で、1行に1組（3つ以上を=でつなげてもよい）'),
+    ('枠タイトル（☆の前の枠名）', '言葉の一覧', 'FRAME_TITLES', 'words',
+     '「枠タイトル＋☆＋実際の料理名」の形のメニューの、枠タイトル'),
+    ('No.17 赤とみなす言葉', '言葉の一覧', 'RED_KW', 'words', '1食に赤・黄・緑を使うか見るときの、赤の言葉'),
+    ('No.17 黄とみなす言葉', '言葉の一覧', 'YELLOW_KW', 'words', '同、黄の言葉'),
+    ('No.17 緑とみなす言葉', '言葉の一覧', 'GREEN_KW', 'words', '同、緑の言葉'),
+    ('No.17 赤を補うとみなす商品名の言葉', '言葉の一覧', 'RED_SUPPLEMENT_KW_NO17', 'words',
+     '野菜マスタに赤と登録されていなくても、見た目に赤を補う商品名の言葉'),
+    ('No.8 調味料の素材名の言葉', '言葉の一覧', 'SEASONING_FOOD_KW', 'words',
+     '調味料に含まれる素材が、同じ食事の食材にもあるか見るときの素材名（ごま・梅・柚子など）'),
+    ('No.8 素材名の言い換え', '言葉の一覧', 'SEASONING_NAME_ALIASES', 'wordgroups',
+     '「言葉=言い換え=言い換え」の形で、1行に1グループ（例：ごま=ゴマ=胡麻）'),
+    ('No.9 彩りの判定から外す色', '言葉の一覧', 'COMMON_VEG_COLORS', 'words',
+     'ほぼ毎食使われる基礎色。この色の野菜は、同じ色が2日連続でも指摘しない'),
+    ('No.9 彩りの判定から外す野菜名', '言葉の一覧', 'COMMON_VEG_NAMES', 'words',
+     '赤・茶に分類されるが、ほぼ毎日使われる定番野菜（人参・しいたけなど）'),
+    ('ポテト・マカロニサラダの商品ID', '言葉の一覧', 'PM_SALAD_IDS', 'idnames',
+     '「商品ID=名前」の形。ポテトサラダとマカロニサラダを交互に使うルールで見る商品'),
+    # ---- 「野菜名」タブ ----
+    ('野菜名', '野菜名', 'NAME_VEG_PATTERNS', 'namepat',
+     'メニュー名から野菜を見分ける表（No.6・No.30・No.38など）。「名前=言い換え,言い換え」の形で1行に1つ。'
+     '「／除外=言葉」を付けると、その言葉を取り除いてから見る（例：大根／除外=大根葉）。「re:」で始めると正規表現'),
+    ('野菜以外の食材名（代替え案用）', '野菜名', 'NAME_ING_EXTRA_PATTERNS', 'namepat',
+     '代替え案が前後の日のメニューと食材名で被らないようにするための、野菜以外の食材名。書き方は「野菜名」と同じ'),
 ]
 _SETTINGS_DEFAULTS = {}
 _NUTRI_KEYS = {'NUTRI_KCAL_MIN': ('kcal', 0), 'NUTRI_KCAL_MAX': ('kcal', 1),
@@ -5596,6 +5660,8 @@ def _settings_capture_defaults():
             continue
         _SETTINGS_DEFAULTS[var] = copy.deepcopy(g[var])
     _SETTINGS_DEFAULTS['NUTRI_BOUNDS'] = copy.deepcopy(g['NUTRI_BOUNDS'])
+    _SETTINGS_DEFAULTS['NAME_VEG_EXCLUDES'] = {}
+    _SETTINGS_DEFAULTS['NAME_ING_EXCLUDES'] = {}
     _SETTINGS_DEFAULTS['DISCONTINUED_RECIPE_KW'] = copy.deepcopy(g['DISCONTINUED_RECIPE_KW'])
     _SETTINGS_DEFAULTS['DISCONTINUED_PRODUCT_IDS'] = set()
     _SETTINGS_DEFAULTS['DISCONTINUED_PRODUCT_NAMES'] = []
@@ -5613,10 +5679,61 @@ def reset_settings():
             g['DESSERT_NAME_RE'] = re.compile(val)
         else:
             g[var] = copy.deepcopy(val)
+    _rebuild_name_regex()
 
 
 def _split_cells(v):
     return [x for x in re.split(r'[,、，\n]+', str(v)) if x.strip()]
+
+
+_NAMEPAT_EXCL_VAR = {'NAME_VEG_PATTERNS': 'NAME_VEG_EXCLUDES', 'NAME_ING_EXTRA_PATTERNS': 'NAME_ING_EXCLUDES'}
+
+# コード内の正規表現のうち、シートでは「言葉＋除外」の形に直して書くもの（動作は同じ）
+_NAMEPAT_SHEET_FORM = {
+    'コーン': 'コーン,とうもろこし／除外=スコーン',
+    '大根': '大根,だいこん／除外=大根葉,だいこん葉',
+    'かぶ': r'蕪,re:(?<![ぁ-んァ-ン])かぶ(?![ぁ-んァ-ン]),re:(?<![ぁ-んァ-ン])カブ(?![ぁ-んァ-ン])',
+    'なす': r'茄子,re:(?<![ァ-ン])ナス(?![ァ-ン]),re:(?<![ぁ-ん])なす(?=[のとやをが・\u3001 ]|$)',
+    'ねぎ': 'ねぎ,ネギ,長ねぎ,白ねぎ／除外=玉ねぎ,玉ネギ',
+    'ニラ': r're:(?<![ァ-ン])ニラ,re:(?<![ぁ-ん])にら(?=[のとやをが・\u3001 ]|$)',
+}
+
+
+def _namepat_tokens(text):
+    return [t.strip() for t in re.split(r'[,，、\n]+', str(text)) if t.strip()]
+
+
+def _namepat_regex(tokens):
+    parts = []
+    for t in tokens:
+        parts.append(t[3:] if t.startswith('re:') else re.escape(_nfkc(t)))
+    return '|'.join(parts)
+
+
+def _parse_namepat_cell(cell):
+    """『名前=言葉,言葉／除外=言葉』を (名前, 判定の正規表現, 除外の正規表現) にする。読めなければ None。"""
+    main, _, excl = str(cell).partition('／')
+    if '=' not in main:
+        return None
+    name, _, words = main.partition('=')
+    name = name.strip()
+    toks = _namepat_tokens(words)
+    if not name or not toks:
+        return None
+    ex = ''
+    if excl.strip():
+        ex = _namepat_regex(_namepat_tokens(excl.split('=', 1)[1] if '=' in excl else excl))
+    return name, _namepat_regex(toks), ex
+
+
+def _namepat_default_cell(canon, pat):
+    if canon in _NAMEPAT_SHEET_FORM:
+        return f'{canon}=' + _NAMEPAT_SHEET_FORM[canon]
+    return f'{canon}=' + ','.join(pat.split('|'))
+
+
+def _lines(v):
+    return [x.strip() for x in str(v).split('\n') if x.strip()]
 
 
 def _settings_default_text(var, kind):
@@ -5660,6 +5777,25 @@ def settings_template_rows():
                 out[tab].append([lab, v, desc if i == 0 else ''])
         elif kind == 'dessert_extra':
             out[tab].append([lab, '', desc + '（現在は追加なし。必要になったら、この行の値に書くか、行を足す）'])
+        elif kind == 'pairs':
+            for i, (k, v) in enumerate(_SETTINGS_DEFAULTS[var].items()):
+                out[tab].append([lab, f'{k}={v}', desc if i == 0 else ''])
+        elif kind == 'wordgroups':
+            seen_g = []
+            for k, grp in _SETTINGS_DEFAULTS[var].items():
+                if tuple(grp) not in seen_g:
+                    seen_g.append(tuple(grp))
+            for i, grp in enumerate(seen_g):
+                out[tab].append([lab, '='.join(grp), desc if i == 0 else ''])
+        elif kind == 'idnames':
+            for i, (k, v) in enumerate(_SETTINGS_DEFAULTS[var].items()):
+                out[tab].append([lab, f'{k}={v}', desc if i == 0 else ''])
+        elif kind == 'lookalike':
+            for i, (names, _gap) in enumerate(_SETTINGS_DEFAULTS[var]):
+                out[tab].append([lab, '='.join(names), desc if i == 0 else ''])
+        elif kind == 'namepat':
+            for i, (canon, pat) in enumerate(_SETTINGS_DEFAULTS[var]):
+                out[tab].append([lab, _namepat_default_cell(canon, pat), desc if i == 0 else ''])
     return out
 
 
@@ -5769,6 +5905,61 @@ def apply_settings(tab_rows):
                     add, rem = sorted(set(new) - set(d)), sorted(set(d) - set(new))
                     changed.append(f'{lab}：' + (f'追加 {add} ' if add else '') + (f'削除 {rem}' if rem else ''))
                 g[var] = new
+            elif kind == 'pairs':
+                new = {}
+                for x in [y for v in vals for y in _lines(v)]:
+                    k, _, r = x.partition('=')
+                    if k.strip() and r.strip():
+                        new[k.strip()] = r.strip()
+                if new:
+                    g[var] = new
+                    changed.append(f'{lab}：{len(new)}件')
+            elif kind == 'wordgroups':
+                new = {}
+                for x in [y for v in vals for y in _lines(v)]:
+                    grp = tuple(dict.fromkeys(w.strip() for w in re.split(r'[=＝]', x) if w.strip()))
+                    if len(grp) >= 1:
+                        for w in grp:
+                            new[w] = grp
+                if new:
+                    g[var] = new
+                    changed.append(f'{lab}：{len(new)}語')
+            elif kind == 'idnames':
+                new = {}
+                for x in [y for v in vals for y in _lines(v)]:
+                    k, _, r = x.partition('=')
+                    kd = re.sub(r'\D', '', k)
+                    if kd:
+                        new[int(kd)] = r.strip()
+                if new:
+                    g[var] = new
+                    changed.append(f'{lab}：{len(new)}件')
+            elif kind == 'lookalike':
+                new = []
+                for x in [y for v in vals for y in _lines(v)]:
+                    names = [w.strip() for w in re.split(r'[=＝]', x) if w.strip()]
+                    if len(names) >= 2:
+                        new.append((names, 8))
+                if new:
+                    g[var] = new
+                    changed.append(f'{lab}：{len(new)}組')
+            elif kind == 'namepat':
+                new, excl, bad = [], {}, []
+                for x in [y for v in vals for y in _lines(v)]:
+                    r = _parse_namepat_cell(x)
+                    if r is None:
+                        bad.append(x[:20])
+                        continue
+                    new.append((r[0], r[1]))
+                    if r[2]:
+                        excl[r[0]] = r[2]
+                for b in bad:
+                    msgs.append(('注意', f'設定シート「{lab}」：「{b}」は「名前=言葉,言葉」の形で読めないため無視しました'))
+                if new:
+                    g[var] = new
+                    g[_NAMEPAT_EXCL_VAR[var]] = excl
+                    _rebuild_name_regex()
+                    changed.append(f'{lab}：{len(new)}件')
             elif kind == 'dessert_extra':
                 items = [x.strip() for v in vals for x in _split_cells(v)]
                 if items:
