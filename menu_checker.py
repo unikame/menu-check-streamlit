@@ -5896,7 +5896,7 @@ def _disc_usage_checks(data):
                     continue
                 pids = pd.to_numeric(shoku['商品ID'], errors='coerce')
                 for pid, nm, md in zip(pids, shoku['商品名'].astype(str), shoku['md']):
-                    if '終売後' in _nfkc(nm):   # 商品名に「※終売後、◯◯にてお届けいたします」とあるもの＝後継品が届くので終売扱いしない（担当者判断・2026/11）
+                    if re.search(r'終売後|在庫.*次第', _nfkc(nm)):   # 商品名に「※終売後、◯◯にてお届けいたします」「※在庫がなくなり次第、◯◯に切り替えとなります」とあるもの＝後継品が届くので終売扱いしない（担当者判断・2026/11）
                         continue
                     if not pd.isna(pid) and int(pid) in DISCONTINUED_STOCK_ONLY_IDS:
                         continue
