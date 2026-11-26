@@ -87,6 +87,7 @@ FRAME_SHEET_GIDS = {   # (西暦下2桁, 月): gid  ※無くても動く。タ�
 SETTINGS_BOOK_URL = 'https://docs.google.com/spreadsheets/d/1SCqW9BttOKdIo-YAowcAEKMpsRnw0al-7NKfir58qLE/edit'
 SETTINGS_TABS = ('数値', '商品ID例外', 'キーワード')
 SETTINGS_EXTRA_TABS = ('終売',)    # 見出しが違うタブ（終売の一覧）
+SETTINGS_OPTIONAL_TABS = ('言葉の一覧', '野菜名')   # あとから足したタブ。無くても（読めなくても）既定値で動き、お知らせは出さない
 SETTINGS_HISTORY_TAB = '履歴'     # 過去メニューの一覧（月｜URL｜有効）
 
 # ============================================================================
@@ -561,7 +562,7 @@ def resolve_settings():
     if not url:
         return {}, ['<span class="muted">設定シート：未設定（コードの既定値で動作）</span>']
     paths, ng = {}, []
-    for tab in SETTINGS_TABS + SETTINGS_EXTRA_TABS:
+    for tab in SETTINGS_TABS + SETTINGS_EXTRA_TABS + SETTINGS_OPTIONAL_TABS:
         try:
             data = fetch_settings_csv(url, tab)
             path = os.path.join(TMP_DIR, f'設定_{tab}.csv')
@@ -570,10 +571,16 @@ def resolve_settings():
             if tab == '終売':                # 見出し行があるか確認
                 mc.load_discontinued_csv(path)
             else:
-                mc.load_settings_csv(path)
+                _rows = mc.load_settings_csv(path)
+                if tab in SETTINGS_OPTIONAL_TABS:
+                    # タブ名が無いと、Googleは先頭のタブを返す。このタブの項目が1つも無ければ「まだ作っていない」と見なす
+                    _spec = {lab: t for lab, t, *_r in getattr(mc, 'SETTINGS_SPEC', [])}
+                    if not any(_spec.get(lab) == tab for lab, _v, _n in _rows):
+                        continue
             paths[tab] = path
         except Exception as e:  # noqa: BLE001
-            ng.append(f'{tab}（{e}）')
+            if tab not in SETTINGS_OPTIONAL_TABS:
+                ng.append(f'{tab}（{e}）')
     chips = []
     if paths:
         chips.append(f'<span class="ms-ok">● 設定シート（{"・".join(paths)}）</span>')
