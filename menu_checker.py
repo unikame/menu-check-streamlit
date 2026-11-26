@@ -5819,7 +5819,7 @@ def apply_discontinued(parsed):
 
 def parse_discontinued_book_rows(rows, tab=''):
     """月ごとの『新商品・切替・値上げ・終売』シート（タブ「27年2月」など）の行から、終売の商品を拾う。
-    ・B列などに「■終売」と書かれた見出しから、次の「■…」の見出しまでが終売の欄（見出しは複数あってよい）。
+    ・B列などに「■終売」と書かれた見出しから、次の「■…」の見出しまでが終売の欄（見出しは複数あってよい）。見出しと同じ行に商品IDがあってもよい。
     ・商品ID（C列）がある行だけを終売とする。商品名だけの行（「…：見つかり次第」）は拾わない（担当者確認・2026/11）。
     ・B列に「YDのみ終売」「→ML継続」のように、MLでは使える旨があれば終売にしない（MLのチェックのため）。
     戻り値：[(商品ID, 商品名, 備考)]"""
@@ -5829,7 +5829,7 @@ def parse_discontinued_book_rows(rows, tab=''):
         head = next((c for c in r[:3] if c.startswith('■')), None)
         if head is not None:
             sec = head.replace('■', '').strip()
-            continue
+            # 見出しと同じ行に商品が書かれていることがある（「■終売｜メーカー｜商品ID｜商品名」）ので、continueしない
         if sec != '終売':
             continue
         pid = r[2]
