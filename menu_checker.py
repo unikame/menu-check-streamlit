@@ -2058,6 +2058,7 @@ def _curry_blocked(data, date, cand, removed=()):
 # 代替え案の候補から外す。過去メニューCSV由来の候補に終売商品が残っている問題の対策。
 DISCONTINUED_PRODUCT_IDS = set()     # 終売の商品ID（新商品・終売ブック／設定シート「終売」タブ）。その商品を使うレシピを代替え案から外す。メニューで使われていれば「マスタ・設定の確認」に警告を出す（担当者判断・2026/11：警告は残す）
 DISCONTINUED_PRODUCT_NAMES = []      # 同・商品名（IDが空の行用）
+DISCONTINUED_STOCK_ONLY_IDS = set()  # 「在庫がなくなり次第」と書かれた終売の商品ID（代替え案からは外すが、メニューで使われていても警告しない）
 DISCONTINUED_RECIPE_KW = (
     'かぼちゃ天ぷら', 'かぼちゃの天ぷら', 'カボチャ天ぷら', '南瓜天ぷら',   # 担当者指摘（2026/10・終売商材）
 )
@@ -5585,6 +5586,7 @@ def _settings_capture_defaults():
     _SETTINGS_DEFAULTS['DISCONTINUED_RECIPE_KW'] = copy.deepcopy(g['DISCONTINUED_RECIPE_KW'])
     _SETTINGS_DEFAULTS['DISCONTINUED_PRODUCT_IDS'] = set()
     _SETTINGS_DEFAULTS['DISCONTINUED_PRODUCT_NAMES'] = []
+    _SETTINGS_DEFAULTS['DISCONTINUED_STOCK_ONLY_IDS'] = set()
     _SETTINGS_DEFAULTS['_DESSERT_PATTERN'] = g['DESSERT_NAME_RE'].pattern
 
 
@@ -5796,15 +5798,19 @@ def apply_discontinued(parsed):
     g = globals()
     msgs = []
     ids, names = set(), []
+    stock_ids, plain_ids = set(), set()
     for pid, nm, _note in parsed.get('products', []):
         digits = re.sub(r'\D', '', str(pid))
         if digits:
             ids.add(int(digits))
+            (stock_ids if '在庫次第' in str(_note) else plain_ids).add(int(digits))
         elif str(nm).strip():
             names.append(str(nm).strip())
     if ids or names:
         g['DISCONTINUED_PRODUCT_IDS'] = ids
         g['DISCONTINUED_PRODUCT_NAMES'] = names
+        # 「在庫がなくなり次第」の行（他のタブに普通の終売としても載っているIDは除く）は、メニューで使われていても警告しない
+        g['DISCONTINUED_STOCK_ONLY_IDS'] = stock_ids - plain_ids
         msgs.append(('情報', f'終売の一覧（シート）：商品{len(ids) + len(names)}件を使うレシピを、代替え案から外します'))
     kws = [str(k).strip() for k, _n in parsed.get('kw', []) if str(k).strip()]
     if kws:
@@ -5839,7 +5845,8 @@ def parse_discontinued_book_rows(rows, tab=''):
         mark = r[1]
         if re.search(r'YD.*のみ|継続', mark):
             continue
-        out.append((pid, r[4], (mark + ' ' + tab).strip()))
+        tag = '【在庫次第】' if re.search(r'在庫.*次第', ''.join(r)) else ''
+        out.append((pid, r[4], (tag + mark + ' ' + tab).strip()))
     return out
 
 
@@ -5892,6 +5899,8 @@ def _disc_usage_checks(data):
                 pids = pd.to_numeric(shoku['商品ID'], errors='coerce')
                 for pid, nm, md in zip(pids, shoku['商品名'].astype(str), shoku['md']):
                     if '終売後' in _nfkc(nm):   # 商品名に「※終売後、◯◯にてお届けいたします」とあるもの＝後継品が届くので終売扱いしない（担当者判断・2026/11）
+                        continue
+                    if not pd.isna(pid) and int(pid) in DISCONTINUED_STOCK_ONLY_IDS:
                         continue
                     hit = (not pd.isna(pid) and int(pid) in DISCONTINUED_PRODUCT_IDS) or any(
                         _disc_name_match(sn, nm) for sn in DISCONTINUED_PRODUCT_NAMES)
