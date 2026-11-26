@@ -217,6 +217,10 @@ VEG_FLEXIBLE_IDS = [
     3002303, 3000097,
 ]
 
+# 「昼夜使用可能」「連続OK」階層の野菜が、メニュー名に入っている（前回・今回とも）ときに空ける日数。
+# シートの注記『※メニュー名に記載がある場合は倍の日数を空ける』＝半日(0.5)の倍で1日。0にすると見ない（担当者指摘・2026/11）
+FLEX_TIER_NAMED_DAYS = 1.0
+
 VEG_TIER_MASTER = [
     # 1.5日空けばOK階層。ユーザー確認済み：この階層はメニュー名に記載があっても2倍にせず
     # 常に1.5日でよい（doubled_days も 1.5 にしてある）。
@@ -371,6 +375,11 @@ def parse_veg_tier_rows(rows):
                     entries.append(('id', tuple(sorted(ids)), _kw(_n), 0.5 if kind else req, req, False,
                                     _veg_tier_clean_name(_n) + ('（添えのとき）' if kind == 'sozoe' else
                                                                  '（メニュー名記載のとき）' if kind else ''), kind))
+                elif FLEX_TIER_NAMED_DAYS:
+                    # 「連続OK ※メニュー名に記載がない場合」の階層：メニュー名に野菜名が入っている（前回・今回とも）ときは、
+                    # 倍の日数（半日の倍＝1日）空ける（担当者指摘・2026/11：「しらすとほうれん草のサラダ」はほうれん草が名前に入る）
+                    entries.append(('id', tuple(sorted(ids)), _kw(_n), 0.5, float(FLEX_TIER_NAMED_DAYS), False,
+                                    _veg_tier_clean_name(_n) + '（メニュー名記載のとき）', 'named'))
             continue
         name_only = {}
         for pid, name, _note in t['items']:
@@ -3219,6 +3228,8 @@ def _name_has_seasoning_kw(kw, recipe_name):
 
 
 FLAVOR_NAME_WORDS = ['醤油', '和風', '味噌', 'ポン酢', '甘酢', '中華', '洋風']
+# 同じ食事の中だけで見る味付けワード（翌日の食事までは見ない）。例：バター（2/8夜 チキンステーキ 塩レモンバターソース×うまい菜のバターソテー）。担当者判断・2026/11：翌日に続くバターは指摘しない
+FLAVOR_SAME_MEAL_WORDS = ['バター']
 # No.8（味付けワードの被り）：1食の中で、レシピ名に同じ味付けワードが2品以上に出ているとNG
 # （担当者指摘・2026/11：2/1夜 副菜1「鶏さつまの出汁醤油」×副菜2「オクラと人参の和風醤油和え」で『醤油』、
 #   副菜2×サラダ「水菜としば漬けの和風サラダ」で『和風』が被っている）。ワードは設定シート（キーワード）で編集できる。
@@ -3231,7 +3242,7 @@ def check_rule8_flavor(data):
     1食に被りが複数あるときは1行にまとめ、被りの数が最も多いレシピを差し替え対象にする。"""
     dr = data.date_range
     viol = []
-    words = [_nfkc(w) for w in FLAVOR_NAME_WORDS if str(w).strip()]
+    words = list(dict.fromkeys(_nfkc(w) for w in list(FLAVOR_NAME_WORDS) + list(FLAVOR_SAME_MEAL_WORDS) if str(w).strip()))
     if not words:
         return pd.DataFrame()
     for d in dr:
@@ -5559,7 +5570,9 @@ SETTINGS_SPEC = [
     ('No.8 味付けワードを続けない日数', '数値', 'FLAVOR_ADJ_DAYS', 'int',
      'メニュー名の味付けワードを、この日数先の昼・夜まで続けない（1＝翌日の昼・夜まで。0にすると連続は見ない）'),
     ('No.8 味付けワード（メニュー名が被るとNG）', 'キーワード', 'FLAVOR_NAME_WORDS', 'words',
-     '1食の中で、メニュー名にこの言葉が2品以上に出るとNG（醤油・和風など）'),
+     '1食の中で、メニュー名にこの言葉が2品以上に出るとNG。さらに翌日の食事にも続けて出るとNG（醤油・和風など）'),
+    ('No.8 味付けワード（同じ食事内だけ）', 'キーワード', 'FLAVOR_SAME_MEAL_WORDS', 'words',
+     '1食の中で、メニュー名にこの言葉が2品以上に出るとNG。翌日の食事までは見ない（バターなど）'),
     ('No.38 味付けワード（バターなど）', 'キーワード', 'LEAFY_BUTTER_SAUCE_WORDS', 'words',
      'この言葉をメニュー名に含み、かつ葉物・炒め/ソテーを含むメニューが対象'),
     ('No.38 葉物のワード', 'キーワード', 'LEAFY_BUTTER_LEAF_WORDS', 'words', '葉物として扱う野菜名'),
