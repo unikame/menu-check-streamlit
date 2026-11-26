@@ -5641,7 +5641,9 @@ SETTINGS_SPEC = [
     # ---- 「野菜名」タブ ----
     ('野菜名', '野菜名', 'NAME_VEG_PATTERNS', 'namepat',
      'メニュー名から野菜を見分ける表（No.6・No.30・No.38など）。「名前=言い換え,言い換え」の形で1行に1つ。'
-     '「／除外=言葉」を付けると、その言葉を取り除いてから見る（例：大根／除外=大根葉）。「re:」で始めると正規表現'),
+     '「／除外=言葉」を付けると、その言葉を取り除いてから見る（例：大根／除外=大根葉）。'
+     '言葉の前に「単独:」「カタカナ単独:」「前がカタカナでない:」「ひらがな単独:」を付けると、前後の文字で判定を変えられる（かぶ・なす・ニラの行を参照）。'
+     '特別な場合は「re:」で始めて正規表現も書ける'),
     ('野菜以外の食材名（代替え案用）', '野菜名', 'NAME_ING_EXTRA_PATTERNS', 'namepat',
      '代替え案が前後の日のメニューと食材名で被らないようにするための、野菜以外の食材名。書き方は「野菜名」と同じ'),
 ]
@@ -5692,10 +5694,26 @@ _NAMEPAT_EXCL_VAR = {'NAME_VEG_PATTERNS': 'NAME_VEG_EXCLUDES', 'NAME_ING_EXTRA_P
 _NAMEPAT_SHEET_FORM = {
     'コーン': 'コーン,とうもろこし／除外=スコーン',
     '大根': '大根,だいこん／除外=大根葉,だいこん葉',
-    'かぶ': r'蕪,re:(?<![ぁ-んァ-ン])かぶ(?![ぁ-んァ-ン]),re:(?<![ぁ-んァ-ン])カブ(?![ぁ-んァ-ン])',
-    'なす': r'茄子,re:(?<![ァ-ン])ナス(?![ァ-ン]),re:(?<![ぁ-ん])なす(?=[のとやをが・\u3001 ]|$)',
+    'かぶ': '蕪,単独:かぶ,単独:カブ',
+    'なす': '茄子,カタカナ単独:ナス,ひらがな単独:なす',
     'ねぎ': 'ねぎ,ネギ,長ねぎ,白ねぎ／除外=玉ねぎ,玉ネギ',
-    'ニラ': r're:(?<![ァ-ン])ニラ,re:(?<![ぁ-ん])にら(?=[のとやをが・\u3001 ]|$)',
+    'ニラ': '前がカタカナでない:ニラ,ひらがな単独:にら',
+}
+# 表の備考欄に添える説明
+_NAMEPAT_NOTES = {
+    'かぶ': '「単独:かぶ」＝前後がひらがな・カタカナでないときだけ「かぶ」とみなす（別の言葉の一部を拾わないため）',
+    'なす': '「カタカナ単独:ナス」＝前後がカタカナでないときだけ。「ひらがな単独:なす」＝前がひらがなでなく、後ろが の・と・や・を・が・・・、・空白・語末のときだけ',
+    'ニラ': '「前がカタカナでない:ニラ」＝前がカタカナでないときだけ。「ひらがな単独:にら」＝なすと同じ',
+    'ねぎ': '「／除外=玉ねぎ」＝玉ねぎは取り除いてから見る（玉ねぎをねぎと数えない）',
+    '大根': '「／除外=大根葉」＝大根葉は取り除いてから見る（大根葉は大根と別の食材）',
+    'コーン': '「／除外=スコーン」＝スコーンは取り除いてから見る',
+}
+# 言葉の前に付けて、前後の文字で判定を変える書き方（シート用）
+_NAMEPAT_PREFIX = {
+    '単独:': r'(?<![ぁ-んァ-ン])%s(?![ぁ-んァ-ン])',
+    'カタカナ単独:': r'(?<![ァ-ン])%s(?![ァ-ン])',
+    '前がカタカナでない:': r'(?<![ァ-ン])%s',
+    'ひらがな単独:': r'(?<![ぁ-ん])%s(?=[のとやをが・\u3001 ]|$)',
 }
 
 
@@ -5706,7 +5724,12 @@ def _namepat_tokens(text):
 def _namepat_regex(tokens):
     parts = []
     for t in tokens:
-        parts.append(t[3:] if t.startswith('re:') else re.escape(_nfkc(t)))
+        for pre, tmpl in _NAMEPAT_PREFIX.items():
+            if t.startswith(pre):
+                parts.append(tmpl % re.escape(_nfkc(t[len(pre):])))
+                break
+        else:
+            parts.append(t[3:] if t.startswith('re:') else re.escape(_nfkc(t)))
     return '|'.join(parts)
 
 
@@ -5795,7 +5818,8 @@ def settings_template_rows():
                 out[tab].append([lab, '='.join(names), desc if i == 0 else ''])
         elif kind == 'namepat':
             for i, (canon, pat) in enumerate(_SETTINGS_DEFAULTS[var]):
-                out[tab].append([lab, _namepat_default_cell(canon, pat), desc if i == 0 else ''])
+                out[tab].append([lab, _namepat_default_cell(canon, pat),
+                                 _NAMEPAT_NOTES.get(canon, desc if i == 0 else '')])
     return out
 
 
