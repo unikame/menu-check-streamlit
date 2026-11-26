@@ -2056,7 +2056,7 @@ def _curry_blocked(data, date, cand, removed=()):
 # 終売レシピ（代替え案の候補に出さない）。担当者から「終売商材」と指摘されたレシピ名のキーワードを
 # 追加していく（ユーザー確認済み・2026/10）。レシピ名にこのキーワード（NFKC正規化後）が含まれると
 # 代替え案の候補から外す。過去メニューCSV由来の候補に終売商品が残っている問題の対策。
-DISCONTINUED_PRODUCT_IDS = set()     # 終売の商品ID（新商品・終売ブック／設定シート「終売」タブ）。その商品を使うレシピを代替え案から外す。メニューで使われていても警告はしない（担当者判断・2026/11）
+DISCONTINUED_PRODUCT_IDS = set()     # 終売の商品ID（新商品・終売ブック／設定シート「終売」タブ）。その商品を使うレシピを代替え案から外す。メニューで使われていれば「マスタ・設定の確認」に警告を出す（担当者判断・2026/11：警告は残す）
 DISCONTINUED_PRODUCT_NAMES = []      # 同・商品名（IDが空の行用）
 DISCONTINUED_RECIPE_KW = (
     'かぼちゃ天ぷら', 'かぼちゃの天ぷら', 'カボチャ天ぷら', '南瓜天ぷら',   # 担当者指摘（2026/10・終売商材）
@@ -5562,6 +5562,7 @@ SETTINGS_SPEC = [
     ('No.38 味付けワード（バターなど）', 'キーワード', 'LEAFY_BUTTER_SAUCE_WORDS', 'words',
      'この言葉をメニュー名に含み、かつ葉物・炒め/ソテーを含むメニューが対象'),
     ('No.38 葉物のワード', 'キーワード', 'LEAFY_BUTTER_LEAF_WORDS', 'words', '葉物として扱う野菜名'),
+    ('No.38 調理法のワード（炒め・ソテー）', 'キーワード', 'LEAFY_BUTTER_COOK_WORDS', 'words', '炒め物として扱う調理法の言葉'),
     ('カレーのキーワード', 'キーワード', 'CURRY_KW', 'str', '同じ日のカレー被りを避けるためのキーワード'),
     ('デザート扱いの名称キーワード（追加）', 'キーワード', 'DESSERT_NAME_EXTRA', 'dessert_extra',
      'メニュー名にこの言葉を含むものもデザートとして扱う（コードの既定の語に追加される）'),
@@ -5877,6 +5878,32 @@ def _recipe_has_disc_product(data, name):
     return hit
 
 
+def _disc_usage_checks(data):
+    """切替リスト（新商品・終売ブック）の「■終売」欄にある商品が、今月のメニューに使われていないか。使われていれば警告に出す。
+    メニューの商品名に「※終売後、◯◯にてお届けいたします」とあるものは、終売扱いしない。"""
+    if not (DISCONTINUED_PRODUCT_IDS or DISCONTINUED_PRODUCT_NAMES):
+        return
+    try:
+        found = {}
+        for shoku_dict in (data.shoku, data.shoku_night):
+            for month, shoku in shoku_dict.items():
+                if shoku is None or not len(shoku):
+                    continue
+                pids = pd.to_numeric(shoku['商品ID'], errors='coerce')
+                for pid, nm, md in zip(pids, shoku['商品名'].astype(str), shoku['md']):
+                    if '終売後' in _nfkc(nm):   # 商品名に「※終売後、◯◯にてお届けいたします」とあるもの＝後継品が届くので終売扱いしない（担当者判断・2026/11）
+                        continue
+                    hit = (not pd.isna(pid) and int(pid) in DISCONTINUED_PRODUCT_IDS) or any(
+                        _disc_name_match(sn, nm) for sn in DISCONTINUED_PRODUCT_NAMES)
+                    if hit and isinstance(md, tuple):
+                        found.setdefault((nm, md[0]), set()).add(md[1])
+        for (nm, month), days in sorted(found.items(), key=lambda x: (x[0][1], x[0][0])):
+            ds = '・'.join(f'{month}/{d}' for d in sorted(days))
+            data.master_checks.append(('警告', f'終売の商品「{nm}」が、メニューで使われています（{ds}）'))
+    except Exception as ex:  # noqa: BLE001
+        data.master_checks.append(('注意', f'終売の商品の使用確認の途中でエラーが出ました（{ex}）'))
+
+
 def _master_gap_checks(data):
     """マスタ・設定の不備を data.master_checks に追加する（違反としては数えず、画面の先頭に出す）。
     ①商品枠で「商品枠外」とされた商品がその月のメニューで使われている
@@ -5955,6 +5982,7 @@ def run_all_checks(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_mast
                 frames.append(result.reindex(columns=cols_std))
     _DESSERT_CTX['data'] = None
     _master_gap_checks(data)
+    _disc_usage_checks(data)
     if frames:
         combined = pd.concat(frames, ignore_index=True)
         combined['No'] = combined['No'].astype(int)
