@@ -1358,11 +1358,11 @@ def load_workbook_data(xlsx_path, night_csv_paths=None, day_csv_paths=None, veg_
             _prods += _got
             _used.append(f'{_tabname}（{len(_got)}件）')
         data.master_checks.extend(apply_discontinued({'products': _prods, 'kw': []}))
-        data.master_checks.append(('情報', '終売の一覧：月ごとのシートのタブ ' + '・'.join(_used) + ' から読み込みました'
-                                   if _used else '終売の一覧：月ごとのシートに該当するタブがありませんでした'))
+        if not _used:
+            data.master_checks.append(('情報', '終売の一覧：月ごとのシートに該当するタブがありませんでした'))
     # 野菜の使用間隔シート（No.30）。設定シートより後に反映する（シートの内容を優先）。渡されなければコード内の表
     _veg_msgs = apply_veg_tier(veg_tier_path)
-    data.master_checks.extend(_veg_msgs)
+    data.master_checks.extend(m for m in _veg_msgs if m[0] != '情報')   # 「シートから読み込みました」は画面に出さない（接続状態の●で分かる）
     if veg_tier_path and any(lv == '情報' for lv, _m in _veg_msgs) and settings_paths:
         if any(lab == '間隔の制約がほぼ無い野菜の商品ID' for rows in locals().get('_tab_rows', {}).values() for lab, _v, _n in rows):
             data.master_checks.append(('注意', '設定シートの「間隔の制約がほぼ無い野菜の商品ID」は、野菜の使用間隔シートを読んでいるため'
@@ -5764,8 +5764,7 @@ def apply_settings(tab_rows):
                     changed.append(f'{lab}：追加 {items}')
         except Exception as e:  # noqa: BLE001
             msgs.append(('注意', f'設定シート「{lab}」の値が読めませんでした（{e}）。既定値を使います'))
-    if changed:
-        msgs.append(('情報', '設定シートの内容でコードの既定値から変更している項目：' + ' ／ '.join(changed)))
+    # 「既定値から変更している項目」のお知らせは画面に出さない（担当者判断・2026/11）。changed は残してある
     return msgs
 
 
@@ -5811,7 +5810,6 @@ def apply_discontinued(parsed):
         g['DISCONTINUED_PRODUCT_NAMES'] = names
         # 「在庫がなくなり次第」の行（他のタブに普通の終売としても載っているIDは除く）は、メニューで使われていても警告しない
         g['DISCONTINUED_STOCK_ONLY_IDS'] = stock_ids - plain_ids
-        msgs.append(('情報', f'終売の一覧（シート）：商品{len(ids) + len(names)}件を使うレシピを、代替え案から外します'))
     kws = [str(k).strip() for k, _n in parsed.get('kw', []) if str(k).strip()]
     if kws:
         old = set(_SETTINGS_DEFAULTS.get('DISCONTINUED_RECIPE_KW', ()))
